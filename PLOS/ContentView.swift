@@ -331,6 +331,11 @@ final class SidecarAPIClient {
 
 @MainActor
 final class SidecarProcessManager: ObservableObject {
+    private struct PythonRuntimeConfig {
+        let pythonExecutable: String
+        let pythonPath: String?
+    }
+
     @Published private(set) var isRunning = false
 
     private(set) var sessionToken = UUID().uuidString
@@ -349,7 +354,7 @@ final class SidecarProcessManager: ObservableObject {
 
         let sidecarDirectory = try resolveSidecarDirectory()
         let runtimeDirectory = try Self.prepareRuntimeDirectory()
-        let python = try await Task.detached(priority: .userInitiated) {
+        let runtimeConfig = try await Task.detached(priority: .userInitiated) {
             try Self.ensureSidecarEnvironment(sidecarDirectory: sidecarDirectory, runtimeDirectory: runtimeDirectory)
         }.value
         let dataDirectory = runtimeDirectory.appendingPathComponent("data")
@@ -358,7 +363,7 @@ final class SidecarProcessManager: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [
-            python,
+            runtimeConfig.pythonExecutable,
             "-m", "uvicorn",
             "local_ai_core.main:app",
             "--host", host,
@@ -370,6 +375,13 @@ final class SidecarProcessManager: ObservableObject {
         env["LOCAL_AI_SESSION_TOKEN"] = sessionToken
         env["LOCAL_AI_DATA_DIR"] = dataDirectory.path
         env["PYTHONUNBUFFERED"] = "1"
+        if let runtimePythonPath = runtimeConfig.pythonPath {
+            if let existing = env["PYTHONPATH"], !existing.isEmpty {
+                env["PYTHONPATH"] = "\(runtimePythonPath):\(existing)"
+            } else {
+                env["PYTHONPATH"] = runtimePythonPath
+            }
+        }
         process.environment = env
 
         let (logURL, logHandle) = try Self.makeLogFile(prefix: "sidecar-runtime")
@@ -437,17 +449,18 @@ final class SidecarProcessManager: ObservableObject {
         return "최근 sidecar 로그:\n\(text.suffix(1400))"
     }
 
-    private nonisolated static func ensureSidecarEnvironment(sidecarDirectory: URL, runtimeDirectory: URL) throws -> String {
+    private nonisolated static func ensureSidecarEnvironment(sidecarDirectory: URL, runtimeDirectory: URL) throws -> PythonRuntimeConfig {
         let fm = FileManager.default
         let runtimeVenvDirectory = runtimeDirectory.appendingPathComponent(".venv")
         let runtimeVenvPython = runtimeVenvDirectory.appendingPathComponent("bin/python3")
         let sidecarVenvPython = sidecarDirectory.appendingPathComponent(".venv/bin/python3")
+        let runtimeSitePackages = runtimeDirectory.appendingPathComponent("site-packages")
 
-        if hasRequiredModules(python: runtimeVenvPython.path) {
-            return runtimeVenvPython.path
+        if hasRequiredModules(python: runtimeVenvPython.path, pythonPath: nil) {
+            return PythonRuntimeConfig(pythonExecutable: runtimeVenvPython.path, pythonPath: nil)
         }
-        if hasRequiredModules(python: sidecarVenvPython.path) {
-            return sidecarVenvPython.path
+        if hasRequiredModules(python: sidecarVenvPython.path, pythonPath: nil) {
+            return PythonRuntimeConfig(pythonExecutable: sidecarVenvPython.path, pythonPath: nil)
         }
 
         let pythonCandidates = resolveSystemPythonExecutables()
@@ -481,12 +494,36 @@ final class SidecarProcessManager: ObservableObject {
                     step: "sidecar 의존성 설치"
                 )
 
-                if hasRequiredModules(python: runtimeVenvPython.path) {
-                    return runtimeVenvPython.path
+                if hasRequiredModules(python: runtimeVenvPython.path, pythonPath: nil) {
+                    return PythonRuntimeConfig(pythonExecutable: runtimeVenvPython.path, pythonPath: nil)
                 }
                 bootstrapErrors.append("\(systemPython): 설치 후 모듈 점검 실패")
             } catch {
-                bootstrapErrors.append("\(systemPython): \(error.localizedDescription)")
+                bootstrapErrors.append("\(systemPython) [venv]: \(error.localizedDescription)")
+            }
+
+            do {
+                if fm.fileExists(atPath: runtimeSitePackages.path) {
+                    try? fm.removeItem(at: runtimeSitePackages)
+                }
+                try fm.createDirectory(at: runtimeSitePackages, withIntermediateDirectories: true)
+
+                try runCommand(
+                    executable: systemPython,
+                    arguments: ["-m", "pip", "install", "--upgrade", "--target", runtimeSitePackages.path, sidecarDirectory.path],
+                    cwd: nil,
+                    step: "sidecar target 설치"
+                )
+
+                if hasRequiredModules(python: systemPython, pythonPath: runtimeSitePackages.path) {
+                    return PythonRuntimeConfig(
+                        pythonExecutable: systemPython,
+                        pythonPath: runtimeSitePackages.path
+                    )
+                }
+                bootstrapErrors.append("\(systemPython) [target]: 설치 후 모듈 점검 실패")
+            } catch {
+                bootstrapErrors.append("\(systemPython) [target]: \(error.localizedDescription)")
             }
         }
 
@@ -536,13 +573,18 @@ final class SidecarProcessManager: ObservableObject {
         throw APIError(message: "sidecar runtime 디렉터리를 생성하지 못했습니다.\n\(errors.joined(separator: "\n"))")
     }
 
-    private nonisolated static func hasRequiredModules(python: String) -> Bool {
+    private nonisolated static func hasRequiredModules(python: String, pythonPath: String?) -> Bool {
         do {
+            var overrides: [String: String]? = nil
+            if let pythonPath, !pythonPath.isEmpty {
+                overrides = ["PYTHONPATH": pythonPath]
+            }
             try runCommand(
                 executable: python,
                 arguments: ["-c", "import uvicorn, fastapi, httpx, pydantic, lancedb"],
                 cwd: nil,
-                step: "sidecar 모듈 점검"
+                step: "sidecar 모듈 점검",
+                envOverrides: overrides
             )
             return true
         } catch {
@@ -592,7 +634,8 @@ final class SidecarProcessManager: ObservableObject {
         executable: String,
         arguments: [String],
         cwd: URL?,
-        step: String
+        step: String,
+        envOverrides: [String: String]? = nil
     ) throws {
         let fm = FileManager.default
         let stdoutURL = fm.temporaryDirectory.appendingPathComponent("local-ai-core-\(UUID().uuidString).stdout.log")
@@ -614,6 +657,13 @@ final class SidecarProcessManager: ObservableObject {
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.currentDirectoryURL = cwd
+        if let envOverrides {
+            var env = ProcessInfo.processInfo.environment
+            for (k, v) in envOverrides {
+                env[k] = v
+            }
+            process.environment = env
+        }
 
         process.standardOutput = outHandle
         process.standardError = errHandle
