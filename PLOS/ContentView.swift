@@ -336,6 +336,7 @@ final class SidecarProcessManager: ObservableObject {
     private(set) var sessionToken = UUID().uuidString
     private var process: Process?
     private(set) var apiClient: SidecarAPIClient?
+    private var startupLogs = ""
 
     private let host = "127.0.0.1"
     private let port = 8777
@@ -345,14 +346,14 @@ final class SidecarProcessManager: ObservableObject {
             return
         }
 
+        startupLogs = ""
         let sidecarDirectory = try resolveSidecarDirectory()
+        let python = try ensureSidecarEnvironment(sidecarDirectory: sidecarDirectory)
         let dataDirectory = sidecarDirectory.appendingPathComponent("data")
         try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-
-        let python = resolvePythonExecutable(sidecarDirectory: sidecarDirectory)
         process.arguments = [
             python,
             "-m", "uvicorn",
@@ -365,9 +366,11 @@ final class SidecarProcessManager: ObservableObject {
         var env = ProcessInfo.processInfo.environment
         env["LOCAL_AI_SESSION_TOKEN"] = sessionToken
         env["LOCAL_AI_DATA_DIR"] = dataDirectory.path
+        env["PYTHONUNBUFFERED"] = "1"
         process.environment = env
 
         let pipe = Pipe()
+        attachLogCapture(to: pipe)
         process.standardOutput = pipe
         process.standardError = pipe
 
@@ -392,11 +395,15 @@ final class SidecarProcessManager: ObservableObject {
     func stop() {
         process?.terminate()
         process = nil
+        apiClient = nil
         isRunning = false
     }
 
     private func waitUntilHealthy(client: SidecarAPIClient) async throws {
-        for _ in 0 ..< 40 {
+        for _ in 0 ..< 80 {
+            if let process, !process.isRunning {
+                throw APIError(message: "Sidecar가 시작 직후 종료되었습니다.\n\(startupLogSummary())")
+            }
             do {
                 try await client.health()
                 return
@@ -404,15 +411,101 @@ final class SidecarProcessManager: ObservableObject {
                 try await Task.sleep(nanoseconds: 250_000_000)
             }
         }
-        throw APIError(message: "Sidecar가 정상 상태가 되지 않았습니다. (health timeout)")
+        throw APIError(message: "Sidecar가 정상 상태가 되지 않았습니다. (health timeout)\n\(startupLogSummary())")
     }
 
-    private func resolvePythonExecutable(sidecarDirectory: URL) -> String {
-        let venvPython = sidecarDirectory.appendingPathComponent(".venv/bin/python3").path
-        if FileManager.default.fileExists(atPath: venvPython) {
-            return venvPython
+    private func attachLogCapture(to pipe: Pipe) {
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            guard let text = String(data: data, encoding: .utf8) else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                self.startupLogs.append(text)
+                if self.startupLogs.count > 8000 {
+                    self.startupLogs.removeFirst(self.startupLogs.count - 8000)
+                }
+            }
         }
-        return "python3"
+    }
+
+    private func startupLogSummary() -> String {
+        let trimmed = startupLogs.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "sidecar 로그가 비어 있습니다."
+        }
+        return "최근 sidecar 로그:\n\(trimmed.suffix(1200))"
+    }
+
+    private func ensureSidecarEnvironment(sidecarDirectory: URL) throws -> String {
+        let fm = FileManager.default
+        let venvPython = sidecarDirectory.appendingPathComponent(".venv/bin/python3")
+
+        if !fm.fileExists(atPath: venvPython.path) {
+            try runCommand(
+                executable: "/usr/bin/env",
+                arguments: ["python3", "-m", "venv", ".venv"],
+                cwd: sidecarDirectory,
+                step: "Python 가상환경 생성"
+            )
+        }
+
+        if !hasRequiredModules(python: venvPython.path, cwd: sidecarDirectory) {
+            try runCommand(
+                executable: venvPython.path,
+                arguments: ["-m", "pip", "install", "-e", "."],
+                cwd: sidecarDirectory,
+                step: "sidecar 의존성 설치"
+            )
+        }
+
+        return venvPython.path
+    }
+
+    private func hasRequiredModules(python: String, cwd: URL) -> Bool {
+        do {
+            try runCommand(
+                executable: python,
+                arguments: ["-c", "import uvicorn, fastapi, httpx, pydantic, lancedb"],
+                cwd: cwd,
+                step: "sidecar 모듈 점검"
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func runCommand(
+        executable: String,
+        arguments: [String],
+        cwd: URL,
+        step: String
+    ) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.currentDirectoryURL = cwd
+
+        let out = Pipe()
+        let err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+
+        do {
+            try process.run()
+        } catch {
+            throw APIError(message: "\(step) 실행 실패: \(error.localizedDescription)")
+        }
+
+        process.waitUntilExit()
+        let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        guard process.terminationStatus == 0 else {
+            let log = (stderr.isEmpty ? stdout : stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw APIError(message: "\(step) 실패 (exit \(process.terminationStatus))\n\(log)")
+        }
     }
 
     private func resolveSidecarDirectory() throws -> URL {
