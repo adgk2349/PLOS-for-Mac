@@ -8,10 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .classification import DocumentClassifier
 from .chunker import chunk_text
 from .db import Database
 from .embedding import EmbeddingService
-from .models import IndexJobStatus, StartupProfile, WorkspaceResponse
+from .models import DocumentMetadata, IndexJobStatus, StartupProfile, WorkspaceResponse
 from .parsers import ParseError, SUPPORTED_EXTENSIONS, parse_file
 from .vector_store import VectorStore
 
@@ -23,10 +24,17 @@ class IndexDocument:
 
 
 class IndexingService:
-    def __init__(self, db: Database, vector_store: VectorStore, embedding_service: EmbeddingService):
+    def __init__(
+        self,
+        db: Database,
+        vector_store: VectorStore,
+        embedding_service: EmbeddingService,
+        classifier: DocumentClassifier,
+    ):
         self._db = db
         self._vector_store = vector_store
         self._embedding_service = embedding_service
+        self._classifier = classifier
         self._jobs: dict[str, IndexJobStatus] = {}
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=2)
@@ -53,9 +61,24 @@ class IndexingService:
     def list_failures(self):
         return self._db.list_failures()
 
+    def reclassify_document(self, doc_id: str) -> DocumentMetadata:
+        record = self._db.get_document_record(doc_id)
+        if record is None:
+            raise FileNotFoundError(f"document not found: {doc_id}")
+        path = Path(record["path"])
+        parse_result = parse_file(path)
+        metadata = self._safe_classification(path, parse_result.text)
+        updated = self._db.update_document_auto_metadata(doc_id, metadata)
+        if updated is None:
+            raise FileNotFoundError(f"document not found after reclassify: {doc_id}")
+        return updated
+
     def _run_job(self, job_id: str, scope: str, workspace: WorkspaceResponse) -> None:
         self._update(job_id, status="running", stage="scan", progress=0.01)
         try:
+            if scope == "full":
+                # Avoid showing stale failures from previous runs before this full rescan.
+                self._db.clear_all_failures()
             docs = list(self._scan_documents(workspace, scope=scope))
             total = len(docs)
             processed = 0
@@ -82,7 +105,15 @@ class IndexingService:
                         raise ParseError("Parsed text is empty")
 
                     doc_id = self._stable_doc_id(doc.path)
-                    self._db.upsert_document(doc_id, str(doc.path), doc.path.suffix.lower(), doc.modified_at)
+                    self._update(job_id, stage="classify")
+                    metadata = self._safe_classification(doc.path, parse_result.text)
+                    self._db.upsert_document(
+                        doc_id,
+                        str(doc.path),
+                        doc.path.suffix.lower(),
+                        doc.modified_at,
+                        metadata=metadata,
+                    )
                     self._vector_store.delete_doc(doc_id)
 
                     self._update(job_id, stage="embed")
@@ -107,7 +138,10 @@ class IndexingService:
 
                     self._db.insert_chunks(doc_id, db_chunks)
                     self._vector_store.upsert_rows(rows)
-                    self._db.clear_failure(str(doc.path))
+                    if metadata.get("_classification_warning"):
+                        self._db.record_failure(str(doc.path), metadata["_classification_warning"])
+                    else:
+                        self._db.clear_failure(str(doc.path))
                 except Exception as exc:
                     failures += 1
                     self._db.record_failure(str(doc.path), str(exc))
@@ -123,6 +157,24 @@ class IndexingService:
             self._update(job_id, status="completed", stage="done", progress=1.0)
         except Exception as exc:
             self._update(job_id, status="failed", stage="failed", error=str(exc), progress=1.0)
+
+    def _safe_classification(self, path: Path, text: str) -> dict:
+        try:
+            result = self._classifier.classify(path, text)
+            return result.model_dump()
+        except Exception as exc:
+            compact = " ".join(text.split())[:240]
+            return {
+                "summary": compact,
+                "category": "참고자료",
+                "subcategory": "",
+                "document_type": "",
+                "tags": [],
+                "year": None,
+                "project": None,
+                "importance": 0.5,
+                "_classification_warning": f"classification fallback: {exc}",
+            }
 
     def _scan_documents(self, workspace: WorkspaceResponse, *, scope: str) -> Iterable[IndexDocument]:
         excluded = [Path(path).resolve() for path in workspace.excluded_paths]

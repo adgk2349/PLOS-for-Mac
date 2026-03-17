@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from .language_utils import resolve_response_language, response_language_instruction
 from .models import Citation, WorkMode
 
 
@@ -28,9 +29,17 @@ class OpenAIProvider:
         self.api_key = api_key
         self.model = model
 
-    async def analyze(self, query: str, mode: WorkMode, citations: list[Citation]) -> ProviderResult:
+    async def analyze(
+        self,
+        query: str,
+        mode: WorkMode,
+        citations: list[Citation],
+        language_preference: str | None = None,
+    ) -> ProviderResult:
+        response_language = resolve_response_language(query, language_preference)
         prompt = (
             "You are a deep-analysis assistant. Respect local citations and avoid hallucinations.\n"
+            f"{response_language_instruction(response_language)}\n"
             f"Mode: {mode.value}\n"
             "Local citations:\n"
             f"{_context_block(citations)}\n\n"
@@ -40,7 +49,7 @@ class OpenAIProvider:
 
         if not self.api_key:
             return ProviderResult(
-                answer="OpenAI API 키가 설정되지 않아 외부 분석을 수행하지 못했습니다.",
+                answer=_missing_api_key_message("OpenAI", response_language),
                 sent_chars=sent_chars,
             )
 
@@ -63,9 +72,17 @@ class AnthropicProvider:
         self.api_key = api_key
         self.model = model
 
-    async def analyze(self, query: str, mode: WorkMode, citations: list[Citation]) -> ProviderResult:
+    async def analyze(
+        self,
+        query: str,
+        mode: WorkMode,
+        citations: list[Citation],
+        language_preference: str | None = None,
+    ) -> ProviderResult:
+        response_language = resolve_response_language(query, language_preference)
         prompt = (
             "Use only grounded reasoning from local citation context when possible.\n"
+            f"{response_language_instruction(response_language)}\n"
             f"Mode: {mode.value}\n"
             f"Local citations:\n{_context_block(citations)}\n\n"
             f"Question: {query}"
@@ -74,7 +91,7 @@ class AnthropicProvider:
 
         if not self.api_key:
             return ProviderResult(
-                answer="Anthropic API 키가 설정되지 않아 외부 분석을 수행하지 못했습니다.",
+                answer=_missing_api_key_message("Anthropic", response_language),
                 sent_chars=sent_chars,
             )
 
@@ -106,12 +123,25 @@ class ProviderRouter:
             model=os.getenv("ANTHROPIC_MODEL", "claude-3-7-sonnet-latest"),
         )
 
-    async def analyze(self, provider: str, query: str, mode: WorkMode, citations: list[Citation]) -> ProviderResult:
+    async def analyze(
+        self,
+        provider: str,
+        query: str,
+        mode: WorkMode,
+        citations: list[Citation],
+        language_preference: str | None = None,
+    ) -> ProviderResult:
         if provider == "openai":
-            return await self._openai.analyze(query, mode, citations)
+            return await self._openai.analyze(query, mode, citations, language_preference=language_preference)
         if provider == "anthropic":
-            return await self._anthropic.analyze(query, mode, citations)
+            return await self._anthropic.analyze(query, mode, citations, language_preference=language_preference)
         raise ValueError(f"Unsupported provider: {provider}")
+
+
+def _missing_api_key_message(provider: str, response_language: str) -> str:
+    if response_language == "ko":
+        return f"{provider} API 키가 설정되지 않아 외부 분석을 수행하지 못했습니다."
+    return f"{provider} API key is not configured, so deep analysis could not run."
 
 
 def _extract_openai_text(payload: dict) -> str:
@@ -126,7 +156,7 @@ def _extract_openai_text(payload: dict) -> str:
                 chunks.append(text)
     if chunks:
         return "\n".join(chunks)
-    return "외부 분석 응답을 해석하지 못했습니다."
+    return "Failed to parse external analysis response."
 
 
 def _extract_anthropic_text(payload: dict) -> str:
@@ -137,4 +167,4 @@ def _extract_anthropic_text(payload: dict) -> str:
             chunks.append(text)
     if chunks:
         return "\n".join(chunks)
-    return "외부 분석 응답을 해석하지 못했습니다."
+    return "Failed to parse external analysis response."

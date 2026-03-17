@@ -12,8 +12,9 @@ __pycache__/
 sidecar/.state/
 sidecar/.pytest_cache/
 sidecar/data/
+sidecar/build/
 sidecar/sidecar/
 sidecar/local_ai_core_sidecar.egg-info/
-
+PLOS.xcodeproj/xcuserdata/
 *.xcuserdatad/
 xcuserdata/

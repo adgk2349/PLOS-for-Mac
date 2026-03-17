@@ -54,6 +54,13 @@ def test_folder_to_index_to_chat_flow(client, auth_headers, tmp_path: Path):
     assert chat.status_code == 200
     body = chat.json()
     assert body["is_local"] is True
+    assert body["lead"]
+    assert body["result_summary"]
+    assert isinstance(body["actions"], list)
+    assert len(body["actions"]) >= 1
+    action_kinds = {item["kind"] for item in body["actions"]}
+    assert "ASK_FOLLOWUP" in action_kinds
+    assert "OPEN_FILE" in action_kinds
     assert len(body["citations"]) >= 1
 
 
@@ -162,3 +169,40 @@ def test_external_call_privacy_gate(client, auth_headers, tmp_path: Path):
     )
     assert allowed.status_code == 200
     assert allowed.json()["provider"] == "openai"
+
+
+def test_strict_search_returns_composed_insufficient_shape(client, auth_headers, tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    source = workspace / "notes.txt"
+    source.write_text("totally unrelated content", encoding="utf-8")
+
+    client.post(
+        "/v1/workspaces",
+        headers=auth_headers,
+        json={
+            "included_paths": [str(workspace)],
+            "excluded_paths": [],
+            "startup_profile": "RECOMMENDED",
+            "default_mode": "GENERAL",
+        },
+    )
+    job = client.post("/v1/index/jobs", headers=auth_headers, json={"scope": "full"})
+    _poll_job(client, auth_headers, job.json()["job_id"])
+
+    strict = client.post(
+        "/v1/chat/local",
+        headers=auth_headers,
+        json={
+            "query": "quantum tunneling theorem in local files",
+            "mode": "STRICT_SEARCH",
+            "conversation_id": "conv-strict",
+        },
+    )
+    assert strict.status_code == 200
+    payload = strict.json()
+    assert payload["intent"] in {"DOCUMENT_QA", "AMBIGUOUS", "TASK_REQUEST", "FILE_SEARCH"}
+    assert payload["lead"]
+    assert payload["result_summary"]
+    assert payload["citations"] == []
+    assert any(action["kind"] == "ASK_FOLLOWUP" for action in payload["actions"])
