@@ -413,24 +413,46 @@ final class SidecarProcessManager: ObservableObject {
 
     private func ensureSidecarEnvironment(sidecarDirectory: URL) throws -> String {
         let fm = FileManager.default
+        let venvDirectory = sidecarDirectory.appendingPathComponent(".venv")
         let venvPython = sidecarDirectory.appendingPathComponent(".venv/bin/python3")
+        let systemPython = try resolveSystemPythonExecutable()
 
-        if !fm.fileExists(atPath: venvPython.path) {
+        if !isRunnablePythonExecutable(venvPython.path) {
+            if fm.fileExists(atPath: venvDirectory.path) {
+                try? fm.removeItem(at: venvDirectory)
+            }
+
             try runCommand(
-                executable: "/usr/bin/env",
-                arguments: ["python3", "-m", "venv", ".venv"],
+                executable: systemPython,
+                arguments: ["-m", "venv", ".venv"],
                 cwd: sidecarDirectory,
                 step: "Python 가상환경 생성"
             )
         }
 
         if !hasRequiredModules(python: venvPython.path, cwd: sidecarDirectory) {
-            try runCommand(
-                executable: venvPython.path,
-                arguments: ["-m", "pip", "install", "-e", "."],
-                cwd: sidecarDirectory,
-                step: "sidecar 의존성 설치"
-            )
+            do {
+                try runCommand(
+                    executable: venvPython.path,
+                    arguments: ["-m", "pip", "install", "-e", "."],
+                    cwd: sidecarDirectory,
+                    step: "sidecar 의존성 설치"
+                )
+            } catch {
+                // Some environments miss pip in a fresh venv; bootstrap and retry once.
+                try runCommand(
+                    executable: venvPython.path,
+                    arguments: ["-m", "ensurepip", "--upgrade"],
+                    cwd: sidecarDirectory,
+                    step: "pip 초기화"
+                )
+                try runCommand(
+                    executable: venvPython.path,
+                    arguments: ["-m", "pip", "install", "-e", "."],
+                    cwd: sidecarDirectory,
+                    step: "sidecar 의존성 재설치"
+                )
+            }
         }
 
         return venvPython.path
@@ -448,6 +470,44 @@ final class SidecarProcessManager: ObservableObject {
         } catch {
             return false
         }
+    }
+
+    private func resolveSystemPythonExecutable() throws -> String {
+        let fm = FileManager.default
+        let candidates = [
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "/usr/bin/python3"
+        ]
+
+        for candidate in candidates where fm.isExecutableFile(atPath: candidate) {
+            if isRunnablePythonExecutable(candidate) {
+                return candidate
+            }
+        }
+
+        throw APIError(message: "python3 실행 파일을 찾지 못했습니다. Python 3 설치 후 다시 시도해 주세요.")
+    }
+
+    private func isRunnablePythonExecutable(_ path: String) -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path), fm.isExecutableFile(atPath: path) else {
+            return false
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["--version"]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        process.waitUntilExit()
+        return process.terminationStatus == 0
     }
 
     private func runCommand(
