@@ -336,6 +336,8 @@ final class SidecarProcessManager: ObservableObject {
     private(set) var sessionToken = UUID().uuidString
     private var process: Process?
     private(set) var apiClient: SidecarAPIClient?
+    private var sidecarLogURL: URL?
+    private var sidecarLogHandle: FileHandle?
 
     private let host = "127.0.0.1"
     private let port = 8777
@@ -346,8 +348,11 @@ final class SidecarProcessManager: ObservableObject {
         }
 
         let sidecarDirectory = try resolveSidecarDirectory()
-        let python = try ensureSidecarEnvironment(sidecarDirectory: sidecarDirectory)
-        let dataDirectory = sidecarDirectory.appendingPathComponent("data")
+        let runtimeDirectory = try Self.prepareRuntimeDirectory()
+        let python = try await Task.detached(priority: .userInitiated) {
+            try Self.ensureSidecarEnvironment(sidecarDirectory: sidecarDirectory, runtimeDirectory: runtimeDirectory)
+        }.value
+        let dataDirectory = runtimeDirectory.appendingPathComponent("data")
         try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
 
         let process = Process()
@@ -359,7 +364,7 @@ final class SidecarProcessManager: ObservableObject {
             "--host", host,
             "--port", String(port)
         ]
-        process.currentDirectoryURL = sidecarDirectory
+        process.currentDirectoryURL = runtimeDirectory
 
         var env = ProcessInfo.processInfo.environment
         env["LOCAL_AI_SESSION_TOKEN"] = sessionToken
@@ -367,17 +372,20 @@ final class SidecarProcessManager: ObservableObject {
         env["PYTHONUNBUFFERED"] = "1"
         process.environment = env
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
+        let (logURL, logHandle) = try Self.makeLogFile(prefix: "sidecar-runtime")
+        process.standardOutput = logHandle
+        process.standardError = logHandle
 
         do {
             try process.run()
         } catch {
+            try? logHandle.close()
             throw APIError(message: "Sidecar 실행 실패: \(error.localizedDescription)")
         }
 
         self.process = process
+        self.sidecarLogURL = logURL
+        self.sidecarLogHandle = logHandle
 
         let client = SidecarAPIClient(
             baseURL: URL(string: "http://\(host):\(port)")!,
@@ -385,13 +393,20 @@ final class SidecarProcessManager: ObservableObject {
         )
         self.apiClient = client
 
-        try await waitUntilHealthy(client: client)
-        isRunning = true
+        do {
+            try await waitUntilHealthy(client: client)
+            isRunning = true
+        } catch {
+            stop()
+            throw error
+        }
     }
 
     func stop() {
         process?.terminate()
         process = nil
+        try? sidecarLogHandle?.close()
+        sidecarLogHandle = nil
         apiClient = nil
         isRunning = false
     }
@@ -399,7 +414,7 @@ final class SidecarProcessManager: ObservableObject {
     private func waitUntilHealthy(client: SidecarAPIClient) async throws {
         for _ in 0 ..< 80 {
             if let process, !process.isRunning {
-                throw APIError(message: "Sidecar가 시작 직후 종료되었습니다. Python/패키지 설치 상태를 확인해 주세요.")
+                throw APIError(message: "Sidecar가 시작 직후 종료되었습니다.\n\(sidecarLogSummary())")
             }
             do {
                 try await client.health()
@@ -408,62 +423,125 @@ final class SidecarProcessManager: ObservableObject {
                 try await Task.sleep(nanoseconds: 250_000_000)
             }
         }
-        throw APIError(message: "Sidecar가 정상 상태가 되지 않았습니다. (health timeout)")
+        throw APIError(message: "Sidecar가 정상 상태가 되지 않았습니다. (health timeout)\n\(sidecarLogSummary())")
     }
 
-    private func ensureSidecarEnvironment(sidecarDirectory: URL) throws -> String {
+    private func sidecarLogSummary() -> String {
+        guard let url = sidecarLogURL else {
+            return "sidecar 로그 파일을 찾지 못했습니다."
+        }
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else {
+            return "sidecar 로그가 비어 있습니다."
+        }
+        let text = String(decoding: data, as: UTF8.self)
+        return "최근 sidecar 로그:\n\(text.suffix(1400))"
+    }
+
+    private nonisolated static func ensureSidecarEnvironment(sidecarDirectory: URL, runtimeDirectory: URL) throws -> String {
         let fm = FileManager.default
-        let venvDirectory = sidecarDirectory.appendingPathComponent(".venv")
-        let venvPython = sidecarDirectory.appendingPathComponent(".venv/bin/python3")
-        let systemPython = try resolveSystemPythonExecutable()
+        let runtimeVenvDirectory = runtimeDirectory.appendingPathComponent(".venv")
+        let runtimeVenvPython = runtimeVenvDirectory.appendingPathComponent("bin/python3")
+        let sidecarVenvPython = sidecarDirectory.appendingPathComponent(".venv/bin/python3")
 
-        if !isRunnablePythonExecutable(venvPython.path) {
-            if fm.fileExists(atPath: venvDirectory.path) {
-                try? fm.removeItem(at: venvDirectory)
-            }
-
-            try runCommand(
-                executable: systemPython,
-                arguments: ["-m", "venv", ".venv"],
-                cwd: sidecarDirectory,
-                step: "Python 가상환경 생성"
-            )
+        if hasRequiredModules(python: runtimeVenvPython.path) {
+            return runtimeVenvPython.path
+        }
+        if hasRequiredModules(python: sidecarVenvPython.path) {
+            return sidecarVenvPython.path
         }
 
-        if !hasRequiredModules(python: venvPython.path, cwd: sidecarDirectory) {
+        let pythonCandidates = resolveSystemPythonExecutables()
+        guard !pythonCandidates.isEmpty else {
+            throw APIError(message: "python3 실행 파일을 찾지 못했습니다. Python 3 설치 후 다시 시도해 주세요.")
+        }
+
+        var bootstrapErrors: [String] = []
+        for systemPython in pythonCandidates {
             do {
+                if fm.fileExists(atPath: runtimeVenvDirectory.path) {
+                    try? fm.removeItem(at: runtimeVenvDirectory)
+                }
+
                 try runCommand(
-                    executable: venvPython.path,
-                    arguments: ["-m", "pip", "install", "-e", "."],
-                    cwd: sidecarDirectory,
-                    step: "sidecar 의존성 설치"
+                    executable: systemPython,
+                    arguments: ["-m", "venv", runtimeVenvDirectory.path],
+                    cwd: nil,
+                    step: "Python 가상환경 생성"
                 )
-            } catch {
-                // Some environments miss pip in a fresh venv; bootstrap and retry once.
                 try runCommand(
-                    executable: venvPython.path,
+                    executable: runtimeVenvPython.path,
                     arguments: ["-m", "ensurepip", "--upgrade"],
-                    cwd: sidecarDirectory,
+                    cwd: nil,
                     step: "pip 초기화"
                 )
                 try runCommand(
-                    executable: venvPython.path,
-                    arguments: ["-m", "pip", "install", "-e", "."],
-                    cwd: sidecarDirectory,
-                    step: "sidecar 의존성 재설치"
+                    executable: runtimeVenvPython.path,
+                    arguments: ["-m", "pip", "install", "--upgrade", sidecarDirectory.path],
+                    cwd: nil,
+                    step: "sidecar 의존성 설치"
                 )
+
+                if hasRequiredModules(python: runtimeVenvPython.path) {
+                    return runtimeVenvPython.path
+                }
+                bootstrapErrors.append("\(systemPython): 설치 후 모듈 점검 실패")
+            } catch {
+                bootstrapErrors.append("\(systemPython): \(error.localizedDescription)")
             }
         }
 
-        return venvPython.path
+        throw APIError(
+            message: "sidecar 의존성 설치 실패: Python 환경 구성이 완료되지 않았습니다.\n\(bootstrapErrors.joined(separator: "\n"))"
+        )
     }
 
-    private func hasRequiredModules(python: String, cwd: URL) -> Bool {
+    private nonisolated static func prepareRuntimeDirectory() throws -> URL {
+        let fm = FileManager.default
+        var candidates: [URL] = []
+
+        if let appSupportBase = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            candidates.append(
+                appSupportBase
+                    .appendingPathComponent("LocalAICore", isDirectory: true)
+                    .appendingPathComponent("SidecarRuntime", isDirectory: true)
+            )
+        }
+
+        candidates.append(
+            fm.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+                .appendingPathComponent("LocalAICore", isDirectory: true)
+                .appendingPathComponent("SidecarRuntime", isDirectory: true)
+        )
+
+        candidates.append(
+            fm.temporaryDirectory
+                .appendingPathComponent("LocalAICore", isDirectory: true)
+                .appendingPathComponent("SidecarRuntime", isDirectory: true)
+        )
+
+        var errors: [String] = []
+        for dir in candidates {
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                let probe = dir.appendingPathComponent(".write-test-\(UUID().uuidString)")
+                try Data("ok".utf8).write(to: probe, options: .atomic)
+                try? fm.removeItem(at: probe)
+                return dir
+            } catch {
+                errors.append("\(dir.path): \(error.localizedDescription)")
+            }
+        }
+
+        throw APIError(message: "sidecar runtime 디렉터리를 생성하지 못했습니다.\n\(errors.joined(separator: "\n"))")
+    }
+
+    private nonisolated static func hasRequiredModules(python: String) -> Bool {
         do {
             try runCommand(
                 executable: python,
                 arguments: ["-c", "import uvicorn, fastapi, httpx, pydantic, lancedb"],
-                cwd: cwd,
+                cwd: nil,
                 step: "sidecar 모듈 점검"
             )
             return true
@@ -472,7 +550,7 @@ final class SidecarProcessManager: ObservableObject {
         }
     }
 
-    private func resolveSystemPythonExecutable() throws -> String {
+    private nonisolated static func resolveSystemPythonExecutables() -> [String] {
         let fm = FileManager.default
         let candidates = [
             "/opt/homebrew/bin/python3",
@@ -480,16 +558,16 @@ final class SidecarProcessManager: ObservableObject {
             "/usr/bin/python3"
         ]
 
+        var valid: [String] = []
         for candidate in candidates where fm.isExecutableFile(atPath: candidate) {
             if isRunnablePythonExecutable(candidate) {
-                return candidate
+                valid.append(candidate)
             }
         }
-
-        throw APIError(message: "python3 실행 파일을 찾지 못했습니다. Python 3 설치 후 다시 시도해 주세요.")
+        return valid
     }
 
-    private func isRunnablePythonExecutable(_ path: String) -> Bool {
+    private nonisolated static func isRunnablePythonExecutable(_ path: String) -> Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: path), fm.isExecutableFile(atPath: path) else {
             return false
@@ -510,36 +588,62 @@ final class SidecarProcessManager: ObservableObject {
         return process.terminationStatus == 0
     }
 
-    private func runCommand(
+    private nonisolated static func runCommand(
         executable: String,
         arguments: [String],
-        cwd: URL,
+        cwd: URL?,
         step: String
     ) throws {
+        let fm = FileManager.default
+        let stdoutURL = fm.temporaryDirectory.appendingPathComponent("local-ai-core-\(UUID().uuidString).stdout.log")
+        let stderrURL = fm.temporaryDirectory.appendingPathComponent("local-ai-core-\(UUID().uuidString).stderr.log")
+        fm.createFile(atPath: stdoutURL.path, contents: nil)
+        fm.createFile(atPath: stderrURL.path, contents: nil)
+
+        let outHandle = try FileHandle(forWritingTo: stdoutURL)
+        let errHandle = try FileHandle(forWritingTo: stderrURL)
+
+        defer {
+            try? outHandle.close()
+            try? errHandle.close()
+            try? fm.removeItem(at: stdoutURL)
+            try? fm.removeItem(at: stderrURL)
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.currentDirectoryURL = cwd
 
-        let out = Pipe()
-        let err = Pipe()
-        process.standardOutput = out
-        process.standardError = err
+        process.standardOutput = outHandle
+        process.standardError = errHandle
 
         do {
             try process.run()
         } catch {
-            throw APIError(message: "\(step) 실행 실패: \(error.localizedDescription)")
+            throw APIError(
+                message: "\(step) 실행 실패: \(error.localizedDescription)\nexec=\(executable)\nargs=\(arguments.joined(separator: " "))\ncwd=\(cwd?.path ?? "(nil)")"
+            )
         }
 
         process.waitUntilExit()
-        let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        try? outHandle.synchronize()
+        try? errHandle.synchronize()
+        let stdout = (try? String(contentsOf: stdoutURL, encoding: .utf8)) ?? ""
+        let stderr = (try? String(contentsOf: stderrURL, encoding: .utf8)) ?? ""
 
         guard process.terminationStatus == 0 else {
             let log = (stderr.isEmpty ? stdout : stderr).trimmingCharacters(in: .whitespacesAndNewlines)
             throw APIError(message: "\(step) 실패 (exit \(process.terminationStatus))\n\(log)")
         }
+    }
+
+    private nonisolated static func makeLogFile(prefix: String) throws -> (URL, FileHandle) {
+        let fm = FileManager.default
+        let url = fm.temporaryDirectory.appendingPathComponent("\(prefix)-\(UUID().uuidString).log")
+        fm.createFile(atPath: url.path, contents: nil)
+        return (url, try FileHandle(forWritingTo: url))
     }
 
     private func resolveSidecarDirectory() throws -> URL {
