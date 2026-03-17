@@ -453,15 +453,14 @@ final class SidecarProcessManager: ObservableObject {
         let fm = FileManager.default
         let runtimeVenvDirectory = runtimeDirectory.appendingPathComponent(".venv")
         let runtimeVenvPython = runtimeVenvDirectory.appendingPathComponent("bin/python3")
-        let sidecarVenvPython = sidecarDirectory.appendingPathComponent(".venv/bin/python3")
         let runtimeSitePackages = runtimeDirectory.appendingPathComponent("site-packages")
+        let stagedSourceDirectory = runtimeDirectory.appendingPathComponent("staged-sidecar", isDirectory: true)
 
         if hasRequiredModules(python: runtimeVenvPython.path, pythonPath: nil) {
             return PythonRuntimeConfig(pythonExecutable: runtimeVenvPython.path, pythonPath: nil)
         }
-        if hasRequiredModules(python: sidecarVenvPython.path, pythonPath: nil) {
-            return PythonRuntimeConfig(pythonExecutable: sidecarVenvPython.path, pythonPath: nil)
-        }
+
+        try stageSidecarSource(from: sidecarDirectory, to: stagedSourceDirectory)
 
         let pythonCandidates = resolveSystemPythonExecutables()
         guard !pythonCandidates.isEmpty else {
@@ -489,7 +488,7 @@ final class SidecarProcessManager: ObservableObject {
                 )
                 try runCommand(
                     executable: runtimeVenvPython.path,
-                    arguments: ["-m", "pip", "install", "--upgrade", sidecarDirectory.path],
+                    arguments: ["-m", "pip", "install", "--upgrade", stagedSourceDirectory.path],
                     cwd: nil,
                     step: "sidecar 의존성 설치"
                 )
@@ -510,7 +509,7 @@ final class SidecarProcessManager: ObservableObject {
 
                 try runCommand(
                     executable: systemPython,
-                    arguments: ["-m", "pip", "install", "--upgrade", "--target", runtimeSitePackages.path, sidecarDirectory.path],
+                    arguments: ["-m", "pip", "install", "--upgrade", "--target", runtimeSitePackages.path, stagedSourceDirectory.path],
                     cwd: nil,
                     step: "sidecar target 설치"
                 )
@@ -530,6 +529,27 @@ final class SidecarProcessManager: ObservableObject {
         throw APIError(
             message: "sidecar 의존성 설치 실패: Python 환경 구성이 완료되지 않았습니다.\n\(bootstrapErrors.joined(separator: "\n"))"
         )
+    }
+
+    private nonisolated static func stageSidecarSource(from sidecarDirectory: URL, to stagedSourceDirectory: URL) throws {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: stagedSourceDirectory.path) {
+            try? fm.removeItem(at: stagedSourceDirectory)
+        }
+        try fm.createDirectory(at: stagedSourceDirectory, withIntermediateDirectories: true)
+
+        let packageSource = sidecarDirectory.appendingPathComponent("local_ai_core", isDirectory: true)
+        let pyprojectSource = sidecarDirectory.appendingPathComponent("pyproject.toml")
+
+        let packageTarget = stagedSourceDirectory.appendingPathComponent("local_ai_core", isDirectory: true)
+        let pyprojectTarget = stagedSourceDirectory.appendingPathComponent("pyproject.toml")
+
+        guard fm.fileExists(atPath: packageSource.path), fm.fileExists(atPath: pyprojectSource.path) else {
+            throw APIError(message: "sidecar 소스 파일을 찾지 못했습니다. local_ai_core 또는 pyproject.toml이 없습니다.")
+        }
+
+        try fm.copyItem(at: packageSource, to: packageTarget)
+        try fm.copyItem(at: pyprojectSource, to: pyprojectTarget)
     }
 
     private nonisolated static func prepareRuntimeDirectory() throws -> URL {
