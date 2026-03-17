@@ -454,13 +454,14 @@ final class SidecarProcessManager: ObservableObject {
         let runtimeVenvDirectory = runtimeDirectory.appendingPathComponent(".venv")
         let runtimeVenvPython = runtimeVenvDirectory.appendingPathComponent("bin/python3")
         let runtimeSitePackages = runtimeDirectory.appendingPathComponent("site-packages")
-        let stagedSourceDirectory = runtimeDirectory.appendingPathComponent("staged-sidecar", isDirectory: true)
+        let stagedSourceDirectory = runtimeDirectory.appendingPathComponent("staged-sidecar-\(UUID().uuidString)", isDirectory: true)
 
         if hasRequiredModules(python: runtimeVenvPython.path, pythonPath: nil) {
             return PythonRuntimeConfig(pythonExecutable: runtimeVenvPython.path, pythonPath: nil)
         }
 
         try stageSidecarSource(from: sidecarDirectory, to: stagedSourceDirectory)
+        defer { try? fm.removeItem(at: stagedSourceDirectory) }
 
         let pythonCandidates = resolveSystemPythonExecutables()
         guard !pythonCandidates.isEmpty else {
@@ -533,9 +534,6 @@ final class SidecarProcessManager: ObservableObject {
 
     private nonisolated static func stageSidecarSource(from sidecarDirectory: URL, to stagedSourceDirectory: URL) throws {
         let fm = FileManager.default
-        if fm.fileExists(atPath: stagedSourceDirectory.path) {
-            try? fm.removeItem(at: stagedSourceDirectory)
-        }
         try fm.createDirectory(at: stagedSourceDirectory, withIntermediateDirectories: true)
 
         let packageSource = sidecarDirectory.appendingPathComponent("local_ai_core", isDirectory: true)
@@ -548,8 +546,36 @@ final class SidecarProcessManager: ObservableObject {
             throw APIError(message: "sidecar 소스 파일을 찾지 못했습니다. local_ai_core 또는 pyproject.toml이 없습니다.")
         }
 
-        try fm.copyItem(at: packageSource, to: packageTarget)
-        try fm.copyItem(at: pyprojectSource, to: pyprojectTarget)
+        try copyDirectory(source: packageSource, destination: packageTarget)
+        let pyprojectData = try Data(contentsOf: pyprojectSource)
+        try pyprojectData.write(to: pyprojectTarget, options: .atomic)
+    }
+
+    private nonisolated static func copyDirectory(source: URL, destination: URL) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+
+        let entries = try fm.contentsOfDirectory(
+            at: source,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+
+        for entry in entries {
+            let name = entry.lastPathComponent
+            if name == "__pycache__" || name.hasSuffix(".pyc") {
+                continue
+            }
+
+            let target = destination.appendingPathComponent(name, isDirectory: false)
+            let values = try entry.resourceValues(forKeys: [.isDirectoryKey])
+            if values.isDirectory == true {
+                try copyDirectory(source: entry, destination: target)
+            } else {
+                let data = try Data(contentsOf: entry)
+                try data.write(to: target, options: .atomic)
+            }
+        }
     }
 
     private nonisolated static func prepareRuntimeDirectory() throws -> URL {
