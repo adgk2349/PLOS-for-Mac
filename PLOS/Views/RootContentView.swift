@@ -8,11 +8,10 @@ struct ContentView: View {
             AnimatedGlassBackground()
 
             VStack(spacing: 10) {
-                headerBar
-
                 if viewModel.hasFinishedOnboarding {
                     MainWorkspaceView(viewModel: viewModel)
                 } else {
+                    headerBar
                     OnboardingView(viewModel: viewModel)
                 }
 
@@ -44,18 +43,23 @@ struct ContentView: View {
                 .background(.regularMaterial)
                 .clipShape(Capsule())
 
-            if let snapshot = viewModel.statusSnapshot, snapshot.latest_external_call != nil {
-                Image(systemName: "network")
-                    .foregroundStyle(.orange)
-                    .help("최근 외부 호출 있음")
-            } else {
-                Image(systemName: "desktopcomputer")
-                    .foregroundStyle(.green)
-                    .help("로컬 처리")
-            }
+            routeBadge
         }
         .padding(12)
         .glassCard(cornerRadius: 14)
     }
-}
 
+    @ViewBuilder
+    private var routeBadge: some View {
+        switch viewModel.currentRoute {
+        case .local:
+            Image(systemName: "lock.shield.fill")
+                .foregroundStyle(.green)
+                .help("현재 로컬 처리 경로")
+        case .external:
+            Image(systemName: "cloud.fill")
+                .foregroundStyle(.orange)
+                .help("최근 응답은 외부 AI 경로")
+        }
+    }
+}

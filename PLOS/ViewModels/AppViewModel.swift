@@ -74,6 +74,11 @@ enum OnboardingStep: Int, CaseIterable {
     case ready
 }
 
+enum ProcessingRoute {
+    case local
+    case external
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     static let fixedCategories = ["학습자료", "프로젝트문서", "회의록", "아이디어", "개인메모", "참고자료", "코드관련"]
@@ -103,6 +108,7 @@ final class AppViewModel: ObservableObject {
     @Published var showAdvancedModelDetails = false
     @Published var isDownloadingModel = false
     @Published var localRuntimeDetail = ""
+    @Published var currentRoute: ProcessingRoute = .local
     @Published var chatFilterCategory = ""
     @Published var chatFilterTags = ""
     @Published var chatFilterYear = ""
@@ -294,6 +300,7 @@ final class AppViewModel: ObservableObject {
                 )
             )
             chatMessages.append(ChatMessage(source: .external, text: response.answer, timestamp: Date()))
+            currentRoute = .external
             try await refreshRemoteState()
         } catch {
             handleViewModelError(error)
@@ -791,6 +798,7 @@ final class AppViewModel: ObservableObject {
                 localRuntimeDetail = runtimeDetail
             }
             chatMessages.append(ChatMessage(local: response, timestamp: Date()))
+            currentRoute = .local
             latestQueryForDeepAnalysis = trimmed
             try await refreshRemoteState()
         } catch {

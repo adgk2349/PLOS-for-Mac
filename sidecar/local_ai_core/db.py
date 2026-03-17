@@ -341,12 +341,20 @@ class Database:
         *,
         search: str | None = None,
         filters: ChatFilters | None = None,
+        included_paths: list[str] | None = None,
+        excluded_paths: list[str] | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> tuple[list[DocumentMetadata], int]:
         rows = self._fetchall("SELECT * FROM documents ORDER BY indexed_at DESC")
         filtered = [self._row_to_effective_dict(row) for row in rows]
-        filtered = self._apply_doc_filters(filtered, search=search, filters=filters)
+        filtered = self._apply_doc_filters(
+            filtered,
+            search=search,
+            filters=filters,
+            included_paths=included_paths,
+            excluded_paths=excluded_paths,
+        )
 
         total = len(filtered)
         page = filtered[offset : offset + limit]
@@ -357,10 +365,18 @@ class Database:
         *,
         filters: ChatFilters | None,
         search: str | None = None,
+        included_paths: list[str] | None = None,
+        excluded_paths: list[str] | None = None,
     ) -> set[str]:
         rows = self._fetchall("SELECT * FROM documents")
         effective = [self._row_to_effective_dict(row) for row in rows]
-        filtered = self._apply_doc_filters(effective, search=search, filters=filters)
+        filtered = self._apply_doc_filters(
+            effective,
+            search=search,
+            filters=filters,
+            included_paths=included_paths,
+            excluded_paths=excluded_paths,
+        )
         return {item["doc_id"] for item in filtered}
 
     def update_document_metadata(
@@ -534,11 +550,19 @@ class Database:
         *,
         search: str | None,
         filters: ChatFilters | None,
+        included_paths: list[str] | None = None,
+        excluded_paths: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if not rows:
             return []
 
         result = rows
+        if included_paths is not None:
+            result = self._apply_workspace_scope(
+                result,
+                included_paths=included_paths,
+                excluded_paths=excluded_paths or [],
+            )
         if search:
             needle = search.strip().lower()
             if needle:
@@ -578,6 +602,43 @@ class Database:
             result = [row for row in result if not bool(row.get("excluded", False))]
 
         return result
+
+    @staticmethod
+    def _apply_workspace_scope(
+        rows: list[dict[str, Any]],
+        *,
+        included_paths: list[str],
+        excluded_paths: list[str],
+    ) -> list[dict[str, Any]]:
+        included_roots = [Database._normalize_path(path) for path in included_paths if str(path).strip()]
+        excluded_roots = [Database._normalize_path(path) for path in excluded_paths if str(path).strip()]
+        if not included_roots:
+            return []
+
+        scoped: list[dict[str, Any]] = []
+        for row in rows:
+            candidate = Database._normalize_path(str(row.get("path") or ""))
+            if not candidate:
+                continue
+            if any(Database._is_same_or_child(candidate, excluded) for excluded in excluded_roots):
+                continue
+            if any(Database._is_same_or_child(candidate, included) for included in included_roots):
+                scoped.append(row)
+        return scoped
+
+    @staticmethod
+    def _normalize_path(path: str) -> Path | None:
+        stripped = (path or "").strip()
+        if not stripped:
+            return None
+        try:
+            return Path(stripped).expanduser().resolve(strict=False)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_same_or_child(path: Path, root: Path) -> bool:
+        return path == root or root in path.parents
 
     @staticmethod
     def _row_to_raw_dict(row: sqlite3.Row) -> dict[str, Any]:

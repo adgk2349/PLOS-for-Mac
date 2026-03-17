@@ -161,6 +161,7 @@ def create_app() -> FastAPI:
         tag_list = [item.strip() for item in (tags or "").split(",") if item.strip()]
         effective_limit = max(1, min(limit, 300))
         effective_offset = max(0, offset)
+        workspace = app_state.db.get_workspace()
         filters = ChatFilters(
             category=category,
             tags=tag_list,
@@ -171,6 +172,8 @@ def create_app() -> FastAPI:
         docs, total = app_state.db.list_documents(
             search=search,
             filters=filters,
+            included_paths=workspace.included_paths,
+            excluded_paths=workspace.excluded_paths,
             limit=effective_limit,
             offset=effective_offset,
         )

@@ -142,6 +142,60 @@ def test_incremental_reindex_prunes_deleted_file(client, auth_headers, tmp_path:
     assert all("deleteme_unique_token_9281" not in item["snippet"] for item in payload["citations"])
 
 
+def test_workspace_scope_blocks_removed_folder_without_reindex(client, auth_headers, tmp_path: Path):
+    folder_a = tmp_path / "folderA"
+    folder_b = tmp_path / "folderB"
+    folder_a.mkdir(parents=True, exist_ok=True)
+    folder_b.mkdir(parents=True, exist_ok=True)
+    file_a = folder_a / "a.txt"
+    file_b = folder_b / "b.txt"
+    file_a.write_text("datastructure_unique_a_token", encoding="utf-8")
+    file_b.write_text("out_of_scope_unique_b_token", encoding="utf-8")
+
+    client.post(
+        "/v1/workspaces",
+        headers=auth_headers,
+        json={
+            "included_paths": [str(folder_a), str(folder_b)],
+            "excluded_paths": [],
+            "startup_profile": "RECOMMENDED",
+            "default_mode": "GENERAL",
+        },
+    )
+    full_job = client.post("/v1/index/jobs", headers=auth_headers, json={"scope": "full"})
+    _poll_job(client, auth_headers, full_job.json()["job_id"])
+
+    # Narrow workspace to folderA only, without running another index job.
+    client.post(
+        "/v1/workspaces",
+        headers=auth_headers,
+        json={
+            "included_paths": [str(folder_a)],
+            "excluded_paths": [],
+            "startup_profile": "RECOMMENDED",
+            "default_mode": "GENERAL",
+        },
+    )
+
+    docs = client.get("/v1/docs", headers=auth_headers)
+    assert docs.status_code == 200
+    doc_paths = [item["path"] for item in docs.json()["documents"]]
+    assert str(file_a) in doc_paths
+    assert str(file_b) not in doc_paths
+
+    chat = client.post(
+        "/v1/chat/local",
+        headers=auth_headers,
+        json={
+            "query": "out_of_scope_unique_b_token",
+            "mode": "GENERAL",
+        },
+    )
+    assert chat.status_code == 200
+    payload = chat.json()
+    assert all(item["file_path"] != str(file_b) for item in payload["citations"])
+
+
 def test_external_call_privacy_gate(client, auth_headers, tmp_path: Path):
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)

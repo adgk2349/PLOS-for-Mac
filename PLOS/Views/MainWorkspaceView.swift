@@ -1,27 +1,252 @@
 import SwiftUI
 
+private enum WorkspaceSection: String, CaseIterable, Identifiable {
+    case chat
+    case status
+    case settings
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .chat:
+            return "Chat"
+        case .status:
+            return "상태"
+        case .settings:
+            return "설정"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .chat:
+            return "message"
+        case .status:
+            return "waveform.path.ecg"
+        case .settings:
+            return "gearshape"
+        }
+    }
+}
+
 struct MainWorkspaceView: View {
     @ObservedObject var viewModel: AppViewModel
+    @State private var selectedSection: WorkspaceSection = .chat
+    @State private var sidebarSearch = ""
 
     var body: some View {
-        TabView {
-            ChatPanelView(viewModel: viewModel)
-                .tabItem {
-                    Label("질의응답", systemImage: "message")
-                }
-
-            StatusPanelView(viewModel: viewModel)
-                .tabItem {
-                    Label("상태", systemImage: "gauge")
-                }
-
-            SettingsPanelView(viewModel: viewModel)
-                .tabItem {
-                    Label("설정", systemImage: "gearshape")
-                }
+        NavigationSplitView {
+            sidebar
+                .padding(12)
+        } detail: {
+            VStack(spacing: 12) {
+                detailHeader
+                detailContent
+            }
+            .padding(12)
         }
-        .padding(8)
-        .glassCard(cornerRadius: 16)
+        .navigationSplitViewStyle(.balanced)
+    }
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 12, height: 12)
+                Circle()
+                    .fill(Color.yellow)
+                    .frame(width: 12, height: 12)
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 12, height: 12)
+
+                Spacer()
+
+                Image(systemName: "rectangle.leadinghalf.inset.filled")
+                    .foregroundStyle(.secondary)
+                Image(systemName: "square.and.pencil")
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("검색", text: $sidebarSearch)
+                    .textFieldStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .glassCard(cornerRadius: 12)
+
+            VStack(alignment: .leading, spacing: 8) {
+                sidebarButton(.chat)
+                sidebarButton(.status)
+                sidebarButton(.settings)
+            }
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("최근 대화")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.bottom, 4)
+
+                    ForEach(filteredRecentPrompts, id: \.self) { prompt in
+                        Text(prompt)
+                            .font(.subheadline)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .glassEffect(
+                                .regular.tint(Color.white.opacity(0.08)),
+                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            )
+                    }
+                }
+            }
+
+            Spacer()
+
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(Color.orange)
+                    .frame(width: 30, height: 30)
+                    .overlay(
+                        Text("LM")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.white)
+                    )
+                Text("Lee Seung Min")
+                    .font(.headline)
+            }
+            .padding(.top, 6)
+        }
+        .padding(14)
+        .frame(minWidth: 280, idealWidth: 320, maxWidth: 360)
+        .glassCard(cornerRadius: 24)
+    }
+
+    private var detailHeader: some View {
+        HStack {
+            Text("ChatGPT Auto")
+                .font(.title3.weight(.semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .glassCard(cornerRadius: 16)
+
+            Spacer()
+
+            HStack(spacing: 8) {
+                routeBadge
+                Button {
+                    selectedSection = .chat
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .buttonStyle(.glass)
+
+                Button {
+                    selectedSection = .chat
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .buttonStyle(.glass)
+            }
+        }
+        .padding(10)
+        .glassCard(cornerRadius: 18)
+    }
+
+    @ViewBuilder
+    private var routeBadge: some View {
+        switch viewModel.currentRoute {
+        case .local:
+            Label("로컬", systemImage: "lock.shield.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.green)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .glassCard(cornerRadius: 14)
+        case .external:
+            Label("외부", systemImage: "cloud.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .glassCard(cornerRadius: 14)
+        }
+    }
+
+    @ViewBuilder
+    private var detailContent: some View {
+        switch selectedSection {
+        case .chat:
+            ChatPanelView(viewModel: viewModel)
+                .glassCard(cornerRadius: 22)
+        case .status:
+            StatusPanelView(viewModel: viewModel)
+                .glassCard(cornerRadius: 22)
+        case .settings:
+            SettingsPanelView(viewModel: viewModel)
+                .glassCard(cornerRadius: 22)
+        }
+    }
+
+    private var recentPrompts: [String] {
+        var seen = Set<String>()
+        let prompts = viewModel.chatMessages
+            .filter { $0.source == .user }
+            .compactMap(\.text)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var unique: [String] = []
+        for prompt in prompts.reversed() where !seen.contains(prompt) {
+            unique.append(prompt)
+            seen.insert(prompt)
+        }
+        return unique
+    }
+
+    private var filteredRecentPrompts: [String] {
+        let needle = sidebarSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if needle.isEmpty {
+            return Array(recentPrompts.prefix(14))
+        }
+        return recentPrompts
+            .filter { $0.lowercased().contains(needle) }
+            .prefix(14)
+            .map { $0 }
+    }
+
+    private func sidebarButton(_ section: WorkspaceSection) -> some View {
+        let selected = selectedSection == section
+        return Button {
+            selectedSection = section
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: section.systemImage)
+                    .frame(width: 18)
+                Text(section.title)
+                    .font(.headline)
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .if(selected) { view in
+                view.glassEffect(
+                    .regular.tint(Color.white.opacity(0.16)),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
+            }
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -30,7 +255,7 @@ struct ChatPanelView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let useSplitLayout = proxy.size.width >= 980
+            let useSplitLayout = proxy.size.width >= 1060
 
             VStack(spacing: 12) {
                 controls
@@ -110,6 +335,7 @@ struct ChatPanelView: View {
                 Button("더 깊게 분석") {
                     viewModel.deepAnalyzeTapped()
                 }
+                .buttonStyle(.glassProminent)
                 .disabled(viewModel.chatMessages.isEmpty || viewModel.isBusy)
             }
 
@@ -135,7 +361,7 @@ struct ChatPanelView: View {
                 Button(viewModel.isCitationDrawerVisible ? "출처 숨기기" : "출처 보기") {
                     viewModel.isCitationDrawerVisible.toggle()
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.glass)
             }
         }
         .padding(12)
@@ -155,11 +381,7 @@ struct ChatPanelView: View {
                             messageBody(message)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(12)
-                                .background(background(for: message.source), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
-                                )
+                                .glassTint(background(for: message.source), cornerRadius: 12)
                         }
                     }
                 }
@@ -209,8 +431,8 @@ struct ChatPanelView: View {
                             }
                             .padding(10)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(
-                                (viewModel.highlightedCitationPath == citation.file_path ? Color.white.opacity(0.18) : Color.white.opacity(0.08)),
+                            .glassEffect(
+                                .regular.tint(viewModel.highlightedCitationPath == citation.file_path ? Color.white.opacity(0.20) : Color.white.opacity(0.08)),
                                 in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                             )
                         }
@@ -224,12 +446,15 @@ struct ChatPanelView: View {
 
     private var composer: some View {
         HStack {
-            TextField("질문을 입력하세요", text: $viewModel.inputQuery, axis: .vertical)
-                .lineLimit(1 ... 5)
+            TextField("무엇이든 부탁하세요", text: $viewModel.inputQuery, axis: .vertical)
+                .lineLimit(1 ... 6)
                 .textFieldStyle(.plain)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
-                .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .glassEffect(
+                    .regular.tint(Color.white.opacity(0.10)),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
 
             Button("전송") {
                 Task {
@@ -280,7 +505,7 @@ struct ChatPanelView: View {
                                     await viewModel.executeAction(action)
                                 }
                             }
-                            .buttonStyle(.bordered)
+                            .buttonStyle(.glass)
                         }
                     }
                     .padding(.top, 4)
@@ -302,3 +527,15 @@ struct ChatPanelView: View {
         }
     }
 }
+
+private extension View {
+    @ViewBuilder
+    func `if`<Transformed: View>(_ condition: Bool, transform: (Self) -> Transformed) -> some View {
+        if condition {
+            transform(self)
+        } else {
+            self
+        }
+    }
+}
+

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 from .db import Database
@@ -54,10 +55,20 @@ class ChatService:
         if merged_filters.excluded is None:
             merged_filters.excluded = False
 
-        allowed_doc_ids = self._db.find_doc_ids(filters=merged_filters, search=None)
+        allowed_doc_ids = self._db.find_doc_ids(
+            filters=merged_filters,
+            search=None,
+            included_paths=workspace.included_paths,
+            excluded_paths=workspace.excluded_paths,
+        )
         if req.filters is None and not allowed_doc_ids:
             merged_filters = ChatFilters(excluded=False)
-            allowed_doc_ids = self._db.find_doc_ids(filters=merged_filters, search=None)
+            allowed_doc_ids = self._db.find_doc_ids(
+                filters=merged_filters,
+                search=None,
+                included_paths=workspace.included_paths,
+                excluded_paths=workspace.excluded_paths,
+            )
         metadata_map = self._db.get_documents_metadata_map(list(allowed_doc_ids))
         preset, hits = retrieve_hits(
             self._vector_store,
@@ -92,7 +103,48 @@ class ChatService:
                     citations=[],
                     filters=merged_filters,
                     response_language=response_language,
-                    strict_insufficient=True,
+                    insufficient_reason="strict_threshold",
+                ),
+                mode=req.mode,
+                used_profile=workspace.startup_profile,
+                is_local=True,
+            )
+
+        confidence_floor = self._confidence_floor(req.mode)
+        top_score = hits[0].score if hits else None
+        overlap_count, overlap_ratio = self._grounding_overlap(req.query, hits)
+        low_confidence = req.mode != WorkMode.STRICT_SEARCH and (
+            not hits
+            or (top_score is not None and top_score < confidence_floor)
+            or overlap_count == 0
+            or (overlap_ratio < 0.08 and (top_score is not None and top_score < 0.45))
+        )
+        if low_confidence:
+            intent, lead, result_summary, actions = self._composer.compose(
+                query=req.query,
+                mode=req.mode,
+                response_language=response_language,
+                citations=[],
+                result_summary=insufficient_evidence_message(response_language),
+                insufficient=True,
+            )
+            return LocalChatResponse(
+                intent=intent,
+                lead=lead,
+                result_summary=result_summary,
+                citations=[],
+                actions=actions,
+                reasoning_brief=self._reasoning_brief(
+                    mode=req.mode,
+                    preset=preset,
+                    citations=[],
+                    filters=merged_filters,
+                    response_language=response_language,
+                    insufficient_reason="low_confidence",
+                    top_score=top_score,
+                    confidence_floor=confidence_floor,
+                    overlap_count=overlap_count,
+                    overlap_ratio=overlap_ratio,
                 ),
                 mode=req.mode,
                 used_profile=workspace.startup_profile,
@@ -147,7 +199,7 @@ class ChatService:
                 citations=citations,
                 filters=merged_filters,
                 response_language=response_language,
-                strict_insufficient=False,
+                insufficient_reason=None,
             ),
             mode=req.mode,
             used_profile=workspace.startup_profile,
@@ -203,9 +255,14 @@ class ChatService:
         citations: list[Citation],
         filters: ChatFilters | None,
         response_language: str,
-        strict_insufficient: bool,
+        insufficient_reason: str | None,
+        top_score: float | None = None,
+        confidence_floor: float | None = None,
+        overlap_count: int | None = None,
+        overlap_ratio: float | None = None,
     ) -> str:
-        top_score = f"{citations[0].score:.3f}" if citations else "-"
+        score_value = top_score if top_score is not None else (citations[0].score if citations else None)
+        top_score_text = f"{score_value:.3f}" if score_value is not None else "-"
         filter_parts: list[str] = []
         if filters:
             if filters.category:
@@ -219,22 +276,69 @@ class ChatService:
         filter_text = ", ".join(filter_parts) if filter_parts else "-"
 
         if response_language == "ko":
-            if strict_insufficient:
+            if insufficient_reason == "strict_threshold":
+                return f"판단 로그: 모드={mode.value}, 컨텍스트 top_k={preset.top_k}, 엄격 검색 임계치 미달로 근거 부족 응답을 반환합니다."
+            if insufficient_reason == "low_confidence":
+                threshold_text = f"{confidence_floor:.3f}" if confidence_floor is not None else "-"
+                overlap_text = f"{overlap_ratio:.2f}" if overlap_ratio is not None else "-"
                 return (
                     f"판단 로그: 모드={mode.value}, 컨텍스트 top_k={preset.top_k}, "
-                    "엄격 검색 임계치 미달로 근거 부족 응답을 반환합니다."
+                    f"최고 점수={top_score_text}, 질의-근거 키워드 교집합={overlap_count or 0}개(비율 {overlap_text}), "
+                    f"신뢰 임계치({threshold_text}) 조건 미달로 근거 부족 응답을 반환합니다."
                 )
             return (
                 f"판단 로그: 모드={mode.value}, 컨텍스트 top_k={preset.top_k}, "
-                f"채택 근거={len(citations)}개, 최고 점수={top_score}, 필터={filter_text}."
+                f"채택 근거={len(citations)}개, 최고 점수={top_score_text}, 필터={filter_text}."
             )
 
-        if strict_insufficient:
+        if insufficient_reason == "strict_threshold":
+            return f"Reasoning log: mode={mode.value}, context top_k={preset.top_k}, strict threshold not met, returning insufficient-evidence response."
+        if insufficient_reason == "low_confidence":
+            threshold_text = f"{confidence_floor:.3f}" if confidence_floor is not None else "-"
+            overlap_text = f"{overlap_ratio:.2f}" if overlap_ratio is not None else "-"
             return (
                 f"Reasoning log: mode={mode.value}, context top_k={preset.top_k}, "
-                "strict threshold not met, returning insufficient-evidence response."
+                f"top score={top_score_text}, query-evidence keyword overlap={overlap_count or 0} (ratio {overlap_text}), "
+                f"below confidence conditions (floor {threshold_text}), returning insufficient-evidence response."
             )
         return (
             f"Reasoning log: mode={mode.value}, context top_k={preset.top_k}, "
-            f"accepted citations={len(citations)}, top score={top_score}, filters={filter_text}."
+            f"accepted citations={len(citations)}, top score={top_score_text}, filters={filter_text}."
         )
+
+    @staticmethod
+    def _confidence_floor(mode: WorkMode) -> float:
+        floors = {
+            WorkMode.GENERAL: 0.12,
+            WorkMode.SUMMARY: 0.12,
+            WorkMode.RESEARCH: 0.14,
+            WorkMode.DEVELOPMENT: 0.14,
+            WorkMode.WRITING: 0.10,
+            WorkMode.PLANNING: 0.12,
+        }
+        return floors.get(mode, 0.40)
+
+    @staticmethod
+    def _grounding_overlap(query: str, hits) -> tuple[int, float]:
+        query_terms = ChatService._keyword_tokens(query)
+        if not query_terms or not hits:
+            return 0, 0.0
+
+        evidence_terms: set[str] = set()
+        for hit in hits[:3]:
+            evidence_terms.update(ChatService._keyword_tokens(hit.text))
+            evidence_terms.update(ChatService._keyword_tokens(hit.file_path))
+
+        overlap = len(query_terms.intersection(evidence_terms))
+        ratio = overlap / max(1, len(query_terms))
+        return overlap, ratio
+
+    @staticmethod
+    def _keyword_tokens(text: str) -> set[str]:
+        raw = (text or "").lower()
+        tokens = re.findall(r"[a-z0-9가-힣_+-]{2,}", raw)
+        stop = {
+            "the", "and", "for", "with", "that", "this", "from", "what", "when", "where", "which", "would", "could",
+            "자료", "문서", "정리", "요약", "질문", "파일", "관련", "기반", "같은", "다음", "해주세요", "해줘",
+        }
+        return {token for token in tokens if token not in stop}

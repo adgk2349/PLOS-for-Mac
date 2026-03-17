@@ -3,14 +3,12 @@ import SwiftUI
 // MARK: - Views
 
 struct GlassTheme {
-    static let bgStart = Color(red: 0.05, green: 0.10, blue: 0.16)
-    static let bgMid = Color(red: 0.07, green: 0.20, blue: 0.22)
-    static let bgEnd = Color(red: 0.12, green: 0.24, blue: 0.28)
-    static let cardStroke = Color.white.opacity(0.26)
-    static let cardShadow = Color.black.opacity(0.24)
-    static let userTint = Color.blue.opacity(0.20)
-    static let localTint = Color.green.opacity(0.18)
-    static let externalTint = Color.orange.opacity(0.20)
+    static let bgStart = Color(red: 0.06, green: 0.07, blue: 0.10)
+    static let bgMid = Color(red: 0.08, green: 0.10, blue: 0.14)
+    static let bgEnd = Color(red: 0.10, green: 0.13, blue: 0.18)
+    static let userTint = Color.blue.opacity(0.24)
+    static let localTint = Color.white.opacity(0.18)
+    static let externalTint = Color.orange.opacity(0.24)
 }
 
 struct GlassCardModifier: ViewModifier {
@@ -18,18 +16,23 @@ struct GlassCardModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(GlassTheme.cardStroke, lineWidth: 1)
+            .glassEffect(
+                .regular,
+                in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
             )
-            .shadow(color: GlassTheme.cardShadow, radius: 18, x: 0, y: 10)
     }
 }
 
 extension View {
     func glassCard(cornerRadius: CGFloat = 16) -> some View {
         modifier(GlassCardModifier(cornerRadius: cornerRadius))
+    }
+
+    func glassTint(_ color: Color, cornerRadius: CGFloat = 12) -> some View {
+        glassEffect(
+            .regular.tint(color),
+            in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        )
     }
 }
 
@@ -45,13 +48,13 @@ struct AnimatedGlassBackground: View {
             )
 
             Circle()
-                .fill(Color.white.opacity(0.16))
+                .fill(Color.white.opacity(0.10))
                 .blur(radius: 90)
                 .frame(width: animate ? 420 : 300, height: animate ? 420 : 300)
                 .offset(x: animate ? 180 : -120, y: animate ? -140 : 160)
 
             Circle()
-                .fill(Color.cyan.opacity(0.15))
+                .fill(Color.blue.opacity(0.10))
                 .blur(radius: 110)
                 .frame(width: animate ? 520 : 360, height: animate ? 520 : 360)
                 .offset(x: animate ? -220 : 160, y: animate ? 180 : -140)
@@ -64,4 +67,3 @@ struct AnimatedGlassBackground: View {
         }
     }
 }
-
