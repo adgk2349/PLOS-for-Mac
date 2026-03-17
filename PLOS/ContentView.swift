@@ -336,7 +336,6 @@ final class SidecarProcessManager: ObservableObject {
     private(set) var sessionToken = UUID().uuidString
     private var process: Process?
     private(set) var apiClient: SidecarAPIClient?
-    private var startupLogs = ""
 
     private let host = "127.0.0.1"
     private let port = 8777
@@ -346,7 +345,6 @@ final class SidecarProcessManager: ObservableObject {
             return
         }
 
-        startupLogs = ""
         let sidecarDirectory = try resolveSidecarDirectory()
         let python = try ensureSidecarEnvironment(sidecarDirectory: sidecarDirectory)
         let dataDirectory = sidecarDirectory.appendingPathComponent("data")
@@ -370,7 +368,6 @@ final class SidecarProcessManager: ObservableObject {
         process.environment = env
 
         let pipe = Pipe()
-        attachLogCapture(to: pipe)
         process.standardOutput = pipe
         process.standardError = pipe
 
@@ -402,7 +399,7 @@ final class SidecarProcessManager: ObservableObject {
     private func waitUntilHealthy(client: SidecarAPIClient) async throws {
         for _ in 0 ..< 80 {
             if let process, !process.isRunning {
-                throw APIError(message: "Sidecar가 시작 직후 종료되었습니다.\n\(startupLogSummary())")
+                throw APIError(message: "Sidecar가 시작 직후 종료되었습니다. Python/패키지 설치 상태를 확인해 주세요.")
             }
             do {
                 try await client.health()
@@ -411,30 +408,7 @@ final class SidecarProcessManager: ObservableObject {
                 try await Task.sleep(nanoseconds: 250_000_000)
             }
         }
-        throw APIError(message: "Sidecar가 정상 상태가 되지 않았습니다. (health timeout)\n\(startupLogSummary())")
-    }
-
-    private func attachLogCapture(to pipe: Pipe) {
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            guard let text = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor in
-                guard let self else { return }
-                self.startupLogs.append(text)
-                if self.startupLogs.count > 8000 {
-                    self.startupLogs.removeFirst(self.startupLogs.count - 8000)
-                }
-            }
-        }
-    }
-
-    private func startupLogSummary() -> String {
-        let trimmed = startupLogs.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return "sidecar 로그가 비어 있습니다."
-        }
-        return "최근 sidecar 로그:\n\(trimmed.suffix(1200))"
+        throw APIError(message: "Sidecar가 정상 상태가 되지 않았습니다. (health timeout)")
     }
 
     private func ensureSidecarEnvironment(sidecarDirectory: URL) throws -> String {
