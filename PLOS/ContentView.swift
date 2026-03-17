@@ -336,6 +336,13 @@ final class SidecarProcessManager: ObservableObject {
         let pythonPath: String?
     }
 
+    private struct LaunchArtifacts {
+        let process: Process
+        let logURL: URL
+        let logHandle: FileHandle
+        let baseURL: URL
+    }
+
     @Published private(set) var isRunning = false
 
     private(set) var sessionToken = UUID().uuidString
@@ -346,7 +353,7 @@ final class SidecarProcessManager: ObservableObject {
     private var isStarting = false
 
     private let host = "127.0.0.1"
-    private let port = 8777
+    private var preferredPort = 8777
 
     func start() async throws {
         if isRunning, apiClient != nil {
@@ -371,59 +378,56 @@ final class SidecarProcessManager: ObservableObject {
         }.value
         let dataDirectory = runtimeDirectory.appendingPathComponent("data")
         try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
+        let ports = Self.portCandidates(preferred: preferredPort)
+        var lastError: Error?
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = [
-            runtimeConfig.pythonExecutable,
-            "-m", "uvicorn",
-            "local_ai_core.main:app",
-            "--host", host,
-            "--port", String(port)
-        ]
-        process.currentDirectoryURL = runtimeDirectory
+        for port in ports {
+            var launched: LaunchArtifacts?
+            do {
+                launched = try Self.launchSidecarProcess(
+                    runtimeConfig: runtimeConfig,
+                    runtimeDirectory: runtimeDirectory,
+                    dataDirectory: dataDirectory,
+                    host: host,
+                    port: port,
+                    sessionToken: sessionToken
+                )
 
-        var env = ProcessInfo.processInfo.environment
-        env["LOCAL_AI_SESSION_TOKEN"] = sessionToken
-        env["LOCAL_AI_DATA_DIR"] = dataDirectory.path
-        env["PYTHONUNBUFFERED"] = "1"
-        if let runtimePythonPath = runtimeConfig.pythonPath {
-            if let existing = env["PYTHONPATH"], !existing.isEmpty {
-                env["PYTHONPATH"] = "\(runtimePythonPath):\(existing)"
-            } else {
-                env["PYTHONPATH"] = runtimePythonPath
+                guard let launched else {
+                    throw APIError(message: "Sidecar 런치 아티팩트 생성 실패")
+                }
+
+                self.process = launched.process
+                self.sidecarLogURL = launched.logURL
+                self.sidecarLogHandle = launched.logHandle
+
+                let client = SidecarAPIClient(
+                    baseURL: launched.baseURL,
+                    sessionToken: sessionToken
+                )
+                self.apiClient = client
+
+                try await waitUntilHealthy(client: client)
+                // Health endpoint is unauthenticated; this verifies session token match.
+                _ = try await client.getSettings()
+
+                preferredPort = port
+                isRunning = true
+                return
+            } catch {
+                lastError = error
+                if let launched {
+                    launched.process.terminate()
+                    try? launched.logHandle.close()
+                }
+                self.process = nil
+                self.sidecarLogURL = nil
+                self.sidecarLogHandle = nil
+                self.apiClient = nil
             }
         }
-        process.environment = env
 
-        let (logURL, logHandle) = try Self.makeLogFile(prefix: "sidecar-runtime")
-        process.standardOutput = logHandle
-        process.standardError = logHandle
-
-        do {
-            try process.run()
-        } catch {
-            try? logHandle.close()
-            throw APIError(message: "Sidecar 실행 실패: \(error.localizedDescription)")
-        }
-
-        self.process = process
-        self.sidecarLogURL = logURL
-        self.sidecarLogHandle = logHandle
-
-        let client = SidecarAPIClient(
-            baseURL: URL(string: "http://\(host):\(port)")!,
-            sessionToken: sessionToken
-        )
-        self.apiClient = client
-
-        do {
-            try await waitUntilHealthy(client: client)
-            isRunning = true
-        } catch {
-            stop()
-            throw error
-        }
+        throw lastError ?? APIError(message: "Sidecar 시작 실패: 사용 가능한 포트를 찾지 못했습니다.")
     }
 
     func stop() {
@@ -449,6 +453,67 @@ final class SidecarProcessManager: ObservableObject {
             }
         }
         throw APIError(message: "Sidecar가 정상 상태가 되지 않았습니다. (health timeout)\n\(sidecarLogSummary())")
+    }
+
+    private nonisolated static func portCandidates(preferred: Int) -> [Int] {
+        var ports = [preferred]
+        let fallback = [8777, 8787, 8797, 8807, 8817, 8827]
+        for port in fallback where !ports.contains(port) {
+            ports.append(port)
+        }
+        return ports
+    }
+
+    private nonisolated static func launchSidecarProcess(
+        runtimeConfig: PythonRuntimeConfig,
+        runtimeDirectory: URL,
+        dataDirectory: URL,
+        host: String,
+        port: Int,
+        sessionToken: String
+    ) throws -> LaunchArtifacts {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [
+            runtimeConfig.pythonExecutable,
+            "-m", "uvicorn",
+            "local_ai_core.main:app",
+            "--host", host,
+            "--port", String(port)
+        ]
+        process.currentDirectoryURL = runtimeDirectory
+
+        var env = ProcessInfo.processInfo.environment
+        env["LOCAL_AI_SESSION_TOKEN"] = sessionToken
+        env["LOCAL_AI_DATA_DIR"] = dataDirectory.path
+        env["PYTHONUNBUFFERED"] = "1"
+        if let runtimePythonPath = runtimeConfig.pythonPath {
+            if let existing = env["PYTHONPATH"], !existing.isEmpty {
+                env["PYTHONPATH"] = "\(runtimePythonPath):\(existing)"
+            } else {
+                env["PYTHONPATH"] = runtimePythonPath
+            }
+        }
+        process.environment = env
+
+        let (logURL, logHandle) = try makeLogFile(prefix: "sidecar-runtime")
+        process.standardOutput = logHandle
+        process.standardError = logHandle
+
+        do {
+            try process.run()
+        } catch {
+            try? logHandle.close()
+            throw APIError(message: "Sidecar 실행 실패(포트 \(port)): \(error.localizedDescription)")
+        }
+
+        let baseURL = URL(string: "http://\(host):\(port)")!
+        return LaunchArtifacts(
+            process: process,
+            logURL: logURL,
+            logHandle: logHandle,
+            baseURL: baseURL
+        )
     }
 
     private func sidecarLogSummary() -> String {
