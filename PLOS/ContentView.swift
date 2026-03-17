@@ -343,6 +343,7 @@ final class SidecarProcessManager: ObservableObject {
     private(set) var apiClient: SidecarAPIClient?
     private var sidecarLogURL: URL?
     private var sidecarLogHandle: FileHandle?
+    private var isStarting = false
 
     private let host = "127.0.0.1"
     private let port = 8777
@@ -351,6 +352,17 @@ final class SidecarProcessManager: ObservableObject {
         if isRunning, apiClient != nil {
             return
         }
+        if isStarting {
+            for _ in 0 ..< 120 {
+                if isRunning, apiClient != nil {
+                    return
+                }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+
+        isStarting = true
+        defer { isStarting = false }
 
         let sidecarDirectory = try resolveSidecarDirectory()
         let runtimeDirectory = try Self.prepareRuntimeDirectory()
@@ -421,6 +433,7 @@ final class SidecarProcessManager: ObservableObject {
         sidecarLogHandle = nil
         apiClient = nil
         isRunning = false
+        isStarting = false
     }
 
     private func waitUntilHealthy(client: SidecarAPIClient) async throws {
@@ -986,10 +999,6 @@ final class AppViewModel: ObservableObject {
     func askLocal() async {
         let query = inputQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return }
-        guard let client = sidecar.apiClient else {
-            lastError = "Sidecar가 준비되지 않았습니다."
-            return
-        }
 
         isBusy = true
         defer { isBusy = false }
@@ -998,6 +1007,7 @@ final class AppViewModel: ObservableObject {
         inputQuery = ""
 
         do {
+            let client = try await ensureSidecarClient()
             let response = try await client.localChat(LocalChatRequest(query: query, mode: selectedMode, conversation_id: nil, top_k: nil))
             citations = response.citations
             chatMessages.append(ChatMessage(source: .local, text: response.answer, timestamp: Date()))
@@ -1027,15 +1037,12 @@ final class AppViewModel: ObservableObject {
             lastError = "먼저 로컬 질문을 실행해 주세요."
             return
         }
-        guard let client = sidecar.apiClient else {
-            lastError = "Sidecar가 준비되지 않았습니다."
-            return
-        }
 
         isBusy = true
         defer { isBusy = false }
 
         do {
+            let client = try await ensureSidecarClient()
             let response = try await client.deepAnalysis(
                 DeepAnalysisRequest(
                     query: query,
@@ -1078,9 +1085,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func refreshRemoteState() async throws {
-        guard let client = sidecar.apiClient else {
-            return
-        }
+        let client = try await ensureSidecarClient()
 
         let settings = try await client.getSettings()
         privacyMode = settings.privacy_mode
@@ -1094,9 +1099,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func syncWorkspaceAndSettings() async throws {
-        guard let client = sidecar.apiClient else {
-            throw APIError(message: "Sidecar client unavailable")
-        }
+        let client = try await ensureSidecarClient()
 
         persistBookmarks()
 
@@ -1121,9 +1124,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func runIndexing(scope: String) async throws {
-        guard let client = sidecar.apiClient else {
-            throw APIError(message: "Sidecar client unavailable")
-        }
+        let client = try await ensureSidecarClient()
 
         let start = try await client.startIndexJob(scope: scope)
 
@@ -1140,6 +1141,17 @@ final class AppViewModel: ObservableObject {
             }
             try await Task.sleep(nanoseconds: 300_000_000)
         }
+    }
+
+    private func ensureSidecarClient() async throws -> SidecarAPIClient {
+        if let client = sidecar.apiClient {
+            return client
+        }
+        try await sidecar.start()
+        guard let client = sidecar.apiClient else {
+            throw APIError(message: "Sidecar client unavailable: sidecar 시작 후에도 API 클라이언트가 생성되지 않았습니다.")
+        }
+        return client
     }
 
     private func stageLabel(_ stage: String) -> String {
