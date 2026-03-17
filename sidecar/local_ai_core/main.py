@@ -92,7 +92,7 @@ async def lifespan(_: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Local AI Core Sidecar", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="Local AI Core Sidecar", version="0.2.0.1", lifespan=lifespan)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -159,6 +159,8 @@ def create_app() -> FastAPI:
         offset: int = 0,
     ) -> DocumentListResponse:
         tag_list = [item.strip() for item in (tags or "").split(",") if item.strip()]
+        effective_limit = max(1, min(limit, 300))
+        effective_offset = max(0, offset)
         filters = ChatFilters(
             category=category,
             tags=tag_list,
@@ -169,10 +171,15 @@ def create_app() -> FastAPI:
         docs, total = app_state.db.list_documents(
             search=search,
             filters=filters,
-            limit=max(1, min(limit, 300)),
-            offset=max(0, offset),
+            limit=effective_limit,
+            offset=effective_offset,
         )
-        return DocumentListResponse(documents=docs, total=total, offset=offset, limit=limit)
+        return DocumentListResponse(
+            documents=docs,
+            total=total,
+            offset=effective_offset,
+            limit=effective_limit,
+        )
 
     @app.put("/v1/docs/{doc_id}/metadata", response_model=DocumentMetadata, dependencies=[Depends(_auth_dependency)])
     def update_doc_metadata(doc_id: str, payload: DocumentMetadataUpdate) -> DocumentMetadata:

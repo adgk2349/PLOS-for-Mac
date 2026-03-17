@@ -1,6 +1,6 @@
 [project]
 name = "local-ai-core-sidecar"
-version = "0.2.0"
+version = "0.2.0.1"
 description = "FastAPI sidecar for Local AI Core for Mac"
 requires-python = ">=3.11"
 dependencies = [
@@ -37,4 +37,3 @@ include = ["local_ai_core*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-asyncio_mode = "auto"

@@ -104,6 +104,44 @@ def test_incremental_reindex_updates_content(client, auth_headers, tmp_path: Pat
     assert any("newtoken123" in snippet for snippet in snippets)
 
 
+def test_incremental_reindex_prunes_deleted_file(client, auth_headers, tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    source = workspace / "to-delete.txt"
+    source.write_text("deleteme_unique_token_9281", encoding="utf-8")
+
+    client.post(
+        "/v1/workspaces",
+        headers=auth_headers,
+        json={
+            "included_paths": [str(workspace)],
+            "excluded_paths": [],
+            "startup_profile": "RECOMMENDED",
+            "default_mode": "GENERAL",
+        },
+    )
+
+    full_job = client.post("/v1/index/jobs", headers=auth_headers, json={"scope": "full"})
+    _poll_job(client, auth_headers, full_job.json()["job_id"])
+
+    source.unlink()
+    inc_job = client.post("/v1/index/jobs", headers=auth_headers, json={"scope": "incremental"})
+    _poll_job(client, auth_headers, inc_job.json()["job_id"])
+
+    chat = client.post(
+        "/v1/chat/local",
+        headers=auth_headers,
+        json={
+            "query": "deleteme_unique_token_9281",
+            "mode": "GENERAL",
+        },
+    )
+    assert chat.status_code == 200
+    payload = chat.json()
+    assert all(item["file_path"] != str(source) for item in payload["citations"])
+    assert all("deleteme_unique_token_9281" not in item["snippet"] for item in payload["citations"])
+
+
 def test_external_call_privacy_gate(client, auth_headers, tmp_path: Path):
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)

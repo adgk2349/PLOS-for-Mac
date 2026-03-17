@@ -30,10 +30,21 @@ final class BookmarkStore {
             ) else {
                 continue
             }
-            _ = resolved.startAccessingSecurityScopedResource()
             urls.append(resolved)
         }
         return urls
+    }
+
+    func startAccessing(urls: [URL]) {
+        for url in urls {
+            _ = url.startAccessingSecurityScopedResource()
+        }
+    }
+
+    func stopAccessing(urls: [URL]) {
+        for url in urls {
+            url.stopAccessingSecurityScopedResource()
+        }
     }
 
     func save(urls: [URL]) {
@@ -143,6 +154,7 @@ final class AppViewModel: ObservableObject {
     func bootstrap() async {
         hasFinishedOnboarding = UserDefaults.standard.bool(forKey: onboardingDefaultsKey)
         includedFolderURLs = bookmarkStore.loadURLs()
+        bookmarkStore.startAccessing(urls: includedFolderURLs)
         loadApprovedSystemActionKinds()
 
         do {
@@ -158,6 +170,7 @@ final class AppViewModel: ObservableObject {
 
     func shutdown() {
         sidecar.stop()
+        bookmarkStore.stopAccessing(urls: includedFolderURLs)
     }
 
     func addFolder() {
@@ -170,12 +183,15 @@ final class AppViewModel: ObservableObject {
         if panel.runModal() == .OK {
             let existing = Set(includedFolderURLs.map(\.path))
             let newURLs = panel.urls.filter { !existing.contains($0.path) }
+            bookmarkStore.startAccessing(urls: newURLs)
             includedFolderURLs.append(contentsOf: newURLs)
             persistBookmarks()
         }
     }
 
     func removeFolder(_ path: String) {
+        let removed = includedFolderURLs.filter { $0.path == path }
+        bookmarkStore.stopAccessing(urls: removed)
         includedFolderURLs.removeAll { $0.path == path }
         persistBookmarks()
     }
@@ -812,9 +828,14 @@ final class AppViewModel: ObservableObject {
                 lastError = "열 파일 경로가 없습니다."
                 return
             }
-            let opened = NSWorkspace.shared.open(URL(fileURLWithPath: filePath))
+            let resolvedPath = URL(fileURLWithPath: filePath).standardizedFileURL.path
+            guard isAllowedOpenFilePath(resolvedPath) else {
+                lastError = "허용되지 않은 경로라 파일을 열 수 없습니다: \(resolvedPath)"
+                return
+            }
+            let opened = NSWorkspace.shared.open(URL(fileURLWithPath: resolvedPath))
             if !opened {
-                lastError = "파일을 열지 못했습니다: \(filePath)"
+                lastError = "파일을 열지 못했습니다: \(resolvedPath)"
             }
         case .summarizeTop, .compareTop, .askFollowup:
             // These action kinds are handled via prompt injection path.
@@ -829,5 +850,18 @@ final class AppViewModel: ObservableObject {
 
     private func persistApprovedSystemActionKinds() {
         UserDefaults.standard.set(Array(approvedSystemActionKinds).sorted(), forKey: approvedSystemActionsDefaultsKey)
+    }
+
+    private func isAllowedOpenFilePath(_ candidatePath: String) -> Bool {
+        for root in includedFolderURLs {
+            let rootPath = root.standardizedFileURL.path
+            if candidatePath == rootPath {
+                return true
+            }
+            if candidatePath.hasPrefix(rootPath.hasSuffix("/") ? rootPath : "\(rootPath)/") {
+                return true
+            }
+        }
+        return false
     }
 }

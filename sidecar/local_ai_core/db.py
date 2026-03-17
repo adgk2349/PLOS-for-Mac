@@ -429,6 +429,31 @@ class Database:
             )
             self._conn.commit()
 
+    def delete_documents_by_paths(self, paths: list[str]) -> list[str]:
+        if not paths:
+            return []
+        placeholders = ",".join("?" for _ in paths)
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                f"SELECT doc_id, path FROM documents WHERE path IN ({placeholders})",
+                tuple(paths),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return []
+
+            cur.execute(
+                f"DELETE FROM documents WHERE path IN ({placeholders})",
+                tuple(paths),
+            )
+            cur.execute(
+                f"DELETE FROM failures WHERE path IN ({placeholders})",
+                tuple(paths),
+            )
+            self._conn.commit()
+        return [str(row["doc_id"]) for row in rows]
+
     def clear_failure(self, path: str) -> None:
         with self._lock:
             cur = self._conn.cursor()
