@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
 
 from .db import Database
@@ -8,20 +7,27 @@ from .embedding import EmbeddingService
 from .external_providers import ProviderRouter
 from .language_utils import insufficient_evidence_message, resolve_response_language
 from .local_inference import LocalInferenceEngine
+from .memory_service import MemoryService
 from .models import (
     ChatFilters,
     Citation,
+    ComposedChatResponseV2,
     DeepAnalysisRequest,
     DeepAnalysisResponse,
     ExternalCallEvent,
     LocalChatRequest,
+    LocalChatRequestV2,
     LocalChatResponse,
+    MemoryEventRequest,
+    MemoryEventType,
     PrivacyMode,
     WorkMode,
 )
+from .reasoning_pipeline import ReasoningPipeline
 from .response_composer import ResponseComposer
 from .retrieval import extract_query_hints, merge_filters, retrieve_hits
 from .vector_store import VectorStore
+from .indexing import IndexingService
 
 
 class PrivacyError(PermissionError):
@@ -36,13 +42,26 @@ class ChatService:
         embedding_service: EmbeddingService,
         provider_router: ProviderRouter,
         local_inference: LocalInferenceEngine,
+        memory_service: MemoryService | None = None,
+        indexing_service: IndexingService | None = None,
     ):
         self._db = db
         self._vector_store = vector_store
         self._embedding = embedding_service
         self._providers = provider_router
         self._local_inference = local_inference
+        self._memory = memory_service or MemoryService(db)
         self._composer = ResponseComposer()
+        self._pipeline = ReasoningPipeline(
+            db=db,
+            vector_store=vector_store,
+            embedding_service=embedding_service,
+            local_inference=local_inference,
+            composer=self._composer,
+            memory_service=self._memory,
+            provider_router=provider_router,
+            indexing_service=indexing_service,
+        )
 
     def local_chat(self, req: LocalChatRequest) -> LocalChatResponse:
         workspace = self._db.get_workspace()
@@ -55,19 +74,19 @@ class ChatService:
         if merged_filters.excluded is None:
             merged_filters.excluded = False
 
-        allowed_doc_ids = self._db.find_doc_ids(
-            filters=merged_filters,
-            search=None,
+        allowed_doc_ids = self._db.find_doc_ids_for_workspace(
             included_paths=workspace.included_paths,
             excluded_paths=workspace.excluded_paths,
+            filters=merged_filters,
+            search=None,
         )
         if req.filters is None and not allowed_doc_ids:
             merged_filters = ChatFilters(excluded=False)
-            allowed_doc_ids = self._db.find_doc_ids(
-                filters=merged_filters,
-                search=None,
+            allowed_doc_ids = self._db.find_doc_ids_for_workspace(
                 included_paths=workspace.included_paths,
                 excluded_paths=workspace.excluded_paths,
+                filters=merged_filters,
+                search=None,
             )
         metadata_map = self._db.get_documents_metadata_map(list(allowed_doc_ids))
         preset, hits = retrieve_hits(
@@ -103,48 +122,7 @@ class ChatService:
                     citations=[],
                     filters=merged_filters,
                     response_language=response_language,
-                    insufficient_reason="strict_threshold",
-                ),
-                mode=req.mode,
-                used_profile=workspace.startup_profile,
-                is_local=True,
-            )
-
-        confidence_floor = self._confidence_floor(req.mode)
-        top_score = hits[0].score if hits else None
-        overlap_count, overlap_ratio = self._grounding_overlap(req.query, hits)
-        low_confidence = req.mode != WorkMode.STRICT_SEARCH and (
-            not hits
-            or (top_score is not None and top_score < confidence_floor)
-            or overlap_count == 0
-            or (overlap_ratio < 0.08 and (top_score is not None and top_score < 0.45))
-        )
-        if low_confidence:
-            intent, lead, result_summary, actions = self._composer.compose(
-                query=req.query,
-                mode=req.mode,
-                response_language=response_language,
-                citations=[],
-                result_summary=insufficient_evidence_message(response_language),
-                insufficient=True,
-            )
-            return LocalChatResponse(
-                intent=intent,
-                lead=lead,
-                result_summary=result_summary,
-                citations=[],
-                actions=actions,
-                reasoning_brief=self._reasoning_brief(
-                    mode=req.mode,
-                    preset=preset,
-                    citations=[],
-                    filters=merged_filters,
-                    response_language=response_language,
-                    insufficient_reason="low_confidence",
-                    top_score=top_score,
-                    confidence_floor=confidence_floor,
-                    overlap_count=overlap_count,
-                    overlap_ratio=overlap_ratio,
+                    strict_insufficient=True,
                 ),
                 mode=req.mode,
                 used_profile=workspace.startup_profile,
@@ -199,7 +177,7 @@ class ChatService:
                 citations=citations,
                 filters=merged_filters,
                 response_language=response_language,
-                insufficient_reason=None,
+                strict_insufficient=False,
             ),
             mode=req.mode,
             used_profile=workspace.startup_profile,
@@ -208,6 +186,9 @@ class ChatService:
             used_fallback=inference.used_fallback,
             runtime_detail=inference.detail,
         )
+
+    def local_chat_v2(self, req: LocalChatRequestV2) -> ComposedChatResponseV2:
+        return self._pipeline.run(req)
 
     async def deep_analysis(self, req: DeepAnalysisRequest) -> DeepAnalysisResponse:
         settings = self._db.get_settings()
@@ -232,6 +213,25 @@ class ChatService:
             approved_by_user=req.user_confirmed,
             timestamp=timestamp,
         )
+        workspace_identity = self._memory.get_workspace_identity()
+        related_doc_ids = list(dict.fromkeys([item.doc_id for item in req.selected_citations if item.doc_id]))
+        self._memory.writeMemoryEvent(
+            MemoryEventRequest(
+                event_type=MemoryEventType.EXTERNAL_ANALYSIS,
+                session_id=None,
+                workspace_id=workspace_identity.workspace_id,
+                summary=req.query[:220],
+                related_file_ids=related_doc_ids[:8],
+                metadata_json={
+                    "provider": req.provider,
+                    "mode": req.mode.value,
+                    "approved_by_user": bool(req.user_confirmed),
+                    "sent_chars": provider_result.sent_chars,
+                    "event_timestamp": timestamp.isoformat(),
+                },
+                importance=0.7,
+            )
+        )
 
         return DeepAnalysisResponse(
             answer=provider_result.answer,
@@ -255,14 +255,9 @@ class ChatService:
         citations: list[Citation],
         filters: ChatFilters | None,
         response_language: str,
-        insufficient_reason: str | None,
-        top_score: float | None = None,
-        confidence_floor: float | None = None,
-        overlap_count: int | None = None,
-        overlap_ratio: float | None = None,
+        strict_insufficient: bool,
     ) -> str:
-        score_value = top_score if top_score is not None else (citations[0].score if citations else None)
-        top_score_text = f"{score_value:.3f}" if score_value is not None else "-"
+        top_score = f"{citations[0].score:.3f}" if citations else "-"
         filter_parts: list[str] = []
         if filters:
             if filters.category:
@@ -276,69 +271,22 @@ class ChatService:
         filter_text = ", ".join(filter_parts) if filter_parts else "-"
 
         if response_language == "ko":
-            if insufficient_reason == "strict_threshold":
-                return f"판단 로그: 모드={mode.value}, 컨텍스트 top_k={preset.top_k}, 엄격 검색 임계치 미달로 근거 부족 응답을 반환합니다."
-            if insufficient_reason == "low_confidence":
-                threshold_text = f"{confidence_floor:.3f}" if confidence_floor is not None else "-"
-                overlap_text = f"{overlap_ratio:.2f}" if overlap_ratio is not None else "-"
+            if strict_insufficient:
                 return (
                     f"판단 로그: 모드={mode.value}, 컨텍스트 top_k={preset.top_k}, "
-                    f"최고 점수={top_score_text}, 질의-근거 키워드 교집합={overlap_count or 0}개(비율 {overlap_text}), "
-                    f"신뢰 임계치({threshold_text}) 조건 미달로 근거 부족 응답을 반환합니다."
+                    "엄격 검색 임계치 미달로 근거 부족 응답을 반환합니다."
                 )
             return (
                 f"판단 로그: 모드={mode.value}, 컨텍스트 top_k={preset.top_k}, "
-                f"채택 근거={len(citations)}개, 최고 점수={top_score_text}, 필터={filter_text}."
+                f"채택 근거={len(citations)}개, 최고 점수={top_score}, 필터={filter_text}."
             )
 
-        if insufficient_reason == "strict_threshold":
-            return f"Reasoning log: mode={mode.value}, context top_k={preset.top_k}, strict threshold not met, returning insufficient-evidence response."
-        if insufficient_reason == "low_confidence":
-            threshold_text = f"{confidence_floor:.3f}" if confidence_floor is not None else "-"
-            overlap_text = f"{overlap_ratio:.2f}" if overlap_ratio is not None else "-"
+        if strict_insufficient:
             return (
                 f"Reasoning log: mode={mode.value}, context top_k={preset.top_k}, "
-                f"top score={top_score_text}, query-evidence keyword overlap={overlap_count or 0} (ratio {overlap_text}), "
-                f"below confidence conditions (floor {threshold_text}), returning insufficient-evidence response."
+                "strict threshold not met, returning insufficient-evidence response."
             )
         return (
             f"Reasoning log: mode={mode.value}, context top_k={preset.top_k}, "
-            f"accepted citations={len(citations)}, top score={top_score_text}, filters={filter_text}."
+            f"accepted citations={len(citations)}, top score={top_score}, filters={filter_text}."
         )
-
-    @staticmethod
-    def _confidence_floor(mode: WorkMode) -> float:
-        floors = {
-            WorkMode.GENERAL: 0.12,
-            WorkMode.SUMMARY: 0.12,
-            WorkMode.RESEARCH: 0.14,
-            WorkMode.DEVELOPMENT: 0.14,
-            WorkMode.WRITING: 0.10,
-            WorkMode.PLANNING: 0.12,
-        }
-        return floors.get(mode, 0.40)
-
-    @staticmethod
-    def _grounding_overlap(query: str, hits) -> tuple[int, float]:
-        query_terms = ChatService._keyword_tokens(query)
-        if not query_terms or not hits:
-            return 0, 0.0
-
-        evidence_terms: set[str] = set()
-        for hit in hits[:3]:
-            evidence_terms.update(ChatService._keyword_tokens(hit.text))
-            evidence_terms.update(ChatService._keyword_tokens(hit.file_path))
-
-        overlap = len(query_terms.intersection(evidence_terms))
-        ratio = overlap / max(1, len(query_terms))
-        return overlap, ratio
-
-    @staticmethod
-    def _keyword_tokens(text: str) -> set[str]:
-        raw = (text or "").lower()
-        tokens = re.findall(r"[a-z0-9가-힣_+-]{2,}", raw)
-        stop = {
-            "the", "and", "for", "with", "that", "this", "from", "what", "when", "where", "which", "would", "could",
-            "자료", "문서", "정리", "요약", "질문", "파일", "관련", "기반", "같은", "다음", "해주세요", "해줘",
-        }
-        return {token for token in tokens if token not in stop}

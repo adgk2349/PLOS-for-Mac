@@ -18,24 +18,29 @@ struct StatusPanelView: View {
                     }
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .glassCard(cornerRadius: 12)
+                    .plosGlassPanel()
                 } else {
                     Text("상태 정보를 불러오는 중입니다.")
                         .foregroundStyle(.secondary)
                 }
 
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 8) {
                     Text("인덱싱 대상 폴더")
                         .font(.headline)
-                    ForEach(viewModel.includedFolderURLs, id: \.path) { url in
-                        Text(url.path)
-                            .font(.subheadline)
+                    if viewModel.includedFolderURLs.isEmpty {
+                        Text("선택된 폴더가 없습니다.")
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                    } else {
+                        ForEach(viewModel.includedFolderURLs, id: \.path) { url in
+                            Text(url.path)
+                                .lineLimit(1)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
                 .padding(12)
-                .glassCard(cornerRadius: 12)
+                .plosGlassPanel()
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("실패 파일 목록")
@@ -53,15 +58,14 @@ struct StatusPanelView: View {
                                     .foregroundStyle(.secondary)
                             }
                             .padding(8)
-                            .background(Color.red.opacity(0.12))
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .background(Color.red.opacity(0.12), in: Rectangle())
                         }
                     }
                 }
                 .padding(12)
-                .glassCard(cornerRadius: 12)
+                .plosGlassPanel()
             }
-            .padding(16)
+            .padding(12)
         }
         .task {
             do {
@@ -74,4 +78,3 @@ struct StatusPanelView: View {
         }
     }
 }
-

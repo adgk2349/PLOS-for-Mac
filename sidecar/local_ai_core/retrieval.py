@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass
+from pathlib import Path
 
-from .models import ChatFilters, StartupProfile, WorkMode
+from .models import (
+    BehaviorPolicy,
+    ChatFilters,
+    ChunkCandidate,
+    FileCandidate,
+    RetrievalBundle,
+    StartupProfile,
+    WorkMode,
+)
 from .vector_store import VectorHit, VectorStore
 
 
@@ -15,12 +25,12 @@ class RetrievalPreset:
 
 
 _BASE_PRESETS: dict[WorkMode, RetrievalPreset] = {
-    WorkMode.GENERAL: RetrievalPreset(top_k=5, min_score=0.0, rerank=False),
-    WorkMode.SUMMARY: RetrievalPreset(top_k=6, min_score=0.0, rerank=False),
-    WorkMode.RESEARCH: RetrievalPreset(top_k=8, min_score=0.0, rerank=True),
-    WorkMode.DEVELOPMENT: RetrievalPreset(top_k=7, min_score=0.0, rerank=True),
-    WorkMode.WRITING: RetrievalPreset(top_k=5, min_score=0.0, rerank=False),
-    WorkMode.PLANNING: RetrievalPreset(top_k=6, min_score=0.0, rerank=False),
+    WorkMode.GENERAL: RetrievalPreset(top_k=5, min_score=0.14, rerank=False),
+    WorkMode.SUMMARY: RetrievalPreset(top_k=6, min_score=0.14, rerank=False),
+    WorkMode.RESEARCH: RetrievalPreset(top_k=8, min_score=0.18, rerank=True),
+    WorkMode.DEVELOPMENT: RetrievalPreset(top_k=7, min_score=0.18, rerank=True),
+    WorkMode.WRITING: RetrievalPreset(top_k=5, min_score=0.14, rerank=False),
+    WorkMode.PLANNING: RetrievalPreset(top_k=6, min_score=0.14, rerank=False),
     WorkMode.STRICT_SEARCH: RetrievalPreset(top_k=5, min_score=0.45, rerank=True),
 }
 
@@ -133,6 +143,49 @@ def retrieve_hits(
     return preset, filtered
 
 
+def retrieve_bundle(
+    *,
+    vector_store: VectorStore,
+    query_vector: list[float],
+    mode: WorkMode,
+    startup_profile: StartupProfile,
+    query: str,
+    allowed_doc_ids: set[str],
+    filters: ChatFilters,
+    metadata_map: dict[str, dict],
+    behavior_policy: BehaviorPolicy | None,
+    explicit_top_k: int | None = None,
+) -> tuple[RetrievalPreset, RetrievalBundle]:
+    preset = preset_for(mode, startup_profile, explicit_top_k=explicit_top_k, query=query)
+    search_limit = max(preset.top_k * 10, 40)
+    hits = vector_store.search(query_vector, limit=search_limit)
+    hits = [hit for hit in hits if hit.doc_id in allowed_doc_ids]
+    if not hits:
+        return preset, RetrievalBundle(applied_filters=filters, rerank_features={"query_depth": 0.0})
+
+    rescored = _rerank_v2(
+        hits=hits,
+        mode=mode,
+        filters=filters,
+        metadata_map=metadata_map,
+        behavior_policy=behavior_policy,
+    )
+    rescored = [hit for hit in rescored if hit.score >= preset.min_score][: max(preset.top_k, 1)]
+    chunk_candidates = [_chunk_candidate_from_hit(hit, metadata_map) for hit in rescored]
+    file_candidates = _file_candidates_from_chunks(chunk_candidates)
+    bundle = RetrievalBundle(
+        file_candidates=file_candidates,
+        chunk_candidates=chunk_candidates,
+        applied_filters=filters,
+        rerank_features={
+            "query_depth": float(_query_depth_boost(query)),
+            "top_score": float(chunk_candidates[0].score if chunk_candidates else 0.0),
+            "file_count": float(len(file_candidates)),
+        },
+    )
+    return preset, bundle
+
+
 def _rerank_with_metadata(
     hits: list[VectorHit],
     *,
@@ -160,6 +213,110 @@ def _rerank_with_metadata(
 
     rescored.sort(key=lambda item: item.score, reverse=True)
     return rescored
+
+
+def _rerank_v2(
+    *,
+    hits: list[VectorHit],
+    mode: WorkMode,
+    filters: ChatFilters,
+    metadata_map: dict[str, dict],
+    behavior_policy: BehaviorPolicy | None,
+) -> list[VectorHit]:
+    rescored: list[VectorHit] = []
+    wanted_tags = {tag.lower() for tag in filters.tags}
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    for hit in hits:
+        row = metadata_map.get(hit.doc_id) or {}
+        semantic = hit.score
+
+        metadata_bonus = 0.0
+        if filters.category and row.get("category") == filters.category:
+            metadata_bonus += 0.06
+        if filters.year is not None and row.get("year") == filters.year:
+            metadata_bonus += 0.05
+        if filters.project and str(row.get("project") or "").lower().find(filters.project.lower()) >= 0:
+            metadata_bonus += 0.05
+        if wanted_tags:
+            overlap = len(wanted_tags.intersection({tag.lower() for tag in row.get("tags", [])}))
+            metadata_bonus += min(overlap, 3) * 0.03
+
+        age_days = max(0.0, (now_ts - float(hit.modified_at)) / 86400.0)
+        recency_bonus = max(0.0, 0.08 - min(age_days, 90.0) * 0.001)
+
+        mode_bonus = 0.0
+        if mode in {WorkMode.RESEARCH, WorkMode.DEVELOPMENT}:
+            mode_bonus += min(float(row.get("importance", 0.5)), 1.0) * 0.04
+        if mode == WorkMode.STRICT_SEARCH:
+            mode_bonus += 0.01
+
+        workspace_weight = _workspace_weight(hit.file_path, behavior_policy)
+        workspace_bonus = (workspace_weight - 1.0) * 0.12
+
+        hit.score = semantic + metadata_bonus + recency_bonus + mode_bonus + workspace_bonus
+        rescored.append(hit)
+
+    rescored.sort(key=lambda item: item.score, reverse=True)
+    return rescored
+
+
+def _workspace_weight(file_path: str, behavior_policy: BehaviorPolicy | None) -> float:
+    if not behavior_policy or not behavior_policy.workspace_weights:
+        return 1.0
+
+    resolved = str(Path(file_path).expanduser())
+    best = 1.0
+    for prefix, raw_weight in behavior_policy.workspace_weights.items():
+        if not prefix:
+            continue
+        if resolved.startswith(str(Path(prefix).expanduser())):
+            try:
+                weight = float(raw_weight)
+            except Exception:
+                weight = 1.0
+            best = max(best, max(0.5, min(weight, 1.8)))
+    return best
+
+
+def _chunk_candidate_from_hit(hit: VectorHit, metadata_map: dict[str, dict]) -> ChunkCandidate:
+    row = metadata_map.get(hit.doc_id) or {}
+    snippet = (hit.text[:320] + "...") if len(hit.text) > 320 else hit.text
+    return ChunkCandidate(
+        doc_id=hit.doc_id,
+        chunk_id=hit.chunk_id,
+        file_path=hit.file_path,
+        snippet=snippet,
+        score=hit.score,
+        modified_at=datetime.fromtimestamp(hit.modified_at, tz=timezone.utc),
+        category=row.get("category", "참고자료"),
+        tags=row.get("tags", []),
+    )
+
+
+def _file_candidates_from_chunks(chunks: list[ChunkCandidate]) -> list[FileCandidate]:
+    grouped: dict[str, list[ChunkCandidate]] = {}
+    for chunk in chunks:
+        grouped.setdefault(chunk.doc_id, []).append(chunk)
+
+    output: list[FileCandidate] = []
+    for doc_id, items in grouped.items():
+        items.sort(key=lambda item: item.score, reverse=True)
+        top = items[0]
+        score = top.score if len(items) == 1 else ((top.score * 0.7) + (items[1].score * 0.3))
+        output.append(
+            FileCandidate(
+                doc_id=doc_id,
+                file_path=top.file_path,
+                score=score,
+                modified_at=top.modified_at,
+                category=top.category,
+                tags=top.tags,
+            )
+        )
+
+    output.sort(key=lambda item: item.score, reverse=True)
+    return output[:8]
 
 
 def _query_depth_boost(query: str) -> int:

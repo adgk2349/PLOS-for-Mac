@@ -27,5 +27,6 @@ struct PLOSApp: App {
                 }
                 .frame(minWidth: 1100, minHeight: 760)
         }
+        .windowStyle(.hiddenTitleBar)
     }
 }

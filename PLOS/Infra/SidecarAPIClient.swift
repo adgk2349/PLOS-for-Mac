@@ -74,6 +74,10 @@ final class SidecarAPIClient {
         try await request(path: "/v1/chat/local", method: "POST", body: payload)
     }
 
+    func localChatV2(_ payload: LocalChatRequestV2) async throws -> ComposedChatResponseV2 {
+        try await request(path: "/v2/chat/local", method: "POST", body: payload)
+    }
+
     func deepAnalysis(_ payload: DeepAnalysisRequest) async throws -> DeepAnalysisResponse {
         try await request(path: "/v1/chat/deep-analysis", method: "POST", body: payload)
     }
@@ -84,6 +88,96 @@ final class SidecarAPIClient {
 
     func updateSettings(_ payload: SettingsModel) async throws -> SettingsModel {
         try await request(path: "/v1/settings", method: "PUT", body: payload)
+    }
+
+    func getRelevantSessionMemory(sessionID: String) async throws -> SessionMemoryResponse {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/memory/session/relevant"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid memory session URL")
+        }
+        components.queryItems = [URLQueryItem(name: "session_id", value: sessionID)]
+        guard let url = components.url else {
+            throw APIError(message: "Invalid memory session query URL")
+        }
+        return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
+    }
+
+    func getRelevantWorkspaceMemory(workspaceID: String, intent: String?) async throws -> WorkspaceMemoryResponse {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/memory/workspace/relevant"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid memory workspace URL")
+        }
+        var items = [URLQueryItem(name: "workspace_id", value: workspaceID)]
+        if let intent, !intent.isEmpty {
+            items.append(URLQueryItem(name: "intent", value: intent))
+        }
+        components.queryItems = items
+        guard let url = components.url else {
+            throw APIError(message: "Invalid memory workspace query URL")
+        }
+        return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
+    }
+
+    func getMemoryPreferences() async throws -> UserPreferencesResponse {
+        try await request(path: "/v1/memory/preferences", method: "GET")
+    }
+
+    func getRelevantEpisodicMemory(
+        workspaceID: String?,
+        intent: String?,
+        relatedFileIDs: [String]
+    ) async throws -> EpisodicMemoryResponse {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/memory/episodic/relevant"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid memory episodic URL")
+        }
+        var items: [URLQueryItem] = []
+        if let workspaceID, !workspaceID.isEmpty {
+            items.append(URLQueryItem(name: "workspace_id", value: workspaceID))
+        }
+        if let intent, !intent.isEmpty {
+            items.append(URLQueryItem(name: "intent", value: intent))
+        }
+        if !relatedFileIDs.isEmpty {
+            items.append(URLQueryItem(name: "related_file_ids", value: relatedFileIDs.joined(separator: ",")))
+        }
+        components.queryItems = items.isEmpty ? nil : items
+        guard let url = components.url else {
+            throw APIError(message: "Invalid memory episodic query URL")
+        }
+        return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
+    }
+
+    func writeMemoryEvent(_ payload: MemoryEventRequest) async throws -> MemoryEventResponse {
+        try await request(path: "/v1/memory/events", method: "POST", body: payload)
+    }
+
+    func clearMemory(_ payload: MemoryClearRequest) async throws -> MemoryClearResponse {
+        try await request(path: "/v1/memory/clear", method: "POST", body: payload)
+    }
+
+    func pinMemory(_ payload: MemoryPinRequest) async throws -> MemoryPinResponse {
+        try await request(path: "/v1/memory/pin", method: "POST", body: payload)
+    }
+
+    func unpinMemory(memoryID: String) async throws -> Bool {
+        let response: [String: Bool] = try await request(path: "/v1/memory/pin/\(memoryID)", method: "DELETE")
+        return response["removed"] ?? false
+    }
+
+    func listPins(scope: String?, workspaceID: String?) async throws -> PinnedMemoryResponse {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/memory/pins"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid memory pins URL")
+        }
+        var items: [URLQueryItem] = []
+        if let scope, !scope.isEmpty {
+            items.append(URLQueryItem(name: "scope", value: scope))
+        }
+        if let workspaceID, !workspaceID.isEmpty {
+            items.append(URLQueryItem(name: "workspace_id", value: workspaceID))
+        }
+        components.queryItems = items.isEmpty ? nil : items
+        guard let url = components.url else {
+            throw APIError(message: "Invalid memory pins query URL")
+        }
+        return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
     }
 
     func getStatus() async throws -> StatusSnapshot {

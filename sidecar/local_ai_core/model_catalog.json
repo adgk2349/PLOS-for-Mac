@@ -108,6 +108,113 @@
         "vision": true
       },
       "default": false
+    },
+    {
+      "id": "qwen25_7b_mlx_advanced",
+      "name": "Qwen 2.5 7B Instruct",
+      "profile": "advanced",
+      "engine": "mlx",
+      "distribution_type": "huggingface_repo",
+      "repo_id": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+      "download_label": "깊은 분석 (고품질)",
+      "description": "7B급 고품질 로컬 추론. 복잡한 질의응답/정리 품질을 강화합니다.",
+      "size_gb": 4.8,
+      "recommended_for": ["M2", "M3", "M4"],
+      "recommended_memory_gb": 16,
+      "tags": ["advanced", "local", "mlx", "quality", "apple_silicon"],
+      "supports": {
+        "chat": true,
+        "rag": true,
+        "tool_use": false,
+        "vision": false
+      },
+      "default": false
+    },
+    {
+      "id": "phi4_mini_mlx_advanced",
+      "name": "Phi-4 Mini Instruct",
+      "profile": "advanced",
+      "engine": "mlx",
+      "distribution_type": "huggingface_repo",
+      "repo_id": "mlx-community/Phi-4-mini-instruct-4bit",
+      "download_label": "깊은 분석 (추론형)",
+      "description": "작고 강한 추론형 모델. 짧은 맥락에서 정확한 답변 품질이 좋은 편입니다.",
+      "size_gb": 3.7,
+      "recommended_for": ["M2", "M3", "M4"],
+      "recommended_memory_gb": 16,
+      "tags": ["advanced", "local", "mlx", "reasoning", "apple_silicon"],
+      "supports": {
+        "chat": true,
+        "rag": true,
+        "tool_use": false,
+        "vision": false
+      },
+      "default": false
+    },
+    {
+      "id": "llama31_8b_mlx_advanced",
+      "name": "Llama 3.1 8B Instruct",
+      "profile": "advanced",
+      "engine": "mlx",
+      "distribution_type": "huggingface_repo",
+      "repo_id": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+      "download_label": "깊은 분석 (안정형)",
+      "description": "8B급 안정형 모델. 설명/요약/비교 작업에서 균형 잡힌 품질을 제공합니다.",
+      "size_gb": 4.9,
+      "recommended_for": ["M2", "M3", "M4"],
+      "recommended_memory_gb": 16,
+      "tags": ["advanced", "local", "mlx", "stable", "apple_silicon"],
+      "supports": {
+        "chat": true,
+        "rag": true,
+        "tool_use": false,
+        "vision": false
+      },
+      "default": false
+    },
+    {
+      "id": "qwen3_8b_gguf_advanced",
+      "name": "Qwen 3 8B Instruct GGUF",
+      "profile": "advanced",
+      "engine": "llama_cpp",
+      "distribution_type": "huggingface_file",
+      "repo_id": "Qwen/Qwen3-8B-GGUF",
+      "filename": "Qwen3-8B-Q4_K_M.gguf",
+      "download_label": "깊은 분석 (호환성)",
+      "description": "Qwen3 8B GGUF. llama.cpp 기반 고품질 호환성 경로입니다.",
+      "size_gb": 4.7,
+      "recommended_for": ["M2", "M3", "M4"],
+      "recommended_memory_gb": 16,
+      "tags": ["advanced", "local", "gguf", "llama_cpp", "quality"],
+      "supports": {
+        "chat": true,
+        "rag": true,
+        "tool_use": false,
+        "vision": false
+      },
+      "default": false
+    },
+    {
+      "id": "llama33_70b_gguf_ultra",
+      "name": "Llama 3.3 70B Instruct GGUF",
+      "profile": "advanced",
+      "engine": "llama_cpp",
+      "distribution_type": "huggingface_file",
+      "repo_id": "bartowski/Llama-3.3-70B-Instruct-GGUF",
+      "filename": "Llama-3.3-70B-Instruct-Q4_K_M.gguf",
+      "download_label": "딥 리즈닝 (초고사양)",
+      "description": "70B급 초고품질 모델. 대용량 메모리 환경에서만 권장됩니다.",
+      "size_gb": 40.0,
+      "recommended_for": ["M3", "M4"],
+      "recommended_memory_gb": 64,
+      "tags": ["advanced", "local", "gguf", "llama_cpp", "ultra"],
+      "supports": {
+        "chat": true,
+        "rag": true,
+        "tool_use": false,
+        "vision": false
+      },
+      "default": false
     }
   ]
 }

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 
@@ -13,8 +15,10 @@ def _context_block(citations: list[Citation]) -> str:
     if not citations:
         return "No local citations provided."
     lines = []
-    for c in citations:
-        lines.append(f"- {c.file_path}: {c.snippet[:240]}")
+    for idx, c in enumerate(citations[:5], start=1):
+        safe_name = Path(c.file_path).name
+        compact = " ".join(c.snippet.split())[:180]
+        lines.append(f"- source_{idx} ({safe_name}): {compact}")
     return "\n".join(lines)
 
 
@@ -22,6 +26,7 @@ def _context_block(citations: list[Citation]) -> str:
 class ProviderResult:
     answer: str
     sent_chars: int
+    provider_available: bool = True
 
 
 class OpenAIProvider:
@@ -51,6 +56,7 @@ class OpenAIProvider:
             return ProviderResult(
                 answer=_missing_api_key_message("OpenAI", response_language),
                 sent_chars=sent_chars,
+                provider_available=False,
             )
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
@@ -93,6 +99,7 @@ class AnthropicProvider:
             return ProviderResult(
                 answer=_missing_api_key_message("Anthropic", response_language),
                 sent_chars=sent_chars,
+                provider_available=False,
             )
 
         headers = {
@@ -136,6 +143,47 @@ class ProviderRouter:
         if provider == "anthropic":
             return await self._anthropic.analyze(query, mode, citations, language_preference=language_preference)
         raise ValueError(f"Unsupported provider: {provider}")
+
+    def provider_has_key(self, provider: str) -> bool:
+        if provider == "openai":
+            return bool((self._openai.api_key or "").strip())
+        if provider == "anthropic":
+            return bool((self._anthropic.api_key or "").strip())
+        return False
+
+    def analyze_sync(
+        self,
+        provider: str,
+        query: str,
+        mode: WorkMode,
+        citations: list[Citation],
+        language_preference: str | None = None,
+    ) -> ProviderResult:
+        try:
+            return asyncio.run(
+                self.analyze(
+                    provider=provider,
+                    query=query,
+                    mode=mode,
+                    citations=citations,
+                    language_preference=language_preference,
+                )
+            )
+        except RuntimeError:
+            # Safety path when already running in an event loop.
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(
+                    self.analyze(
+                        provider=provider,
+                        query=query,
+                        mode=mode,
+                        citations=citations,
+                        language_preference=language_preference,
+                    )
+                )
+            finally:
+                loop.close()
 
 
 def _missing_api_key_message(provider: str, response_language: str) -> str:

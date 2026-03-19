@@ -2,6 +2,61 @@ import Foundation
 
 // MARK: - API Models
 
+enum JSONValue: Codable, Hashable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case object([String: JSONValue])
+    case array([JSONValue])
+    case null
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .number(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([String: JSONValue].self) {
+            self = .object(value)
+        } else if let value = try? container.decode([JSONValue].self) {
+            self = .array(value)
+        } else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unsupported JSON value")
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case let .string(value):
+            try container.encode(value)
+        case let .number(value):
+            try container.encode(value)
+        case let .bool(value):
+            try container.encode(value)
+        case let .object(value):
+            try container.encode(value)
+        case let .array(value):
+            try container.encode(value)
+        case .null:
+            try container.encodeNil()
+        }
+    }
+}
+
+extension JSONValue {
+    var boolValue: Bool? {
+        if case let .bool(value) = self {
+            return value
+        }
+        return nil
+    }
+}
+
 enum PrivacyMode: String, CaseIterable, Codable, Identifiable {
     case localOnly = "LOCAL_ONLY"
     case hybrid = "HYBRID"
@@ -103,6 +158,25 @@ enum ActionPermissionMode: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+enum WorkspaceMemoryMode: String, CaseIterable, Codable, Identifiable {
+    case normal = "normal"
+    case disabled = "disabled"
+    case pinnedOnly = "pinned_only"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .normal:
+            return "일반"
+        case .disabled:
+            return "비활성화"
+        case .pinnedOnly:
+            return "Pinned만 사용"
+        }
+    }
+}
+
 enum ChatIntent: String, Codable {
     case fileSearch = "FILE_SEARCH"
     case documentQA = "DOCUMENT_QA"
@@ -115,11 +189,40 @@ enum SuggestedActionKind: String, Codable {
     case summarizeTop = "SUMMARIZE_TOP"
     case compareTop = "COMPARE_TOP"
     case askFollowup = "ASK_FOLLOWUP"
+    case showDiff = "SHOW_DIFF"
+    case createDraft = "CREATE_DRAFT"
+    case showOtherCandidates = "SHOW_OTHER_CANDIDATES"
+    case makeShorter = "MAKE_SHORTER"
+    case openSecond = "OPEN_SECOND"
+    case showPreviousCandidate = "SHOW_PREVIOUS_CANDIDATE"
 }
 
 enum ActionExecutionMode: String, Codable {
     case promptInjection = "PROMPT_INJECTION"
     case system = "SYSTEM"
+}
+
+enum MemoryEventType: String, CaseIterable, Codable, Identifiable {
+    case query = "query"
+    case fileDiscovery = "file_discovery"
+    case comparison = "comparison"
+    case summaryCreated = "summary_created"
+    case draftCreated = "draft_created"
+    case externalAnalysis = "external_analysis"
+    case manualOverride = "manual_override"
+    case actionExecuted = "action_executed"
+
+    var id: String { rawValue }
+}
+
+enum MemoryClearScope: String, CaseIterable, Codable, Identifiable {
+    case all = "all"
+    case workspace = "workspace"
+    case session = "session"
+    case inferredOnly = "inferred_only"
+    case episodic = "episodic"
+
+    var id: String { rawValue }
 }
 
 enum ModelInstallStatus: String, Codable {
@@ -211,6 +314,29 @@ struct LocalChatRequest: Codable {
     var filters: ChatFilters?
 }
 
+enum ResponseLength: String, Codable {
+    case short = "short"
+    case medium = "medium"
+    case long = "long"
+}
+
+struct BehaviorOverrides: Codable {
+    var workspace_weights: [String: Double]?
+    var preferred_mode: WorkMode?
+    var preferred_action_order: [SuggestedActionKind]?
+    var preferred_response_length: ResponseLength?
+}
+
+struct LocalChatRequestV2: Codable {
+    var query: String
+    var mode: WorkMode
+    var conversation_id: String?
+    var session_id: String?
+    var top_k: Int?
+    var filters: ChatFilters?
+    var behavior_overrides: BehaviorOverrides?
+}
+
 struct SuggestedAction: Codable, Identifiable, Hashable {
     var action_id: String
     var kind: SuggestedActionKind
@@ -228,6 +354,94 @@ struct LocalChatResponse: Codable {
     var citations: [Citation]
     var actions: [SuggestedAction]
     var reasoning_brief: String?
+    var mode: WorkMode
+    var used_profile: StartupProfile
+    var is_local: Bool
+    var engine_used: LocalEngine?
+    var used_fallback: Bool?
+    var runtime_detail: String?
+}
+
+enum ReasoningIntent: String, Codable {
+    case generalChat = "general_chat"
+    case findFile = "find_file"
+    case summarizeFile = "summarize_file"
+    case compareFiles = "compare_files"
+    case explainContent = "explain_content"
+    case draftEdit = "draft_edit"
+    case classify = "classify"
+    case followupQuestion = "followup_question"
+    case followupRefine = "followup_refine"
+    case continuePreviousResult = "continue_previous_result"
+    case softConfirm = "soft_confirm"
+    case selectPreviousCandidate = "select_previous_candidate"
+    case nextCandidate = "next_candidate"
+    case reduceScope = "reduce_scope"
+    case lightweightActionRequest = "lightweight_action_request"
+    case openFile = "open_file"
+}
+
+struct ParsedEntities: Codable {
+    var file_names: [String]
+    var tags: [String]
+    var topics: [String]
+    var projects: [String]
+}
+
+struct ParsedTimeFilters: Codable {
+    var year: Int?
+    var year_from: Int?
+    var year_to: Int?
+    var relative_days: Int?
+}
+
+struct ParsedWorkspaceFilters: Codable {
+    var included_paths: [String]
+    var excluded_paths: [String]
+}
+
+struct ParsedIntent: Codable {
+    var intent: ReasoningIntent
+    var entities: ParsedEntities
+    var time_filters: ParsedTimeFilters
+    var workspace_filters: ParsedWorkspaceFilters
+    var confidence: Double
+}
+
+struct LocalPlan: Codable {
+    var plan_type: String
+    var selected_files: [String]
+    var selected_chunks: [String]
+    var response_strategy: String
+    var allowed_actions: [SuggestedActionKind]
+    var external_reasoning_needed: Bool
+}
+
+struct VerificationResult: Codable {
+    var is_valid: Bool
+    var confidence: Double
+    var issues: [String]
+    var ambiguity_level: Double
+    var candidate_mode: Bool
+}
+
+struct StructuredResult: Codable {
+    var result_type: String
+    var summary: String
+    var details: [String]
+    var data: [String: JSONValue]
+}
+
+struct ComposedChatResponseV2: Codable {
+    var response_mode: String?
+    var lead: String
+    var structured_result: StructuredResult
+    var citations: [Citation]
+    var actions: [SuggestedAction]
+    var metadata: [String: JSONValue]?
+    var parsed_intent: ParsedIntent
+    var plan: LocalPlan
+    var verification: VerificationResult
     var mode: WorkMode
     var used_profile: StartupProfile
     var is_local: Bool
@@ -259,15 +473,139 @@ struct DeepAnalysisResponse: Codable {
 }
 
 struct SettingsModel: Codable {
-    var privacy_mode: PrivacyMode
-    var startup_profile: StartupProfile
-    var model_profile: String
+    var privacy_mode: PrivacyMode = .hybrid
+    var startup_profile: StartupProfile = .recommended
+    var model_profile: String = "balanced"
     var local_engine: LocalEngine?
     var mlx_model_path: String?
     var llama_model_path: String?
-    var reindex_policy: String
-    var language: String
+    var reindex_policy: String = "filewatch_incremental"
+    var language: String = "auto"
     var action_permission_mode: ActionPermissionMode?
+    var adaptive_personalization_enabled: Bool = true
+    var session_memory_enabled: Bool = true
+    var workspace_memory_enabled: Bool = true
+    var local_memory_only: Bool = true
+    var workspace_memory_mode: WorkspaceMemoryMode = .normal
+}
+
+struct WorkspaceIdentity: Codable {
+    var workspace_id: String
+    var included_paths_hash: String
+    var version: Int
+}
+
+struct SessionMemoryItem: Codable, Identifiable {
+    var id: String
+    var session_id: String
+    var key: String
+    var value_json: [String: JSONValue]
+    var created_at: Date
+    var updated_at: Date
+    var expires_at: Date?
+}
+
+struct WorkspaceMemoryItem: Codable, Identifiable {
+    var id: String
+    var workspace_id: String
+    var memory_type: String
+    var key: String
+    var value_json: [String: JSONValue]
+    var confidence: Double
+    var source: String
+    var created_at: Date
+    var updated_at: Date
+}
+
+struct UserPreferenceItem: Codable, Identifiable {
+    var id: String
+    var key: String
+    var value_json: [String: JSONValue]
+    var confidence: Double
+    var source: String
+    var created_at: Date
+    var updated_at: Date
+}
+
+struct EpisodicMemoryEvent: Codable, Identifiable {
+    var id: String
+    var workspace_id: String?
+    var event_type: String
+    var summary: String
+    var related_file_ids: [String]
+    var related_action_ids: [String]
+    var metadata_json: [String: JSONValue]
+    var importance: Double
+    var created_at: Date
+}
+
+struct PinnedMemoryItem: Codable, Identifiable {
+    var id: String
+    var scope: String
+    var workspace_id: String?
+    var title: String
+    var content: String
+    var created_at: Date
+    var updated_at: Date
+}
+
+struct SessionMemoryResponse: Codable {
+    var items: [SessionMemoryItem]
+}
+
+struct WorkspaceMemoryResponse: Codable {
+    var items: [WorkspaceMemoryItem]
+}
+
+struct UserPreferencesResponse: Codable {
+    var items: [UserPreferenceItem]
+}
+
+struct EpisodicMemoryResponse: Codable {
+    var items: [EpisodicMemoryEvent]
+}
+
+struct PinnedMemoryResponse: Codable {
+    var items: [PinnedMemoryItem]
+}
+
+struct MemoryEventRequest: Codable {
+    var event_type: MemoryEventType
+    var session_id: String?
+    var workspace_id: String?
+    var summary: String
+    var related_file_ids: [String]
+    var related_action_ids: [String]
+    var metadata_json: [String: JSONValue]
+    var importance: Double
+}
+
+struct MemoryEventResponse: Codable {
+    var event_id: String
+    var accepted: Bool
+}
+
+struct MemoryClearRequest: Codable {
+    var scope: MemoryClearScope
+    var workspace_id: String?
+    var session_id: String?
+}
+
+struct MemoryClearResponse: Codable {
+    var cleared_rows: Int
+    var scope: MemoryClearScope
+}
+
+struct MemoryPinRequest: Codable {
+    var memory_id: String?
+    var scope: String
+    var workspace_id: String?
+    var title: String?
+    var content: String?
+}
+
+struct MemoryPinResponse: Codable {
+    var item: PinnedMemoryItem
 }
 
 struct FailureItem: Codable, Identifiable {
@@ -450,42 +788,96 @@ struct ModelCatalogDeleteResponse: Codable {
     var removed: Bool
 }
 
-struct ChatMessage: Identifiable {
-    enum Source {
+struct ChatMessage: Identifiable, Codable {
+    enum Source: String, Codable {
         case user
         case local
         case external
     }
 
-    let id = UUID()
+    let id: UUID
     let source: Source
     let text: String?
     let intent: ChatIntent?
     let lead: String?
     let resultSummary: String?
+    let structuredResult: StructuredResult?
+    let responseMetadata: [String: JSONValue]?
+    let parsedIntent: ParsedIntent?
+    let plan: LocalPlan?
+    let verification: VerificationResult?
     let reasoningBrief: String?
     let actions: [SuggestedAction]
     let timestamp: Date
 
-    init(source: Source, text: String, timestamp: Date) {
+    init(id: UUID = UUID(), source: Source, text: String, timestamp: Date) {
+        self.id = id
         self.source = source
         self.text = text
         intent = nil
         lead = nil
         resultSummary = nil
+        structuredResult = nil
+        responseMetadata = nil
+        parsedIntent = nil
+        plan = nil
+        verification = nil
         reasoningBrief = nil
         actions = []
         self.timestamp = timestamp
     }
 
-    init(local response: LocalChatResponse, timestamp: Date) {
+    init(id: UUID = UUID(), local response: LocalChatResponse, timestamp: Date) {
+        self.id = id
         source = .local
         text = nil
         intent = response.intent
         lead = response.lead
         resultSummary = response.result_summary
+        structuredResult = nil
+        responseMetadata = nil
+        parsedIntent = nil
+        plan = nil
+        verification = nil
         reasoningBrief = response.reasoning_brief
         actions = response.actions
         self.timestamp = timestamp
+    }
+
+    init(id: UUID = UUID(), localV2 response: ComposedChatResponseV2, timestamp: Date) {
+        self.id = id
+        source = .local
+        text = nil
+        intent = nil
+        lead = response.lead
+        resultSummary = response.structured_result.summary
+        structuredResult = response.structured_result
+        responseMetadata = response.metadata
+        parsedIntent = response.parsed_intent
+        plan = response.plan
+        verification = response.verification
+        reasoningBrief = nil
+        actions = response.actions
+        self.timestamp = timestamp
+    }
+}
+
+struct ChatRoom: Codable, Identifiable {
+    var id: String
+    var title: String
+    var messages: [ChatMessage]
+    var citations: [Citation]
+    var latestQueryForDeepAnalysis: String?
+    var updatedAt: Date
+
+    static func makeDefault() -> ChatRoom {
+        ChatRoom(
+            id: UUID().uuidString,
+            title: "새 채팅",
+            messages: [],
+            citations: [],
+            latestQueryForDeepAnalysis: nil,
+            updatedAt: Date()
+        )
     }
 }

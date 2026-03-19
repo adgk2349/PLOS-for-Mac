@@ -1,6 +1,59 @@
 import Combine
+import CryptoKit
 import Darwin
 import Foundation
+import Security
+
+enum AppSecretStore {
+    private static let service = "com.redbridge.plos"
+
+    static func read(_ key: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let data = item as? Data else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    @discardableResult
+    static func save(_ value: String, for key: String) -> Bool {
+        let data = Data(value.utf8)
+        let baseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key,
+        ]
+        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return true
+        }
+        let addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key,
+            kSecValueData as String: data,
+        ]
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        return addStatus == errSecSuccess
+    }
+
+    static func delete(_ key: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key,
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
 
 @MainActor
 final class SidecarProcessManager: ObservableObject {
@@ -61,10 +114,15 @@ final class SidecarProcessManager: ObservableObject {
         }.value
         let dataDirectory = runtimeDirectory.appendingPathComponent("data")
         try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
+        let openAIKey = AppSecretStore.read("openai_api_key")
+        let anthropicKey = AppSecretStore.read("anthropic_api_key")
         let ports = Self.portCandidates(preferred: preferredPort)
         var lastError: Error?
 
         for port in ports {
+            if Self.isPortListening(port) {
+                continue
+            }
             var launched: LaunchArtifacts?
             do {
                 launched = try Self.launchSidecarProcess(
@@ -73,7 +131,9 @@ final class SidecarProcessManager: ObservableObject {
                     dataDirectory: dataDirectory,
                     host: host,
                     port: port,
-                    sessionToken: sessionToken
+                    sessionToken: sessionToken,
+                    openAIKey: openAIKey,
+                    anthropicKey: anthropicKey
                 )
 
                 guard let launched else {
@@ -91,8 +151,6 @@ final class SidecarProcessManager: ObservableObject {
                 self.apiClient = client
 
                 try await waitUntilHealthy(client: client)
-                // Health endpoint is unauthenticated; this verifies session token match.
-                _ = try await client.getSettings()
 
                 preferredPort = port
                 isRunning = true
@@ -129,9 +187,12 @@ final class SidecarProcessManager: ObservableObject {
                 throw APIError(message: "Sidecar가 시작 직후 종료되었습니다.\n\(sidecarLogSummary())")
             }
             do {
-                try await client.health()
+                _ = try await client.getSettings()
                 return
             } catch {
+                if Self.isInvalidSessionTokenError(error) {
+                    throw APIError(message: "해당 포트에 다른 sidecar 세션이 이미 실행 중입니다. 포트를 자동 전환해 다시 시도해 주세요.\n\(sidecarLogSummary())")
+                }
                 try await Task.sleep(nanoseconds: 250_000_000)
             }
         }
@@ -144,7 +205,78 @@ final class SidecarProcessManager: ObservableObject {
         for port in fallback where !ports.contains(port) {
             ports.append(port)
         }
+        for _ in 0 ..< 12 {
+            if let dynamic = findAvailablePort(), !ports.contains(dynamic) {
+                ports.append(dynamic)
+            }
+        }
+        for port in stride(from: 18080, through: 18140, by: 2) where !ports.contains(port) {
+            ports.append(port)
+        }
         return ports
+    }
+
+    private nonisolated static func findAvailablePort() -> Int? {
+        let socketFD = socket(AF_INET, SOCK_STREAM, 0)
+        guard socketFD >= 0 else {
+            return nil
+        }
+        defer { _ = close(socketFD) }
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(0).bigEndian
+        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        let bindResult = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            return nil
+        }
+
+        var assigned = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let nameResult = withUnsafeMutablePointer(to: &assigned) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(socketFD, $0, &len)
+            }
+        }
+        guard nameResult == 0 else {
+            return nil
+        }
+        return Int(UInt16(bigEndian: assigned.sin_port))
+    }
+
+    private nonisolated static func isPortListening(_ port: Int) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["lsof", "-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus != 0 {
+                return false
+            }
+            let raw = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        } catch {
+            return false
+        }
+    }
+
+    private nonisolated static func isInvalidSessionTokenError(_ error: Error) -> Bool {
+        guard let apiError = error as? APIError else {
+            return false
+        }
+        let lower = apiError.message.lowercased()
+        return lower.contains("http 401") && lower.contains("invalid session token")
     }
 
     private nonisolated static func launchSidecarProcess(
@@ -153,7 +285,9 @@ final class SidecarProcessManager: ObservableObject {
         dataDirectory: URL,
         host: String,
         port: Int,
-        sessionToken: String
+        sessionToken: String,
+        openAIKey: String?,
+        anthropicKey: String?
     ) throws -> LaunchArtifacts {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -175,6 +309,12 @@ final class SidecarProcessManager: ObservableObject {
         env["LOCAL_AI_TESSERACT_CMD"] = Self.detectTesseractExecutable() ?? "/opt/homebrew/bin/tesseract"
         if let tessdataPrefix = Self.detectTessdataPrefix() {
             env["TESSDATA_PREFIX"] = tessdataPrefix
+        }
+        if let openAIKey, !openAIKey.isEmpty {
+            env["OPENAI_API_KEY"] = openAIKey
+        }
+        if let anthropicKey, !anthropicKey.isEmpty {
+            env["ANTHROPIC_API_KEY"] = anthropicKey
         }
         if let runtimePythonPath = runtimeConfig.pythonPath {
             if let existing = env["PYTHONPATH"], !existing.isEmpty {
@@ -274,13 +414,32 @@ final class SidecarProcessManager: ObservableObject {
                     cwd: nil,
                     step: "pip 초기화"
                 )
-                try installSidecarDependencies(withPython: candidateVenvPython.path, targetPath: nil)
+                try installSidecarDependencies(
+                    withPython: candidateVenvPython.path,
+                    targetPath: nil,
+                    runtimeDirectory: runtimeDirectory
+                )
 
-                if hasRequiredModules(
+                var candidateReady = hasRequiredModules(
                     python: candidateVenvPython.path,
                     pythonPath: runtimePackagePythonPath,
                     probeDataDir: probeDataDirectory.path
-                ) {
+                )
+                if !candidateReady {
+                    try installSidecarDependencies(
+                        withPython: candidateVenvPython.path,
+                        targetPath: nil,
+                        runtimeDirectory: runtimeDirectory,
+                        force: true
+                    )
+                    candidateReady = hasRequiredModules(
+                        python: candidateVenvPython.path,
+                        pythonPath: runtimePackagePythonPath,
+                        probeDataDir: probeDataDirectory.path
+                    )
+                }
+
+                if candidateReady {
                     try activateRuntimeVenv(candidateVenvDirectory: candidateVenvDirectory, runtimeVenvDirectory: runtimeVenvDirectory)
                     guard hasRequiredModules(
                         python: runtimeVenvPython.path,
@@ -303,13 +462,32 @@ final class SidecarProcessManager: ObservableObject {
                 }
                 try fm.createDirectory(at: runtimeSitePackages, withIntermediateDirectories: true)
 
-                try installSidecarDependencies(withPython: systemPython, targetPath: runtimeSitePackages.path)
+                try installSidecarDependencies(
+                    withPython: systemPython,
+                    targetPath: runtimeSitePackages.path,
+                    runtimeDirectory: runtimeDirectory
+                )
 
-                if hasRequiredModules(
+                var targetReady = hasRequiredModules(
                     python: systemPython,
                     pythonPath: runtimeTargetPythonPath,
                     probeDataDir: probeDataDirectory.path
-                ) {
+                )
+                if !targetReady {
+                    try installSidecarDependencies(
+                        withPython: systemPython,
+                        targetPath: runtimeSitePackages.path,
+                        runtimeDirectory: runtimeDirectory,
+                        force: true
+                    )
+                    targetReady = hasRequiredModules(
+                        python: systemPython,
+                        pythonPath: runtimeTargetPythonPath,
+                        probeDataDir: probeDataDirectory.path
+                    )
+                }
+
+                if targetReady {
                     return PythonRuntimeConfig(
                         pythonExecutable: systemPython,
                         pythonPath: runtimeTargetPythonPath
@@ -355,8 +533,19 @@ final class SidecarProcessManager: ObservableObject {
         try copyDirectory(source: stagedPackage, destination: runtimePackage)
     }
 
-    private nonisolated static func installSidecarDependencies(withPython pythonExecutable: String, targetPath: String?) throws {
-        var arguments = ["-m", "pip", "install", "--upgrade", "--force-reinstall"]
+    private nonisolated static func installSidecarDependencies(
+        withPython pythonExecutable: String,
+        targetPath: String?,
+        runtimeDirectory: URL,
+        force: Bool = false
+    ) throws {
+        let stampURL = dependencyStampURL(runtimeDirectory: runtimeDirectory, pythonExecutable: pythonExecutable, targetPath: targetPath)
+        let fingerprint = dependencyFingerprint(pythonExecutable: pythonExecutable, targetPath: targetPath)
+        if !force, let existing = try? String(contentsOf: stampURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), existing == fingerprint {
+            return
+        }
+
+        var arguments = ["-m", "pip", "install", "--upgrade"]
         if let targetPath, !targetPath.isEmpty {
             arguments.append(contentsOf: ["--target", targetPath])
         }
@@ -367,6 +556,36 @@ final class SidecarProcessManager: ObservableObject {
             cwd: nil,
             step: "sidecar 의존성 설치"
         )
+        try fingerprint.write(to: stampURL, atomically: true, encoding: .utf8)
+    }
+
+    private nonisolated static func dependencyStampURL(
+        runtimeDirectory: URL,
+        pythonExecutable: String,
+        targetPath: String?
+    ) -> URL {
+        let stampDirectory = runtimeDirectory.appendingPathComponent(".deps-stamps", isDirectory: true)
+        try? FileManager.default.createDirectory(at: stampDirectory, withIntermediateDirectories: true)
+        let scope = (targetPath == nil || targetPath?.isEmpty == true) ? "venv" : "target"
+        let key = "\(scope)|\(pythonVersionLabel(pythonExecutable))|\(targetPath ?? "")"
+        let digest = SHA256.hash(data: Data(key.utf8)).compactMap { String(format: "%02x", $0) }.joined()
+        return stampDirectory.appendingPathComponent("\(digest).stamp")
+    }
+
+    private nonisolated static func dependencyFingerprint(pythonExecutable: String, targetPath: String?) -> String {
+        let lines = [
+            "python=\(pythonVersionLabel(pythonExecutable))",
+            "target=\(targetPath ?? "")",
+            "deps=\(sidecarPipDependencies().joined(separator: "|"))",
+        ]
+        return lines.joined(separator: "\n")
+    }
+
+    private nonisolated static func pythonVersionLabel(_ executable: String) -> String {
+        guard let version = pythonVersionTuple(executable) else {
+            return executable
+        }
+        return "\(version.0).\(version.1)"
     }
 
     private nonisolated static func sidecarPipDependencies() -> [String] {
@@ -756,12 +975,27 @@ final class SidecarProcessManager: ObservableObject {
         let defaults = UserDefaults.standard
         let sidecarDefaultsKey = "local_ai_sidecar_dir"
 
+        func sidecarCandidates(from base: URL) -> [URL] {
+            let root = base.standardizedFileURL
+            return [
+                root,
+                root.appendingPathComponent("sidecar", isDirectory: true),
+                root.appendingPathComponent("staged-sidecar", isDirectory: true),
+                root.appendingPathComponent("Resources/sidecar", isDirectory: true),
+                root.appendingPathComponent("Resources/staged-sidecar", isDirectory: true),
+                root.appendingPathComponent("Contents/Resources/sidecar", isDirectory: true),
+                root.appendingPathComponent("Contents/Resources/staged-sidecar", isDirectory: true),
+            ]
+        }
+
         func validatedSidecarURL(_ candidate: URL) -> URL? {
-            let standardized = candidate.standardizedFileURL
-            let mainPy = standardized.appendingPathComponent("local_ai_core/main.py")
-            if fm.fileExists(atPath: mainPy.path) {
-                defaults.set(standardized.path, forKey: sidecarDefaultsKey)
-                return standardized
+            for dir in sidecarCandidates(from: candidate) {
+                let mainPy = dir.appendingPathComponent("local_ai_core/main.py")
+                let pyproject = dir.appendingPathComponent("pyproject.toml")
+                if fm.fileExists(atPath: mainPy.path), fm.fileExists(atPath: pyproject.path) {
+                    defaults.set(dir.path, forKey: sidecarDefaultsKey)
+                    return dir
+                }
             }
             return nil
         }
@@ -787,6 +1021,13 @@ final class SidecarProcessManager: ObservableObject {
             .deletingLastPathComponent()
         candidates.append(sourceRoot)
 
+        if let resourceURL = Bundle.main.resourceURL {
+            candidates.append(resourceURL)
+        }
+        if let executableURL = Bundle.main.executableURL {
+            candidates.append(executableURL.deletingLastPathComponent())
+        }
+
         // App bundle-relative candidates for packaged builds.
         var bundleCursor = Bundle.main.bundleURL
         for _ in 0 ..< 6 {
@@ -803,18 +1044,43 @@ final class SidecarProcessManager: ObservableObject {
         // Common local development locations.
         let home = fm.homeDirectoryForCurrentUser
         candidates.append(home.appendingPathComponent("Desktop/Development/PLOS"))
+        candidates.append(home.appendingPathComponent("Desktop/Development/PLOS-for-Mac-push"))
         candidates.append(home.appendingPathComponent("Development/PLOS"))
+        candidates.append(home.appendingPathComponent("Development/PLOS-for-Mac-push"))
         candidates.append(home.appendingPathComponent("Documents/PLOS"))
 
-        for root in candidates {
-            if let found = validatedSidecarURL(root) {
-                return found
+        let devRoots = [
+            home.appendingPathComponent("Desktop/Development", isDirectory: true),
+            home.appendingPathComponent("Development", isDirectory: true),
+        ]
+        for devRoot in devRoots where fm.fileExists(atPath: devRoot.path) {
+            if let children = try? fm.contentsOfDirectory(
+                at: devRoot,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for child in children {
+                    let name = child.lastPathComponent.lowercased()
+                    if name.contains("plos") {
+                        candidates.append(child)
+                    }
+                }
             }
-            if let found = validatedSidecarURL(root.appendingPathComponent("sidecar")) {
+        }
+
+        var seen = Set<String>()
+        for root in candidates {
+            let standardizedPath = root.standardizedFileURL.path
+            if !seen.insert(standardizedPath).inserted {
+                continue
+            }
+            if let found = validatedSidecarURL(root) {
                 return found
             }
         }
 
-        throw APIError(message: "sidecar 디렉터리를 자동으로 찾지 못했습니다. sidecar 폴더가 프로젝트 내에 있는지 확인해 주세요.")
+        throw APIError(
+            message: "sidecar 디렉터리를 자동으로 찾지 못했습니다. `LOCAL_AI_SIDECAR_DIR`를 sidecar 루트로 지정하거나 프로젝트의 `sidecar/local_ai_core/main.py` 존재 여부를 확인해 주세요."
+        )
     }
 }

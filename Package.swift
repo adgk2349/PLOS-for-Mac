@@ -7,12 +7,14 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
-        .executable(name: "LocalAICoreApp", targets: ["LocalAICoreApp"])
+        // Canonical app entry point is the Xcode target in `PLOS.xcodeproj`.
+        // Keep SwiftPM only for lightweight shared utilities/tools.
+        .library(name: "PLOSPackageSupport", targets: ["PLOSPackageSupport"])
     ],
     targets: [
-        .executableTarget(
-            name: "LocalAICoreApp",
-            path: "Sources/LocalAICoreApp"
+        .target(
+            name: "PLOSPackageSupport",
+            path: "PackageSupport"
         )
     ]
 )

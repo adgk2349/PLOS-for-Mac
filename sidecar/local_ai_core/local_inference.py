@@ -55,42 +55,172 @@ class LocalInferenceEngine:
         mlx_model_path: str | None = None,
         llama_model_path: str | None = None,
         language_preference: str | None = None,
+        max_tokens: int | None = None,
     ) -> InferenceResult:
         response_language = resolve_response_language(query, language_preference)
         prompt = self._prompt(query, mode, citations, response_language)
+        token_budget = self._resolve_max_tokens(max_tokens)
+        primary = engine
+        secondary = LocalEngine.LLAMA_CPP if primary == LocalEngine.MLX else LocalEngine.MLX
 
-        if engine == LocalEngine.LLAMA_CPP:
-            answer = self._generate_with_llama(prompt, llama_model_path)
-            if answer:
-                return InferenceResult(answer=answer, engine_used=LocalEngine.LLAMA_CPP)
-
-            detail = self._last_engine_error.get(
-                LocalEngine.LLAMA_CPP,
-                "llama.cpp 엔진 실행 실패: 모델 경로 또는 런타임 상태를 확인해 주세요.",
-            )
-            fallback = self._fallback_answer(query, mode, citations, response_language)
+        answer = self._generate_with_engine(
+            engine=primary,
+            prompt=prompt,
+            profile=profile,
+            mlx_model_path=mlx_model_path,
+            llama_model_path=llama_model_path,
+            max_tokens=token_budget,
+        )
+        if answer and self._looks_model_answer(answer):
             return InferenceResult(
-                answer=f"{detail}\n\n{fallback}",
-                engine_used=LocalEngine.LLAMA_CPP,
-                used_fallback=True,
+                answer=answer,
+                engine_used=primary,
+                used_fallback=False,
+                detail=f"primary_engine={primary.value}",
+            )
+
+        primary_error = self._last_engine_error.get(primary, f"{primary.value} engine failed")
+        secondary_answer = self._generate_with_engine(
+            engine=secondary,
+            prompt=prompt,
+            profile=profile,
+            mlx_model_path=mlx_model_path,
+            llama_model_path=llama_model_path,
+            max_tokens=token_budget,
+        )
+        if secondary_answer and self._looks_model_answer(secondary_answer):
+            detail = (
+                f"primary_engine_failed={primary.value}; fallback_engine_used={secondary.value}; "
+                f"reason={primary_error}"
+            )
+            return InferenceResult(
+                answer=secondary_answer,
+                engine_used=secondary,
+                used_fallback=False,
                 detail=detail,
             )
 
-        answer = self._generate_with_mlx(prompt, profile, mlx_model_path)
-        if answer:
-            return InferenceResult(answer=answer, engine_used=LocalEngine.MLX)
-
-        detail = self._last_engine_error.get(
-            LocalEngine.MLX,
-            "MLX 엔진 실행 실패: 모델 경로 또는 런타임 상태를 확인해 주세요.",
+        secondary_error = self._last_engine_error.get(secondary, f"{secondary.value} engine failed")
+        detail = (
+            f"{primary.value} 실패: {primary_error}\n"
+            f"{secondary.value} 실패: {secondary_error}"
         )
         fallback = self._fallback_answer(query, mode, citations, response_language)
         return InferenceResult(
             answer=f"{detail}\n\n{fallback}",
-            engine_used=LocalEngine.MLX,
+            engine_used=primary,
             used_fallback=True,
             detail=detail,
         )
+
+    def generate_conversational(
+        self,
+        *,
+        query: str,
+        mode: WorkMode,
+        profile: str,
+        engine: LocalEngine = LocalEngine.MLX,
+        mlx_model_path: str | None = None,
+        llama_model_path: str | None = None,
+        language_preference: str | None = None,
+        max_tokens: int | None = None,
+        session_summary: str | None = None,
+        allow_static_fallback: bool = True,
+    ) -> InferenceResult:
+        response_language = resolve_response_language(query, language_preference)
+        prompt = self._conversational_prompt(
+            query=query,
+            mode=mode,
+            response_language=response_language,
+            session_summary=session_summary,
+        )
+        token_budget = self._resolve_max_tokens(max_tokens)
+        primary = engine
+        secondary = LocalEngine.LLAMA_CPP if primary == LocalEngine.MLX else LocalEngine.MLX
+
+        answer = self._generate_with_engine(
+            engine=primary,
+            prompt=prompt,
+            profile=profile,
+            mlx_model_path=mlx_model_path,
+            llama_model_path=llama_model_path,
+            max_tokens=token_budget,
+        )
+        answer = self._postprocess_conversational_answer(
+            answer or "",
+            query=query,
+            response_language=response_language,
+        )
+        if answer and self._looks_conversational_answer(
+            answer,
+            response_language=response_language,
+            query=query,
+        ):
+            return InferenceResult(
+                answer=answer,
+                engine_used=primary,
+                used_fallback=False,
+                detail=f"conversational_primary={primary.value}",
+            )
+
+        primary_error = self._last_engine_error.get(primary, f"{primary.value} engine failed")
+        secondary_answer = self._generate_with_engine(
+            engine=secondary,
+            prompt=prompt,
+            profile=profile,
+            mlx_model_path=mlx_model_path,
+            llama_model_path=llama_model_path,
+            max_tokens=token_budget,
+        )
+        secondary_answer = self._postprocess_conversational_answer(
+            secondary_answer or "",
+            query=query,
+            response_language=response_language,
+        )
+        if secondary_answer and self._looks_conversational_answer(
+            secondary_answer,
+            response_language=response_language,
+            query=query,
+        ):
+            return InferenceResult(
+                answer=secondary_answer,
+                engine_used=secondary,
+                used_fallback=False,
+                detail=f"conversational_secondary={secondary.value}; primary_error={primary_error}",
+            )
+
+        detail = f"conversational engines failed; primary={primary.value}; secondary={secondary.value}"
+        if not allow_static_fallback:
+            return InferenceResult(
+                answer="",
+                engine_used=primary,
+                used_fallback=True,
+                detail=detail,
+            )
+        if response_language == "ko":
+            fallback = "좋아요. 바로 도와드릴게요. 기준을 조금만 알려주시면 더 정확하게 이어갈 수 있어요."
+        else:
+            fallback = "Sure, I can help right away. Give me one more hint and I'll narrow it down."
+        return InferenceResult(
+            answer=fallback,
+            engine_used=primary,
+            used_fallback=True,
+            detail=detail,
+        )
+
+    def _generate_with_engine(
+        self,
+        *,
+        engine: LocalEngine,
+        prompt: str,
+        profile: str,
+        mlx_model_path: str | None,
+        llama_model_path: str | None,
+        max_tokens: int,
+    ) -> str | None:
+        if engine == LocalEngine.LLAMA_CPP:
+            return self._generate_with_llama(prompt, llama_model_path, max_tokens=max_tokens)
+        return self._generate_with_mlx(prompt, profile, mlx_model_path, max_tokens=max_tokens)
 
     def prepare_runtime(
         self,
@@ -180,12 +310,19 @@ class LocalInferenceEngine:
             detail=detail,
         )
 
-    def _generate_with_mlx(self, prompt: str, profile: str, explicit_model_path: str | None) -> str | None:
+    def _generate_with_mlx(
+        self,
+        prompt: str,
+        profile: str,
+        explicit_model_path: str | None,
+        *,
+        max_tokens: int,
+    ) -> str | None:
         if self._ensure_mlx_loaded(profile, explicit_model_path, allow_runtime_install=False):
             try:
                 from mlx_lm import generate
 
-                output = generate(self._mlx_model, self._mlx_tokenizer, prompt=prompt, max_tokens=480)
+                output = generate(self._mlx_model, self._mlx_tokenizer, prompt=prompt, max_tokens=max_tokens)
                 text = self._sanitize_generated_answer(str(output), prompt=prompt)
                 if text:
                     self._clear_engine_error(LocalEngine.MLX)
@@ -196,14 +333,14 @@ class LocalInferenceEngine:
                 return None
         return None
 
-    def _generate_with_llama(self, prompt: str, explicit_model_path: str | None) -> str | None:
+    def _generate_with_llama(self, prompt: str, explicit_model_path: str | None, *, max_tokens: int) -> str | None:
         if not self._ensure_llama_loaded(explicit_model_path, allow_runtime_install=False):
             return None
 
         try:
             result = self._llama_model.create_completion(
                 prompt=prompt,
-                max_tokens=480,
+                max_tokens=max_tokens,
                 temperature=0.2,
                 repeat_penalty=1.15,
             )
@@ -441,6 +578,12 @@ class LocalInferenceEngine:
         self._last_engine_error.pop(engine, None)
 
     @staticmethod
+    def _resolve_max_tokens(max_tokens: int | None) -> int:
+        if max_tokens is None:
+            return 320
+        return max(96, min(int(max_tokens), 640))
+
+    @staticmethod
     def _prompt(query: str, mode: WorkMode, citations: list[Citation], response_language: str) -> str:
         snippets = "\n".join(f"- {c.snippet}" for c in citations[:5])
         strict_rule = ""
@@ -466,6 +609,114 @@ class LocalInferenceEngine:
             f"Question: {query}\n"
             f"Evidence:\n{snippets}"
         )
+
+    @staticmethod
+    def _conversational_prompt(
+        *,
+        query: str,
+        mode: WorkMode,
+        response_language: str,
+        session_summary: str | None = None,
+    ) -> str:
+        ko_tone = ""
+        if response_language == "ko":
+            ko_tone = (
+                "한국어 규칙: 자연스러운 존댓말로 짧고 명확하게 답합니다. "
+                "공문체나 딱딱한 로그 문구를 피하고, 첫 문장은 사용자 메시지에 바로 반응하세요.\n"
+            )
+        context_block = ""
+        if session_summary:
+            context_block = f"Recent session context (summary only):\n{session_summary}\n"
+        return (
+            "You are a conversational local AI assistant.\n"
+            f"{response_language_instruction(response_language)}\n"
+            f"{ko_tone}"
+            "Do not output system logs. Provide concise, practical help.\n"
+            "Never role-play both user and assistant in one response.\n"
+            "Do not include labels like 'User:' or 'Assistant:'.\n"
+            "Do not invent personal facts (location, identity, background) unless user stated them in this turn.\n"
+            "Keep response to 1-3 sentences. Ask at most one follow-up question.\n"
+            f"Mode: {mode.value}\n"
+            f"{context_block}"
+            f"User: {query}\n"
+        )
+
+    @staticmethod
+    def _postprocess_conversational_answer(answer: str, *, query: str, response_language: str) -> str:
+        text = (answer or "").strip()
+        if not text:
+            return ""
+        text = LocalInferenceEngine._strip_reasoning_leak(text)
+        if not text:
+            return ""
+        text = re.sub(r"\.\s*입니다\.$", ".", text)
+        text = re.sub(r"\s{2,}", " ", text).strip()
+        text = re.sub(
+            r"(?i)\b(?:okay,\s*let'?s\s*see|alright,\s*let\s*me|alright,\s*something\s*like|hmm,|wait,)\b.*",
+            "",
+            text,
+        ).strip()
+        text = re.sub(r"(?i)\b(?:user|assistant)\s*:\s*.*", "", text).strip()
+        if not text:
+            return ""
+
+        if response_language == "ko" and re.search(r"[가-힣]", query):
+            ko_chars = len(re.findall(r"[가-힣]", text))
+            en_words = len(re.findall(r"[A-Za-z]{3,}", text))
+            if en_words >= 6 and ko_chars < 10:
+                return ""
+
+        lowered_query = (query or "").lower()
+        is_greeting = any(token in lowered_query for token in ("안녕", "hello", "hi", "hey"))
+        if not is_greeting:
+            return text
+
+        segments = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        if not segments:
+            return text
+        # Greeting replies should be short and direct.
+        limited = segments[:2]
+        joined = " ".join(limited).strip()
+        if response_language == "ko" and len(joined) > 130:
+            joined = limited[0]
+        return joined.strip()
+
+    @staticmethod
+    def _looks_conversational_answer(text: str, *, response_language: str, query: str) -> bool:
+        content = (text or "").strip()
+        if not content:
+            return False
+        lowered = content.lower()
+        blocked = (
+            "user:",
+            "assistant:",
+            "follow-up question:",
+            "okay, let's see",
+            "okay let me",
+            "alright, let me",
+            "alright, something like",
+            "i should",
+            "i need to",
+            "the user",
+            "let's think",
+            "my reasoning",
+            "thought:",
+            "mode:",
+            "question:",
+        )
+        if any(token in lowered for token in blocked):
+            return False
+        if not LocalInferenceEngine._looks_model_answer(content):
+            return False
+
+        if response_language == "ko" and re.search(r"[가-힣]", query):
+            ko_chars = len(re.findall(r"[가-힣]", content))
+            en_words = len(re.findall(r"[A-Za-z]{3,}", content))
+            if ko_chars < 4:
+                return False
+            if en_words >= 8 and ko_chars <= (en_words * 2):
+                return False
+        return True
 
     @staticmethod
     def _fallback_answer(query: str, mode: WorkMode, citations: list[Citation], response_language: str) -> str:
@@ -600,15 +851,24 @@ class LocalInferenceEngine:
         # Remove prompt echo when completion model repeats the input block.
         if prompt and text.startswith(prompt):
             text = text[len(prompt) :].strip()
-
-        text = re.sub(r"\s+", " ", text).strip()
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"(?im)^(?:answer|final answer|response|답변)\s*[:：]\s*", "", text).strip()
+        text = re.sub(r"(?im)\b(?:answer|response)\s*[:：]\s*", "", text).strip()
+        text = LocalInferenceEngine._strip_reasoning_leak(text)
         if not text:
             return ""
 
-        # Deduplicate repetitive segments and cap repeated loops.
-        segments = [seg.strip() for seg in re.split(r"(?<=[.!?。！？])\s+|\n+", text) if seg.strip()]
+        # Keep line boundaries as segmentation hints to avoid single-runaway sentences.
+        segments = [
+            seg.strip(" \t-•")
+            for seg in re.split(r"(?:\n+|(?<=[.!?。！？])\s+|(?:\s+-\s+))", text)
+            if seg.strip(" \t-•")
+        ]
         if not segments:
-            return ""
+            compact = re.sub(r"\s+", " ", text).strip()
+            if not compact:
+                return ""
+            segments = [compact]
 
         deduped: list[str] = []
         seen_counts: dict[str, int] = {}
@@ -620,18 +880,153 @@ class LocalInferenceEngine:
             if key == prev_key:
                 continue
             count = seen_counts.get(key, 0)
-            if count >= 2:
+            if count >= 1:
+                continue
+            if any(LocalInferenceEngine._near_duplicate(segment, prior) for prior in deduped):
                 continue
             seen_counts[key] = count + 1
             deduped.append(segment)
             prev_key = key
 
-        normalized = " ".join(deduped).strip()
+        compact_segments = LocalInferenceEngine._remove_repeated_blocks(deduped)
+        if not compact_segments:
+            return ""
+        normalized = " ".join(compact_segments).strip()
         if not normalized:
             return ""
 
-        # Hard limit to avoid long repetitive spillover.
-        if len(normalized) > 1400:
-            normalized = normalized[:1400].rstrip()
+        # Hard limit to avoid long repetitive spillover without cutting mid-sentence.
+        normalized = LocalInferenceEngine._cap_by_sentence(compact_segments, max_chars=1200)
+        if not normalized:
+            first = re.sub(r"\s+", " ", compact_segments[0]).strip()
+            normalized = first[:1200].rstrip()
+            if len(first) > 1200:
+                normalized += "..."
+
+        normalized = re.sub(r"\s{2,}", " ", normalized).strip()
+        if normalized and not (normalized.endswith("습니다") or normalized.endswith("입니다")) and normalized[-1] not in {".", "!", "?", "다", "요"}:
+            normalized += "."
 
         return normalized
+
+    @staticmethod
+    def _strip_reasoning_leak(text: str) -> str:
+        if not text:
+            return ""
+        content = text.strip()
+        lowered = content.lower()
+        leak_markers = (
+            "okay, let's see",
+            "hmm,",
+            "i should",
+            "the user",
+            "follow-up question:",
+            "recent session context",
+            "user:",
+            "assistant:",
+            "mode:",
+        )
+        if not any(marker in lowered for marker in leak_markers):
+            return content
+
+        cut_match = re.search(
+            r"(?i)(okay,\s*let'?s\s*see|alright,\s*let\s*me|alright,\s*something\s*like|hmm,|wait,|the user|i should|i need to)",
+            content,
+        )
+        if cut_match and cut_match.start() > 0:
+            prefix = content[: cut_match.start()].strip()
+            prefix = re.sub(r"(?im)\b(?:user|assistant)\s*:\s*", "", prefix).strip()
+            prefix = re.sub(r"(?im)\bfollow-up question:\s*.*", "", prefix).strip()
+            prefix = re.sub(r"(?im)\bmode:\s*[A-Z_]+\s*", "", prefix).strip()
+            prefix = re.sub(r"\s{2,}", " ", prefix).strip(" -:\n")
+            if prefix and len(prefix) >= 8:
+                return prefix
+
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        cleaned_lines: list[str] = []
+        for line in lines:
+            low = line.lower()
+            if low.startswith("user:") or low.startswith("assistant:"):
+                continue
+            if "follow-up question:" in low or "recent session context" in low:
+                continue
+            if "okay, let's see" in low or low.startswith("hmm") or low.startswith("wait,"):
+                continue
+            if "i should" in low or "the user" in low:
+                continue
+            line = re.sub(r"(?im)^mode:\s*[A-Z_]+\s*", "", line).strip()
+            line = re.sub(r"(?im)^question:\s*", "", line).strip()
+            line = re.sub(r"(?im)\bquestion:\s*", "", line).strip()
+            if not line:
+                continue
+            cleaned_lines.append(line)
+
+        if not cleaned_lines:
+            return ""
+        return "\n".join(cleaned_lines).strip()
+
+    @staticmethod
+    def _looks_model_answer(text: str) -> bool:
+        content = (text or "").strip()
+        if not content:
+            return False
+        lowered = content.lower()
+        error_signals = (
+            "engine failed",
+            "런타임",
+            "모델 경로",
+            "설치되어 있지",
+            "설치 실패",
+            "no relevant evidence",
+        )
+        if any(token in lowered for token in error_signals):
+            return False
+        if len(content) < 12:
+            return False
+        return True
+
+    @staticmethod
+    def _near_duplicate(a: str, b: str) -> bool:
+        norm_a = re.sub(r"\s+", " ", a).strip().lower()
+        norm_b = re.sub(r"\s+", " ", b).strip().lower()
+        if not norm_a or not norm_b:
+            return False
+        if norm_a == norm_b:
+            return True
+        if norm_a in norm_b or norm_b in norm_a:
+            shorter = min(len(norm_a), len(norm_b))
+            return shorter >= 24
+        # rough token overlap to suppress repetitive loops
+        tokens_a = set(re.findall(r"[a-z0-9가-힣]+", norm_a))
+        tokens_b = set(re.findall(r"[a-z0-9가-힣]+", norm_b))
+        if not tokens_a or not tokens_b:
+            return False
+        overlap = len(tokens_a.intersection(tokens_b))
+        union = len(tokens_a.union(tokens_b))
+        return union > 0 and (overlap / union) >= 0.88
+
+    @staticmethod
+    def _remove_repeated_blocks(segments: list[str]) -> list[str]:
+        if len(segments) < 4:
+            return segments
+        output: list[str] = []
+        seen: set[str] = set()
+        for segment in segments:
+            key = re.sub(r"[^\w가-힣]+", "", segment).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(segment)
+        return output
+
+    @staticmethod
+    def _cap_by_sentence(segments: list[str], *, max_chars: int) -> str:
+        selected: list[str] = []
+        length = 0
+        for segment in segments:
+            proposed = length + (1 if selected else 0) + len(segment)
+            if proposed > max_chars:
+                break
+            selected.append(segment)
+            length = proposed
+        return " ".join(selected).strip()

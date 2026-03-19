@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from local_ai_core.model_manager import ModelManager
 from local_ai_core.models import (
     LocalEngine,
     ModelCatalogActivateResponse,
@@ -101,3 +104,13 @@ def test_model_catalog_endpoints(client, auth_headers, monkeypatch):
     deleted = client.delete("/v1/models/catalog/llama32_3b_mlx_balanced", headers=auth_headers)
     assert deleted.status_code == 200
     assert deleted.json()["removed"] is True
+
+
+def test_catalog_manifest_includes_high_quality_options(tmp_path: Path):
+    manager = ModelManager(tmp_path)
+    manifest = manager._load_catalog_manifest()
+    ids = {item.id for item in manifest.models}
+    assert "qwen25_7b_mlx_advanced" in ids
+    assert "phi4_mini_mlx_advanced" in ids
+    assert "llama31_8b_mlx_advanced" in ids
+    assert "qwen3_8b_gguf_advanced" in ids

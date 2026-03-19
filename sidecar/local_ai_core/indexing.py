@@ -6,6 +6,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 from .classification import DocumentClassifier
 from .chunker import chunk_text
@@ -78,9 +79,7 @@ class IndexingService:
             if scope == "full":
                 # Avoid showing stale failures from previous runs before this full rescan.
                 self._db.clear_all_failures()
-            snapshot = self._snapshot_workspace(workspace)
-            self._prune_deleted_documents(snapshot)
-            docs = self._documents_to_index(snapshot, scope=scope)
+            docs = list(self._scan_documents(workspace, scope=scope))
             total = len(docs)
             processed = 0
             failures = 0
@@ -177,9 +176,9 @@ class IndexingService:
                 "_classification_warning": f"classification fallback: {exc}",
             }
 
-    def _snapshot_workspace(self, workspace: WorkspaceResponse) -> dict[str, float]:
-        snapshot: dict[str, float] = {}
+    def _scan_documents(self, workspace: WorkspaceResponse, *, scope: str) -> Iterable[IndexDocument]:
         excluded = [Path(path).resolve() for path in workspace.excluded_paths]
+        indexed = self._db.get_indexed_documents() if scope == "incremental" else {}
 
         for included_path in workspace.included_paths:
             root = Path(included_path).expanduser().resolve()
@@ -188,7 +187,8 @@ class IndexingService:
 
             if root.is_file():
                 if self._is_supported(root) and not self._is_excluded(root, excluded):
-                    snapshot[str(root)] = root.stat().st_mtime
+                    if self._needs_indexing(root, indexed):
+                        yield IndexDocument(path=root, modified_at=root.stat().st_mtime)
                 continue
 
             for file in root.rglob("*"):
@@ -196,32 +196,8 @@ class IndexingService:
                     continue
                 if self._is_excluded(file, excluded):
                     continue
-                snapshot[str(file)] = file.stat().st_mtime
-
-        return snapshot
-
-    def _documents_to_index(self, snapshot: dict[str, float], *, scope: str) -> list[IndexDocument]:
-        if scope == "full":
-            return [IndexDocument(path=Path(path), modified_at=mtime) for path, mtime in snapshot.items()]
-
-        indexed = self._db.get_indexed_documents()
-        docs: list[IndexDocument] = []
-        for path, mtime in snapshot.items():
-            previous = indexed.get(path)
-            if previous is None or mtime > previous:
-                docs.append(IndexDocument(path=Path(path), modified_at=mtime))
-        return docs
-
-    def _prune_deleted_documents(self, snapshot: dict[str, float]) -> None:
-        indexed_paths = set(self._db.get_indexed_documents().keys())
-        existing_paths = set(snapshot.keys())
-        removed_paths = sorted(indexed_paths - existing_paths)
-        if not removed_paths:
-            return
-
-        removed_doc_ids = self._db.delete_documents_by_paths(removed_paths)
-        for doc_id in removed_doc_ids:
-            self._vector_store.delete_doc(doc_id)
+                if self._needs_indexing(file, indexed):
+                    yield IndexDocument(path=file, modified_at=file.stat().st_mtime)
 
     @staticmethod
     def _is_supported(path: Path) -> bool:
@@ -240,6 +216,16 @@ class IndexingService:
     def _stable_doc_id(path: Path) -> str:
         digest = hashlib.sha1(str(path).encode("utf-8"), usedforsecurity=False).hexdigest()
         return digest
+
+    @staticmethod
+    def _needs_indexing(path: Path, indexed_map: dict[str, float]) -> bool:
+        if not indexed_map:
+            return True
+        key = str(path)
+        prev = indexed_map.get(key)
+        if prev is None:
+            return True
+        return path.stat().st_mtime > prev
 
     def _update(self, job_id: str, **kwargs) -> None:
         with self._lock:
