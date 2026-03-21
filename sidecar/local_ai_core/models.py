@@ -228,6 +228,10 @@ class ParsedIntent(BaseModel):
     time_filters: ParsedTimeFilters = Field(default_factory=ParsedTimeFilters)
     workspace_filters: ParsedWorkspaceFilters = Field(default_factory=ParsedWorkspaceFilters)
     confidence: float = 0.5
+    operation: Literal["chat", "find", "summarize", "open"] = "chat"
+    target: str | None = None
+    scope: Literal["single", "top_n", "all"] = "single"
+    ambiguity: Literal["clear", "unclear"] = "clear"
 
 
 class FileCandidate(BaseModel):
@@ -609,7 +613,9 @@ class ModelCatalogItem(BaseModel):
     engine: LocalEngine
     distribution_type: DistributionType
     repo_id: str
+    repo_url: str | None = None
     filename: str | None = None
+    allow_patterns: list[str] = Field(default_factory=list)
     download_label: str
     description: str
     size_gb: float

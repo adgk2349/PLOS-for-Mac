@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,32 +17,42 @@ from .models import (
 )
 from .vector_store import VectorHit, VectorStore
 
+# ---------------------------------------------------------------------------
+# Shared constants
+# ---------------------------------------------------------------------------
+STRICT_SEARCH_THRESHOLD = 0.6       # Minimum score for STRICT_SEARCH to return results
+STRICT_SEARCH_SHORT_CIRCUIT = 0.6   # Used in reasoning_pipeline short-circuit check
+LOW_RELEVANCE_THRESHOLD = 0.26      # Fallback short-circuit for other modes
+
 
 @dataclass(slots=True)
 class RetrievalPreset:
     top_k: int
     min_score: float
     rerank: bool
+    # Multiplier for search_limit = max(top_k * search_factor, search_floor)
+    search_factor: int = 10
+    search_floor: int = 40
 
 
 _BASE_PRESETS: dict[WorkMode, RetrievalPreset] = {
-    WorkMode.GENERAL: RetrievalPreset(top_k=5, min_score=0.14, rerank=False),
-    WorkMode.SUMMARY: RetrievalPreset(top_k=6, min_score=0.14, rerank=False),
-    WorkMode.RESEARCH: RetrievalPreset(top_k=8, min_score=0.18, rerank=True),
-    WorkMode.DEVELOPMENT: RetrievalPreset(top_k=7, min_score=0.18, rerank=True),
-    WorkMode.WRITING: RetrievalPreset(top_k=5, min_score=0.14, rerank=False),
-    WorkMode.PLANNING: RetrievalPreset(top_k=6, min_score=0.14, rerank=False),
-    WorkMode.STRICT_SEARCH: RetrievalPreset(top_k=5, min_score=0.45, rerank=True),
+    WorkMode.GENERAL:       RetrievalPreset(top_k=5,  min_score=0.14, rerank=False),
+    WorkMode.SUMMARY:       RetrievalPreset(top_k=6,  min_score=0.14, rerank=False),
+    WorkMode.RESEARCH:      RetrievalPreset(top_k=8,  min_score=0.18, rerank=True),
+    WorkMode.DEVELOPMENT:   RetrievalPreset(top_k=7,  min_score=0.18, rerank=True),
+    WorkMode.WRITING:       RetrievalPreset(top_k=5,  min_score=0.14, rerank=False),
+    WorkMode.PLANNING:      RetrievalPreset(top_k=6,  min_score=0.14, rerank=False),
+    WorkMode.STRICT_SEARCH: RetrievalPreset(top_k=5,  min_score=0.45, rerank=True),
 }
 
 _CATEGORY_HINTS = {
-    "학습자료": ("학습", "강의", "study", "course", "노트"),
+    "학습자료":   ("학습", "강의", "study", "course", "노트"),
     "프로젝트문서": ("프로젝트", "기획", "spec", "proposal", "prd"),
-    "회의록": ("회의", "미팅", "meeting", "minutes"),
-    "아이디어": ("아이디어", "idea", "브레인스토밍"),
-    "개인메모": ("메모", "일기", "journal", "private"),
-    "참고자료": ("참고", "reference", "paper", "article"),
-    "코드관련": ("코드", "api", "swift", "python", "typescript"),
+    "회의록":    ("회의", "미팅", "meeting", "minutes"),
+    "아이디어":   ("아이디어", "idea", "브레인스토밍"),
+    "개인메모":   ("메모", "일기", "journal", "private"),
+    "참고자료":   ("참고", "reference", "paper", "article"),
+    "코드관련":   ("코드", "api", "swift", "python", "typescript"),
 }
 
 
@@ -70,7 +81,13 @@ def preset_for(
         if depth_boost >= 2 and mode != WorkMode.STRICT_SEARCH:
             min_score = max(0.0, min_score - 0.02)
 
-    return RetrievalPreset(top_k=top_k, min_score=min_score, rerank=base.rerank)
+    return RetrievalPreset(
+        top_k=top_k,
+        min_score=min_score,
+        rerank=base.rerank,
+        search_factor=base.search_factor,
+        search_floor=base.search_floor,
+    )
 
 
 def extract_query_hints(query: str) -> ChatFilters:
@@ -125,7 +142,7 @@ def retrieve_hits(
     metadata_map: dict[str, dict] | None = None,
 ) -> tuple[RetrievalPreset, list[VectorHit]]:
     preset = preset_for(mode, startup_profile, explicit_top_k=explicit_top_k, query=query)
-    search_limit = max(preset.top_k * 8, 30)
+    search_limit = max(preset.top_k * preset.search_factor, preset.search_floor)
     hits = vector_store.search(query_vector, limit=search_limit)
 
     if allowed_doc_ids is not None:
@@ -137,7 +154,7 @@ def retrieve_hits(
     filtered = [hit for hit in hits if hit.score >= preset.min_score]
     filtered = filtered[: preset.top_k]
 
-    if mode == WorkMode.STRICT_SEARCH and (not filtered or filtered[0].score < 0.6):
+    if mode == WorkMode.STRICT_SEARCH and (not filtered or filtered[0].score < STRICT_SEARCH_THRESHOLD):
         return preset, []
 
     return preset, filtered
@@ -157,7 +174,7 @@ def retrieve_bundle(
     explicit_top_k: int | None = None,
 ) -> tuple[RetrievalPreset, RetrievalBundle]:
     preset = preset_for(mode, startup_profile, explicit_top_k=explicit_top_k, query=query)
-    search_limit = max(preset.top_k * 10, 40)
+    search_limit = max(preset.top_k * preset.search_factor, preset.search_floor)
     hits = vector_store.search(query_vector, limit=search_limit)
     hits = [hit for hit in hits if hit.doc_id in allowed_doc_ids]
     if not hits:
@@ -192,6 +209,7 @@ def _rerank_with_metadata(
     filters: ChatFilters,
     metadata_map: dict[str, dict],
 ) -> list[VectorHit]:
+    """Rerank hits using metadata bonuses. Returns new VectorHit instances (no in-place mutation)."""
     rescored: list[VectorHit] = []
     wanted_tags = {tag.lower() for tag in filters.tags}
     for hit in hits:
@@ -208,8 +226,7 @@ def _rerank_with_metadata(
             overlap = len(wanted_tags.intersection(row_tags))
             bonus += min(overlap, 2) * 0.03
 
-        hit.score = hit.score + bonus
-        rescored.append(hit)
+        rescored.append(hit.with_score(hit.score + bonus))
 
     rescored.sort(key=lambda item: item.score, reverse=True)
     return rescored
@@ -223,13 +240,16 @@ def _rerank_v2(
     metadata_map: dict[str, dict],
     behavior_policy: BehaviorPolicy | None,
 ) -> list[VectorHit]:
+    """Full reranking with metadata, recency, mode and workspace bonuses. Immutable score update."""
     rescored: list[VectorHit] = []
     wanted_tags = {tag.lower() for tag in filters.tags}
     now_ts = datetime.now(timezone.utc).timestamp()
 
     for hit in hits:
         row = metadata_map.get(hit.doc_id) or {}
-        semantic = hit.score
+        # LanceDB cosine-distance conversion may yield scores in [-1, 1].
+        # Normalize first so metadata bonuses cannot overtake weak semantic hits too aggressively.
+        semantic = max(0.0, min((float(hit.score) + 1.0) / 2.0, 1.0))
 
         metadata_bonus = 0.0
         if filters.category and row.get("category") == filters.category:
@@ -243,7 +263,7 @@ def _rerank_v2(
             metadata_bonus += min(overlap, 3) * 0.03
 
         age_days = max(0.0, (now_ts - float(hit.modified_at)) / 86400.0)
-        recency_bonus = max(0.0, 0.08 - min(age_days, 90.0) * 0.001)
+        recency_bonus = max(0.0, 0.06 - min(age_days, 90.0) * 0.0007)
 
         mode_bonus = 0.0
         if mode in {WorkMode.RESEARCH, WorkMode.DEVELOPMENT}:
@@ -252,10 +272,12 @@ def _rerank_v2(
             mode_bonus += 0.01
 
         workspace_weight = _workspace_weight(hit.file_path, behavior_policy)
-        workspace_bonus = (workspace_weight - 1.0) * 0.12
+        workspace_bonus = (workspace_weight - 1.0) * 0.08
 
-        hit.score = semantic + metadata_bonus + recency_bonus + mode_bonus + workspace_bonus
-        rescored.append(hit)
+        bonus_total = metadata_bonus + recency_bonus + mode_bonus + workspace_bonus
+        bonus_total = max(-0.12, min(0.24, bonus_total))
+        new_score = semantic + bonus_total
+        rescored.append(hit.with_score(new_score))
 
     rescored.sort(key=lambda item: item.score, reverse=True)
     return rescored
@@ -303,7 +325,14 @@ def _file_candidates_from_chunks(chunks: list[ChunkCandidate]) -> list[FileCandi
     for doc_id, items in grouped.items():
         items.sort(key=lambda item: item.score, reverse=True)
         top = items[0]
-        score = top.score if len(items) == 1 else ((top.score * 0.7) + (items[1].score * 0.3))
+        if len(items) == 1:
+            score = top.score
+        elif len(items) == 2:
+            score = (top.score * 0.7) + (items[1].score * 0.3)
+        else:
+            # Weighted average: top chunk 60%, second 25%, rest equally split for 15%
+            rest_avg = sum(c.score for c in items[2:]) / len(items[2:])
+            score = (top.score * 0.60) + (items[1].score * 0.25) + (rest_avg * 0.15)
         output.append(
             FileCandidate(
                 doc_id=doc_id,

@@ -12,6 +12,8 @@ class LocalPlanner:
         file_doc_ids: list[str],
         chunk_ids: list[str],
         top_score: float,
+        prefer_multi_file_summary: bool = False,
+        prefer_focused_file_summary: bool = False,
     ) -> LocalPlan:
         intent = parsed_intent.intent
 
@@ -28,8 +30,8 @@ class LocalPlanner:
         if intent == ReasoningIntent.FIND_FILE:
             return LocalPlan(
                 plan_type="file_lookup",
-                selected_files=file_doc_ids[:5],
-                selected_chunks=chunk_ids[:6],
+                selected_files=file_doc_ids[:140],
+                selected_chunks=chunk_ids[:140],
                 response_strategy="list_then_offer_actions",
                 allowed_actions=[
                     SuggestedActionKind.OPEN_FILE,
@@ -42,8 +44,8 @@ class LocalPlanner:
         if intent in {ReasoningIntent.FOLLOWUP_REFINE, ReasoningIntent.REDUCE_SCOPE, ReasoningIntent.NEXT_CANDIDATE}:
             return LocalPlan(
                 plan_type="file_lookup",
-                selected_files=file_doc_ids[:5],
-                selected_chunks=chunk_ids[:6],
+                selected_files=file_doc_ids[:140],
+                selected_chunks=chunk_ids[:140],
                 response_strategy="candidate_first_then_actions",
                 allowed_actions=[
                     SuggestedActionKind.OPEN_FILE,
@@ -55,6 +57,32 @@ class LocalPlanner:
             )
 
         if intent in {ReasoningIntent.SUMMARIZE_FILE}:
+            if prefer_focused_file_summary:
+                return LocalPlan(
+                    plan_type="summary",
+                    selected_files=file_doc_ids[:2],
+                    selected_chunks=chunk_ids[:30],
+                    response_strategy="focused_file_grounded_summary",
+                    allowed_actions=[
+                        SuggestedActionKind.OPEN_FILE,
+                        SuggestedActionKind.MAKE_SHORTER,
+                        SuggestedActionKind.ASK_FOLLOWUP,
+                    ],
+                    external_reasoning_needed=False,
+                )
+            if prefer_multi_file_summary:
+                return LocalPlan(
+                    plan_type="summary",
+                    selected_files=file_doc_ids[:14],
+                    selected_chunks=chunk_ids[:36],
+                    response_strategy="map_reduce_grounded_summary",
+                    allowed_actions=[
+                        SuggestedActionKind.OPEN_FILE,
+                        SuggestedActionKind.MAKE_SHORTER,
+                        SuggestedActionKind.ASK_FOLLOWUP,
+                    ],
+                    external_reasoning_needed=False,
+                )
             return LocalPlan(
                 plan_type="summary",
                 selected_files=file_doc_ids[:3],

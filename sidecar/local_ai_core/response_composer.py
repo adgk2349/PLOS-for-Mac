@@ -312,6 +312,22 @@ class ResponseComposer:
             and response_mode == "conversational_clarify"
             and "확인 질문" in structured_result.summary
         )
+        detail_lower = str(runtime_detail or "").lower()
+        direct_first_applied = bool(
+            execution_result.structured_payload.get("direct_first_applied")
+            or ("direct_first_applied=1" in detail_lower)
+        )
+        recommendation_shape = str(
+            execution_result.structured_payload.get("recommendation_shape")
+            or ResponseComposer._extract_detail_token(runtime_detail, key="recommendation_shape")
+            or ""
+        )
+        question_count_after = ResponseComposer._extract_detail_int(
+            runtime_detail,
+            key="question_count_after_postprocess",
+        )
+        if question_count_after is None:
+            question_count_after = ResponseComposer._question_sentence_count(structured_result.summary)
         return ComposedChatResponseV2(
             response_mode=response_mode,
             lead=lead,
@@ -325,6 +341,9 @@ class ResponseComposer:
                 "conversation_path": conversation_path,
                 "escalated_provider": escalated_provider,
                 "reasoning_hidden": reasoning_hidden,
+                "direct_first_applied": direct_first_applied,
+                "question_count_after_postprocess": max(0, int(question_count_after)),
+                "recommendation_shape": recommendation_shape,
             },
             parsed_intent=parsed_intent,
             plan=plan,
@@ -356,61 +375,24 @@ class ResponseComposer:
         if result_type == "conversation" or ungrounded_allowed:
             return ""
 
-        if response_mode == "task_confirm_execute":
-            return "응, 바로 해볼게." if response_language == "ko" else "Sure, I'll do that now."
-
-        if response_mode == "conversational_soft_confirm":
-            if response_language == "ko":
-                followup_type = str(getattr(followup_resolution, "followup_type", "") or "")
-                if followup_type == "refine_filter":
-                    return "좋아, 그 조건으로 다시 좁혀볼게."
-                if followup_type == "next_candidate":
-                    return "좋아, 그럼 다음 후보로 볼게."
-                return "응, 방금 맥락 기준으로 이어서 볼게."
-            return "Got it. I'll continue from the previous context."
-
-        if response_mode == "conversational_candidate":
-            if response_language == "ko":
-                if citations:
-                    top_name = Path(citations[0].file_path).name
-                    return f"찾았어. 지금 기준으론 {top_name}이 제일 유력해 보여."
-                return "완전히 확실하진 않지만, 지금은 이쪽이 가장 가까워 보여."
-            return "Found one likely candidate. This seems the closest match right now."
-
         if response_mode == "conversational_clarify":
             return (
                 "비슷한 후보가 둘 있어서, 먼저 하나 기준으로 보면 빠를 것 같아."
                 if response_language == "ko"
                 else "Two close candidates are competing, so a quick choice will speed this up."
             )
+        if response_mode == "conversational_candidate" and not citations:
+            return (
+                "완전히 확실하진 않지만, 지금은 이쪽이 가장 가까워 보여."
+                if response_language == "ko"
+                else "This is still ambiguous, but this looks like the closest match for now."
+            )
+        if response_mode in {"task_confirm_execute", "conversational_soft_confirm"}:
+            return ""
 
         if not citations:
-            if response_language == "ko":
-                return "좋아요. 요청하신 방향으로 바로 도와드리겠습니다."
-            return "Got it. I can help with that."
-
-        top_name = Path(citations[0].file_path).name if citations else ""
-        intent = parsed_intent.intent
-        if response_language == "ko":
-            if intent == ReasoningIntent.FIND_FILE:
-                return f"지금 기준이면 {top_name}부터 보는 게 가장 맞아 보여."
-            if intent == ReasoningIntent.COMPARE_FILES:
-                return "좋아, 바로 비교해볼게."
-            if intent == ReasoningIntent.DRAFT_EDIT:
-                return "좋아, 바로 수정 가능한 초안으로 정리해봤어."
-            if intent == ReasoningIntent.CLASSIFY:
-                return "문서 성격 기준으로 분류해봤어."
-            return "좋아, 이 맥락 기준으로 바로 정리해볼게."
-
-        if intent == ReasoningIntent.FIND_FILE:
-            return f"I found relevant files. The top candidate is {top_name}."
-        if intent == ReasoningIntent.COMPARE_FILES:
-            return "I gathered comparable evidence and summarized key differences."
-        if intent == ReasoningIntent.DRAFT_EDIT:
-            return "I produced an editable draft grounded in your local sources."
-        if intent == ReasoningIntent.CLASSIFY:
-            return "I classified the document and suggested metadata tags."
-        return f"I answered using {len(citations)} grounded citations."
+            return ""
+        return ""
 
     @staticmethod
     def _structured_result_v2(
@@ -432,12 +414,27 @@ class ResponseComposer:
                 conversation_mode=(execution_result.result_type == "conversation"),
                 query=query,
             )
+        if (
+            parsed_intent.intent == ReasoningIntent.GENERAL_CHAT
+            and execution_result.result_type == "conversation"
+        ):
+            summary = ResponseComposer._enforce_direct_first_summary(
+                summary=summary,
+                response_language=response_language,
+            )
+            if ResponseComposer._is_recommendation_chat_query(query):
+                summary = ResponseComposer._normalize_recommendation_three_options(
+                    summary=summary,
+                    response_language=response_language,
+                )
         if execution_result.result_type == "file_list":
             summary = ResponseComposer._file_list_summary(
+                query=query,
                 payload=execution_result.structured_payload,
                 response_language=response_language,
                 candidate_mode=verification.candidate_mode,
                 fallback=summary,
+                requested_scope=str(getattr(parsed_intent, "scope", "") or "") or None,
             )
             if execution_result.structured_payload.get("auto_indexed"):
                 if response_language == "ko":
@@ -451,8 +448,31 @@ class ResponseComposer:
                     confidence=verification.confidence,
                     response_language=response_language,
                 )
+        if (
+            parsed_intent.intent == ReasoningIntent.SUMMARIZE_FILE
+            and execution_result.result_type in {"answer", "summary"}
+            and summary
+        ):
+            summary = ResponseComposer._format_summary_points(
+                summary=summary,
+                query=query,
+                response_language=response_language,
+            )
+        summary = ResponseComposer._naturalize_summary_text(
+            summary=summary,
+            query=query,
+            response_language=response_language,
+            result_type=execution_result.result_type,
+            intent=parsed_intent.intent,
+        )
+        if execution_result.result_type in {"answer", "summary", "comparison", "classification"} and execution_result.citations:
+            summary = ResponseComposer._append_compact_source_line(
+                summary=summary,
+                citations=execution_result.citations,
+                response_language=response_language,
+            )
 
-        if not ungrounded_allowed:
+        if not ungrounded_allowed and response_mode != "conversational_direct":
             clarification = ResponseComposer._clarifying_questions(
                 parsed_intent=parsed_intent,
                 verification=verification,
@@ -485,6 +505,32 @@ class ResponseComposer:
             details=details,
             data={**execution_result.structured_payload, "response_mode": response_mode},
         )
+
+    @staticmethod
+    def _append_compact_source_line(*, summary: str, citations: list[Citation], response_language: str) -> str:
+        text = (summary or "").strip()
+        if not text or not citations:
+            return text
+        names: list[str] = []
+        seen: set[str] = set()
+        for citation in citations:
+            name = Path(citation.file_path).name
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+            if len(names) >= 3:
+                break
+        if not names:
+            return text
+        suffix = (
+            f"참고 자료: {', '.join(names)}"
+            if response_language == "ko"
+            else f"References: {', '.join(names)}"
+        )
+        if suffix in text:
+            return text
+        return f"{text}\n\n{suffix}"
 
     @staticmethod
     def _clarifying_questions(
@@ -542,13 +588,23 @@ class ResponseComposer:
     @staticmethod
     def _file_list_summary(
         *,
+        query: str,
         payload: dict,
         response_language: str,
         candidate_mode: bool,
         fallback: str,
+        requested_scope: str | None = None,
     ) -> str:
         items = payload.get("items")
         if not isinstance(items, list) or not items:
+            weeks = payload.get("requested_weeks")
+            if isinstance(weeks, list):
+                week_values = [str(int(item)) for item in weeks if isinstance(item, int)]
+                if week_values:
+                    joined = ", ".join(f"{value}주차" for value in week_values)
+                    if response_language == "ko":
+                        return f"요청하신 {joined} 파일은 현재 인덱싱된 자료에서 찾지 못했습니다."
+                    return f"I could not find files for {joined} in the currently indexed documents."
             return fallback
 
         names: list[str] = []
@@ -561,28 +617,60 @@ class ResponseComposer:
             name = Path(path).name
             if name and name not in names:
                 names.append(name)
-            if len(names) >= 4:
-                break
 
         if not names:
             return fallback
+        total = len(names)
+        preview = names[:8]
+        lowered_query = (query or "").lower()
+        wants_full_list = (requested_scope == "all") or any(token in lowered_query for token in ("전부", "모두", "전체", "모든", "all", "every"))
+        list_limit = 30 if wants_full_list else 48
+        full_list = names[:list_limit]
+        suffix = f" ... 외 {total - list_limit}개" if total > list_limit else ""
 
         if response_language == "ko":
+            if wants_full_list:
+                return (
+                    f"요청하신 조건에 맞는 파일을 총 {total}개 찾았습니다.\n"
+                    + "\n".join(f"{idx}. {name}" for idx, name in enumerate(full_list, start=1))
+                    + (
+                        f"\n... 외 {total - list_limit}개\n원하면 '계속 보여줘'라고 하면 이어서 보여드릴게요."
+                        if total > list_limit
+                        else ""
+                    )
+                )
             if candidate_mode:
                 return (
-                    f"요청하신 내용 기준으로 후보 파일 {len(names)}개를 찾았습니다. "
+                    f"요청하신 내용 기준으로 후보 파일 {total}개를 찾았습니다. "
                     f"우선 {names[0]}부터 확인해보시고, 필요하면 제가 바로 핵심만 정리해드리겠습니다."
                 )
+            if total <= 12:
+                return (
+                    f"요청하신 내용과 맞는 파일을 찾았습니다. 총 {total}개입니다.\n"
+                    + "\n".join(f"{idx}. {name}" for idx, name in enumerate(names, start=1))
+                )
             return (
-                f"요청하신 내용과 맞는 파일을 찾았습니다. "
-                f"가장 관련도가 높은 항목은 {names[0]}이고, 총 {len(names)}개 후보가 있습니다."
+                f"요청하신 내용과 맞는 파일을 찾았습니다. 가장 관련도가 높은 항목은 {preview[0]}이고, 총 {total}개 후보가 있습니다.\n"
+                f"파일 목록: {', '.join(full_list)}{suffix}"
+            )
+        if wants_full_list:
+            return (
+                f"I found {total} matching files for your request.\n"
+                + "\n".join(f"{idx}. {name}" for idx, name in enumerate(full_list, start=1))
+                + (
+                    f"\n... plus {total - list_limit} more\nSay 'show more' and I will continue."
+                    if total > list_limit
+                    else ""
+                )
             )
         if candidate_mode:
             return (
-                f"I found {len(names)} candidate files for your request. "
+                f"I found {total} candidate files for your request. "
                 f"Start with {names[0]}, then I can summarize or compare the rest."
             )
-        return f"I found matching files. The top result is {names[0]}, with {len(names)} strong candidates."
+        if total <= 12:
+            return "I found matching files:\n" + "\n".join(f"{idx}. {name}" for idx, name in enumerate(names, start=1))
+        return f"I found matching files. The top result is {preview[0]}, with {total} strong candidates.\nFiles: {', '.join(full_list)}{suffix}"
 
     @staticmethod
     def _is_noisy_generated_text(text: str) -> bool:
@@ -595,7 +683,183 @@ class ResponseComposer:
             return True
         if len(compact) > 420 and compact.count("http://") + compact.count("https://") >= 2:
             return True
+        tokens = re.findall(r"[A-Za-z0-9가-힣_]+", compact)
+        if len(tokens) >= 40:
+            unique_ratio = len(set(tokens)) / max(1, len(tokens))
+            if unique_ratio < 0.34:
+                return True
         return False
+
+    @staticmethod
+    def _naturalize_summary_text(
+        *,
+        summary: str,
+        query: str,
+        response_language: str,
+        result_type: str,
+        intent: ReasoningIntent,
+    ) -> str:
+        text = (summary or "").strip()
+        if not text:
+            return ""
+        if result_type == "file_list":
+            return text
+
+        text = ResponseComposer._strip_instruction_leakage(text)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"[ \t]{2,}", " ", text).strip()
+        text = ResponseComposer._collapse_repeated_word_chunks(text)
+        text = ResponseComposer._dedupe_sentence_lines(
+            text,
+            aggressive=(result_type != "conversation"),
+        )
+
+        if intent == ReasoningIntent.SUMMARIZE_FILE:
+            looks_like_points = bool(re.search(r"(?m)^\s*1\.\s+", text))
+            if not looks_like_points:
+                text = ResponseComposer._format_summary_points(
+                    summary=text,
+                    query=query,
+                    response_language=response_language,
+                )
+
+        if ResponseComposer._is_noisy_generated_text(text):
+            clauses = ResponseComposer._extract_summary_point_candidates(text, response_language=response_language)
+            if not clauses:
+                clauses = ResponseComposer._extract_clause_candidates(text, response_language=response_language)
+            if clauses:
+                text = "\n".join(f"{idx}. {item}" for idx, item in enumerate(clauses[:5], start=1))
+
+        return text.strip()
+
+    @staticmethod
+    def _strip_instruction_leakage(text: str) -> str:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+        cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+        # Remove leaked role markers and policy-like lines.
+        cleaned = re.sub(r"(?i)\buser\s*:\s*", "", cleaned)
+        cleaned = re.sub(r"(?i)\bassistant\s*:\s*", "", cleaned)
+        cleaned = re.sub(r"(?i)\bfollow-?up question\s*:\s*", "", cleaned)
+        cleaned = re.sub(r"(?i)\bthink step by step\b[:：]?\s*", "", cleaned)
+        cleaned = re.sub(r"(?i)\bokay,\s*let'?s see\.?", "", cleaned).strip()
+        cleaned = re.sub(r"(?i)ask at most one follow-up question\.?", "", cleaned).strip()
+        cleaned = re.sub(r"(?i)keep response to 1-3 sentences\.?", "", cleaned).strip()
+        cleaned = re.sub(r"최대한\s*한\s*번만\s*물어보세요\.?", "", cleaned).strip()
+        cleaned = re.sub(r"최대한\s*1[-~]\s*3문장으로만\s*답하세요\.?", "", cleaned).strip()
+        cleaned = re.sub(r"(?im)^\s*(?:최종\s*답변|final\s*answer)\s*[:：]\s*", "", cleaned).strip()
+        cleaned = re.sub(
+            r"(?im)\b사용자에게\s*물어볼\s*때는\s*반드시\s*['\"“”]?\?['\"“”]?\s*를?\s*붙여주세요\.?\s*",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = re.sub(
+            r"(?im)\b(?:단,\s*)?사용자의?\s*질문에\s*대한\s*(?:답변|답이)\s*(?:부족|충분하지\s*않|명확하지\s*않)[^.!?\n]{0,120}\s*추가(?:적인)?\s*(?:질문|설명)[^.!?\n]{0,120}(?:가능(?:합니다|해요)|할\s*수\s*있습니다|주세요)?\.?\s*",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = re.sub(
+            r"(?im)^\s*사용자에게\s*(?:직접\s*)?(?:도움을?|답변을?|질문을?)\s*(?:주세요|주십시오|제공하세요)\.?\s*",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = re.sub(
+            r"(?im)^\s*사용자\s*메시지에\s*바로\s*반응하(?:세요|십시오)\.?\s*",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = re.sub(
+            r"(?im)^\s*사용자\s*메시지에\s*(?:명확한\s*)?답(?:변)?을?\s*하(?:세요|십시오)\.?\s*",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = re.sub(
+            r"(?im)\b사용자\s*메시지에\s*(?:명확한\s*)?답(?:변)?을?\s*하(?:세요|십시오)\.?\s*",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = re.sub(
+            r"(?im)^\s*(?:좋아|좋아요|알겠어|알겠어요|알겠습니다|응)\s*,?\s*(?:이|그)?\s*맥락[^.!?\n]{0,60}(?:볼게|해볼게|정리해볼게|이어서\s*볼게)\.?\s*",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = re.sub(r"(?i)\bokay,\s*[.!,]*\s*$", "", cleaned).strip()
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned
+
+    @staticmethod
+    def _collapse_repeated_word_chunks(text: str) -> str:
+        words = (text or "").split()
+        if len(words) < 12:
+            return text
+        out: list[str] = []
+        i = 0
+        min_chunk = 3
+        max_chunk = 12
+        min_repeats = 3
+        while i < len(words):
+            matched = False
+            max_try = min(max_chunk, (len(words) - i) // min_repeats)
+            for size in range(max_try, min_chunk - 1, -1):
+                chunk = words[i : i + size]
+                repeats = 1
+                while i + (repeats + 1) * size <= len(words):
+                    next_chunk = words[i + repeats * size : i + (repeats + 1) * size]
+                    if next_chunk != chunk:
+                        break
+                    repeats += 1
+                if repeats >= min_repeats:
+                    out.extend(chunk)
+                    i += size * repeats
+                    matched = True
+                    break
+            if not matched:
+                out.append(words[i])
+                i += 1
+        return " ".join(out).strip()
+
+    @staticmethod
+    def _dedupe_sentence_lines(text: str, *, aggressive: bool = True) -> str:
+        if not text:
+            return ""
+        normalized = re.sub(r"\s+(?=\d+\.\s+)", "\n", text)
+        lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+        is_numbered = all(re.match(r"^\d+\.\s+", line) for line in lines) if lines else False
+        if is_numbered:
+            deduped_points: list[str] = []
+            for line in lines:
+                value = re.sub(r"^\d+\.\s+", "", line).strip()
+                if any(ResponseComposer._is_near_duplicate_point(value, prior) for prior in deduped_points):
+                    continue
+                deduped_points.append(value)
+            return "\n".join(f"{idx}. {item}" for idx, item in enumerate(deduped_points, start=1)).strip()
+
+        parts = [
+            seg.strip()
+            for seg in re.split(r"(?:\n+|(?<=[.!?。！？])\s+)", text)
+            if seg.strip()
+        ]
+        deduped: list[str] = []
+        seen_keys: set[str] = set()
+        for seg in parts:
+            normalized = re.sub(r"\s{2,}", " ", seg).strip()
+            if len(normalized) < 8:
+                continue
+            key = re.sub(r"[^\w가-힣]+", "", normalized).casefold()
+            if not key:
+                continue
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            if aggressive and any(ResponseComposer._is_near_duplicate_point(normalized, prior) for prior in deduped):
+                continue
+            deduped.append(normalized)
+        if not deduped:
+            return text.strip()
+        joined = " ".join(deduped).strip()
+        return re.sub(r"\s{2,}", " ", joined).strip()
 
     @staticmethod
     def _candidate_summary_from_citations(
@@ -643,9 +907,12 @@ class ResponseComposer:
         compact = " ".join(parts)
         compact = " ".join(compact.split())
         if conversation_mode:
-            trimmed = ResponseComposer._trim_conversation_summary(compact, query=query)
-            if trimmed:
-                compact = trimmed
+            if ResponseComposer._is_recommendation_chat_query(query):
+                compact = compact.strip()
+            else:
+                trimmed = ResponseComposer._trim_conversation_summary(compact, query=query)
+                if trimmed:
+                    compact = trimmed
         # Avoid unfinished, clipped endings.
         if compact and not re.search(ResponseComposer._KOREAN_ENDING_REGEX, compact):
             if compact[-1] not in {".", "!", "?"}:
@@ -653,15 +920,137 @@ class ResponseComposer:
         return compact
 
     @staticmethod
+    def _format_summary_points(*, summary: str, query: str, response_language: str) -> str:
+        text = (summary or "").strip()
+        if not text:
+            return ""
+        desired = ResponseComposer._requested_point_count(query=query)
+        candidates = ResponseComposer._extract_summary_point_candidates(text, response_language=response_language)
+        if not candidates:
+            return text
+        if len(candidates) < desired:
+            extra = ResponseComposer._extract_clause_candidates(text, response_language=response_language)
+            for item in extra:
+                if item in candidates:
+                    continue
+                candidates.append(item)
+                if len(candidates) >= desired:
+                    break
+        points = candidates[:desired]
+        if not points:
+            return text
+        lines = [f"{idx}. {item}" for idx, item in enumerate(points, start=1)]
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _requested_point_count(*, query: str) -> int:
+        text = (query or "").lower()
+        match = re.search(r"([3-7])\s*(?:줄|개|포인트|문장|lines?|points?)", text)
+        if match:
+            return max(3, min(7, int(match.group(1))))
+        return 5
+
+    @staticmethod
+    def _extract_summary_point_candidates(text: str, *, response_language: str) -> list[str]:
+        compact = text.replace("\r\n", "\n").replace("\r", "\n")
+        compact = re.sub(r"\(\s*[^()\n]{1,60}\.(?:txt|md|markdown|pdf|docx|py|swift|json|ya?ml)\s*\)", " ", compact, flags=re.IGNORECASE)
+        compact = re.sub(r"\b\d{1,2}[:：]\d{2}\b", "\n", compact)
+        compact = re.sub(r"(?m)^\s*\d{1,2}[:：]\d{2}\s*", "", compact)
+        compact = re.sub(r"(?m)^\s*\d+\s*[\.\)]\s*", "", compact)
+        compact = re.sub(r"[•·■◆▶]", "\n", compact)
+        compact = re.sub(r"\s{2,}", " ", compact).strip()
+        if not compact:
+            return []
+        parts = [
+            seg.strip(" \t-")
+            for seg in re.split(r"(?:\n+|(?<=[.!?。！？])\s+|;\s+)", compact)
+            if seg.strip(" \t-")
+        ]
+        output: list[str] = []
+        seen: set[str] = set()
+        for seg in parts:
+            line = re.sub(r"^\d+\s*[\.\)]\s*", "", seg).strip()
+            line = re.sub(r"(?i)^(?:좋아|좋아요|알겠어|알겠어요|알겠습니다|오케이|okay|alright)\s*,?\s*", "", line).strip()
+            line = re.sub(r"\s{2,}", " ", line).strip(" .")
+            if len(line) < 10:
+                continue
+            key = re.sub(r"[^\w가-힣]+", "", line).lower()
+            if not key or key in seen:
+                continue
+            if any(ResponseComposer._is_near_duplicate_point(line, prior) for prior in output):
+                continue
+            seen.add(key)
+            if response_language == "ko":
+                line = ResponseComposer._trim_point_length(line, max_chars=90)
+            else:
+                line = ResponseComposer._trim_point_length(line, max_chars=120)
+            output.append(line)
+        return output
+
+    @staticmethod
+    def _extract_clause_candidates(text: str, *, response_language: str) -> list[str]:
+        clauses = [
+            seg.strip(" \t-")
+            for seg in re.split(r"[,\n]", text or "")
+            if seg.strip(" \t-")
+        ]
+        output: list[str] = []
+        for clause in clauses:
+            line = re.sub(r"\(\s*[^()\n]{1,60}\.(?:txt|md|markdown|pdf|docx|py|swift|json|ya?ml)\s*\)", "", clause, flags=re.IGNORECASE)
+            line = re.sub(r"\b\d{1,2}[:：]\d{2}\b", " ", line)
+            line = re.sub(r"\s{2,}", " ", line).strip(" .")
+            if len(line) < 10:
+                continue
+            if response_language == "ko":
+                line = ResponseComposer._trim_point_length(line, max_chars=90)
+            else:
+                line = ResponseComposer._trim_point_length(line, max_chars=120)
+            if line and line not in output:
+                output.append(line)
+        return output
+
+    @staticmethod
+    def _is_near_duplicate_point(a: str, b: str) -> bool:
+        normalized_a = re.sub(r"\b\d{1,2}[:：]\d{2}\b", " ", a.lower())
+        normalized_b = re.sub(r"\b\d{1,2}[:：]\d{2}\b", " ", b.lower())
+        normalized_a = re.sub(r"\b\d+\b", " ", normalized_a)
+        normalized_b = re.sub(r"\b\d+\b", " ", normalized_b)
+        tokens_a = set(re.findall(r"[A-Za-z0-9가-힣_]+", normalized_a))
+        tokens_b = set(re.findall(r"[A-Za-z0-9가-힣_]+", normalized_b))
+        if not tokens_a or not tokens_b:
+            return False
+        overlap = len(tokens_a.intersection(tokens_b))
+        union = len(tokens_a.union(tokens_b))
+        if union <= 0:
+            return False
+        return (overlap / union) >= 0.82
+
+    @staticmethod
+    def _trim_point_length(text: str, *, max_chars: int) -> str:
+        value = (text or "").strip()
+        if len(value) <= max_chars:
+            return value
+        head = value[:max_chars]
+        cut = head.rsplit(" ", 1)[0].strip()
+        if not cut:
+            cut = head.strip()
+        return cut + "..."
+
+    @staticmethod
     def _trim_conversation_summary(summary: str, *, query: str) -> str:
         if not summary:
             return ""
-        text = summary
-        # Remove typical leaked thought/log markers.
-        text = re.sub(r"(?i)\buser\s*:\s*", "", text)
-        text = re.sub(r"(?i)\bassistant\s*:\s*", "", text)
-        text = re.sub(r"(?i)\bfollow-?up question\s*:\s*", "", text)
-        text = re.sub(r"(?i)\bokay,\s*let'?s see\.?", "", text).strip()
+        text = ResponseComposer._strip_instruction_leakage(summary)
+        text = re.sub(
+            r"(?im)^\s*(?:사용자의?\s*(?:말|질문|요청)|사용자\s*메시지)에\s*바로\s*반응하(?:세요|십시오)\.?\s*",
+            "",
+            text,
+        ).strip()
+        text = re.sub(
+            r"(?im)^\s*사용자\s*메시지에\s*(?:명확한\s*)?답(?:변)?을?\s*하(?:세요|십시오)\.?\s*",
+            "",
+            text,
+        ).strip()
         text = re.sub(r"\s{2,}", " ", text).strip()
         if not text:
             return ""
@@ -688,6 +1077,171 @@ class ResponseComposer:
             if len(output) > 90:
                 output = deduped[0] if deduped else output[:90]
         return output.strip()
+
+    @staticmethod
+    def _looks_question_sentence(sentence: str) -> bool:
+        value = str(sentence or "").strip()
+        if not value:
+            return False
+        if "?" in value:
+            return True
+        return re.search(r"(까요|나요|인가요|어때요|어떨까요|할까요|될까요)\s*[.!?]?$", value) is not None
+
+    @staticmethod
+    def _question_sentence_count(text: str) -> int:
+        value = str(text or "").strip()
+        if not value:
+            return 0
+        count = 0
+        for line in value.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            for sentence in re.split(r"(?<=[.!?。！？])\s+", line):
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                if ResponseComposer._looks_question_sentence(sentence):
+                    count += 1
+        return count
+
+    @staticmethod
+    def _enforce_direct_first_summary(*, summary: str, response_language: str) -> str:
+        text = str(summary or "").strip()
+        if not text:
+            return ""
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?。！？])\s+", text) if s.strip()]
+        if not sentences:
+            return text
+        first = sentences[0]
+        if not ResponseComposer._looks_question_sentence(first):
+            return text
+        for idx, sentence in enumerate(sentences[1:], start=1):
+            if ResponseComposer._looks_question_sentence(sentence):
+                continue
+            reordered = [sentence] + [s for i, s in enumerate(sentences) if i != idx]
+            candidate = " ".join(reordered).strip()
+            if response_language == "ko" and candidate and candidate[-1] not in {".", "!", "?"}:
+                candidate += "."
+            return candidate
+        return text
+
+    @staticmethod
+    def _is_recommendation_chat_query(query: str) -> bool:
+        lowered = str(query or "").strip().lower()
+        if not lowered:
+            return False
+        task_cues = (
+            "파일",
+            "문서",
+            "요약",
+            "정리해",
+            "찾아",
+            "열어",
+            "비교",
+            "주차",
+            "file",
+            "document",
+            "summary",
+            "summarize",
+            "find",
+            "open",
+            "compare",
+        )
+        if any(token in lowered for token in task_cues):
+            return False
+        recommendation_cues = (
+            "추천",
+            "메뉴",
+            "뭐 먹",
+            "어때",
+            "골라",
+            "선택",
+            "뭐가 좋아",
+            "뭐가 나아",
+            "뭐할까",
+            "어떤 게 좋아",
+            "recommend",
+            "suggest",
+            "what should i",
+            "which one",
+            "choice",
+        )
+        return any(token in lowered for token in recommendation_cues)
+
+    @staticmethod
+    def _normalize_recommendation_three_options(*, summary: str, response_language: str) -> str:
+        text = str(summary or "").strip()
+        if not text:
+            return ""
+        numbered = re.findall(r"(?m)^\s*[1-3]\.\s+.+$", text)
+        if len(numbered) >= 3:
+            return "\n".join([line.strip() for line in numbered[:3]]).strip()
+
+        items: list[str] = []
+        seen: set[str] = set()
+        inline_numbered = re.findall(
+            r"(?:^|\s)([1-3])\.\s*([^0-9]+?)(?=(?:\s[1-3]\.\s)|$)",
+            text,
+        )
+        for _, raw in inline_numbered:
+            item = re.sub(r"\s+", " ", str(raw or "").strip()).strip(" .")
+            if len(item) < 6:
+                continue
+            key = re.sub(r"[^\w가-힣]+", "", item).lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+            if len(items) >= 3:
+                break
+        candidates = re.findall(r"(?m)^\s*(?:\d+[.)]|[-•·])\s*(.+?)\s*$", text)
+        if not candidates:
+            candidates = [
+                seg.strip()
+                for seg in re.split(r"(?<=[.!?。！？])\s+|,\s+|\n+", text)
+                if seg.strip()
+            ]
+        for raw in candidates:
+            item = re.sub(r"\s+", " ", str(raw or "").strip()).strip(" .")
+            if len(item) < 6:
+                continue
+            key = re.sub(r"[^\w가-힣]+", "", item).lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+            if len(items) >= 3:
+                break
+        if len(items) < 3:
+            return text
+        lines = [f"{idx}. {item}" for idx, item in enumerate(items[:3], start=1)]
+        if response_language == "ko":
+            return "\n".join(lines).strip()
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _extract_detail_token(detail: str | None, *, key: str) -> str | None:
+        lowered = str(detail or "").strip().lower()
+        if not lowered:
+            return None
+        match = re.search(rf"{re.escape(key.lower())}=([a-z0-9_\-]+)", lowered)
+        if not match:
+            return None
+        return match.group(1)
+
+    @staticmethod
+    def _extract_detail_int(detail: str | None, *, key: str) -> int | None:
+        lowered = str(detail or "").strip().lower()
+        if not lowered:
+            return None
+        match = re.search(rf"{re.escape(key.lower())}=([0-9]+)", lowered)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
 
     @staticmethod
     def _confidence_band(confidence: float) -> str:
@@ -958,7 +1512,14 @@ class ResponseComposer:
                 if response_language == "ko"
                 else "Create 3 sharper follow-up queries including file name, year, or tags."
             )
-        if SuggestedActionKind.ASK_FOLLOWUP in plan.allowed_actions:
+        if (
+            SuggestedActionKind.ASK_FOLLOWUP in plan.allowed_actions
+            and not (
+                plan.plan_type == "conversation"
+                and response_mode == "conversational_direct"
+                and not candidate_mode
+            )
+        ):
             actions.append(
                 SuggestedAction(
                     action_id="ask_followup",

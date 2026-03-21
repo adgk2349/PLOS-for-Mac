@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +18,8 @@ from .models import DocumentMetadata, IndexJobStatus, StartupProfile, WorkspaceR
 from .parsers import ParseError, SUPPORTED_EXTENSIONS, parse_file
 from .vector_store import VectorStore
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(slots=True)
 class IndexDocument:
@@ -30,6 +34,7 @@ class IndexingService:
         vector_store: VectorStore,
         embedding_service: EmbeddingService,
         classifier: DocumentClassifier,
+        max_workers: int | None = None,
     ):
         self._db = db
         self._vector_store = vector_store
@@ -37,7 +42,9 @@ class IndexingService:
         self._classifier = classifier
         self._jobs: dict[str, IndexJobStatus] = {}
         self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=2)
+        # Use provided max_workers or fall back to min(cpu_count, 4) for sensible default.
+        workers = max_workers or min(os.cpu_count() or 2, 4)
+        self._executor = ThreadPoolExecutor(max_workers=workers)
         self._watcher = IncrementalWatcher(self)
 
     def start_watcher(self) -> None:
@@ -53,6 +60,14 @@ class IndexingService:
             self._jobs[job_id] = status
         self._executor.submit(self._run_job, job_id, scope, workspace)
         return status
+
+    def has_running_job(self) -> bool:
+        """Return True if any job is currently in a running/queued state."""
+        with self._lock:
+            return any(
+                j.status in ("running", "queued")
+                for j in self._jobs.values()
+            )
 
     def get_job(self, job_id: str) -> IndexJobStatus | None:
         with self._lock:
@@ -107,6 +122,11 @@ class IndexingService:
                     doc_id = self._stable_doc_id(doc.path)
                     self._update(job_id, stage="classify")
                     metadata = self._safe_classification(doc.path, parse_result.text)
+
+                    # --- Atomicity fix ---
+                    # Upsert document record first (this also clears DB chunks via
+                    # DocumentRepository.upsert_document which does DELETE FROM chunks
+                    # inside the same SQLite transaction before committing).
                     self._db.upsert_document(
                         doc_id,
                         str(doc.path),
@@ -114,7 +134,6 @@ class IndexingService:
                         doc.modified_at,
                         metadata=metadata,
                     )
-                    self._vector_store.delete_doc(doc_id)
 
                     self._update(job_id, stage="embed")
                     vectors = self._embedding_service.embed_documents(chunks)
@@ -137,13 +156,19 @@ class IndexingService:
                         )
 
                     self._db.insert_chunks(doc_id, db_chunks)
+                    # Vector store: delete old entries then add new ones.
+                    # If upsert_rows fails the SQLite record still exists and the
+                    # next incremental scan will retry (mtime unchanged → re-index).
+                    self._vector_store.delete_doc(doc_id)
                     self._vector_store.upsert_rows(rows)
+
                     if metadata.get("_classification_warning"):
                         self._db.record_failure(str(doc.path), metadata["_classification_warning"])
                     else:
                         self._db.clear_failure(str(doc.path))
                 except Exception as exc:
                     failures += 1
+                    logger.warning("Indexing failure for %s: %s", doc.path, exc)
                     self._db.record_failure(str(doc.path), str(exc))
 
                 progress = processed / total
@@ -156,6 +181,7 @@ class IndexingService:
 
             self._update(job_id, status="completed", stage="done", progress=1.0)
         except Exception as exc:
+            logger.error("Indexing job %s failed: %s", job_id, exc)
             self._update(job_id, status="failed", stage="failed", error=str(exc), progress=1.0)
 
     def _safe_classification(self, path: Path, text: str) -> dict:
@@ -263,7 +289,10 @@ class IncrementalWatcher:
                 workspace = self._indexing_service._db.get_workspace()
                 snapshot = self._snapshot(workspace)
                 if self._has_delta(snapshot):
-                    self._indexing_service.start_job("incremental", workspace)
+                    # Skip triggering a new job if one is already running to prevent
+                    # duplicate concurrent incremental indexing jobs.
+                    if not self._indexing_service.has_running_job():
+                        self._indexing_service.start_job("incremental", workspace)
                 self._last_snapshot = snapshot
             except Exception:
                 # Watcher should not bring down sidecar.

@@ -1,0 +1,60 @@
+import AppKit
+import Combine
+import CryptoKit
+import Foundation
+
+@MainActor
+extension AppViewModel {
+    func bootstrap() async {
+        hasFinishedOnboarding = UserDefaults.standard.bool(forKey: UDKey.onboardingFinished)
+        includedFolderURLs = bookmarkStore.loadURLs()
+        loadApprovedSystemActionKinds()
+        loadChatRooms()
+        loadChatResponseRoute()
+        loadLocalModelPreferenceSnapshot()
+        loadSecretAPIKeys()
+        syncQuickInferencePresetFromProfile()
+
+        do {
+            try await sidecar.start()
+            if hasFinishedOnboarding {
+                try await syncWorkspaceAndSettings()
+                try await refreshRemoteState()
+            }
+        } catch {
+            handleViewModelError(error)
+        }
+    }
+
+
+    func shutdown() {
+        sidecar.stop()
+    }
+
+
+    func startOnboardingIndexingFlow() async {
+        guard !includedFolderURLs.isEmpty else {
+            lastError = "최소 1개 이상의 폴더를 선택해 주세요."
+            return
+        }
+
+        onboardingStep = .indexing
+        isBusy = true
+        defer { isBusy = false }
+
+        do {
+            try await syncWorkspaceAndSettings()
+            try await runIndexing(scope: "full")
+            onboardingStep = .ready
+            try await refreshRemoteState()
+        } catch {
+            handleViewModelError(error)
+        }
+    }
+
+
+    func finalizeOnboarding() {
+        hasFinishedOnboarding = true
+        UserDefaults.standard.set(true, forKey: UDKey.onboardingFinished)
+    }
+}

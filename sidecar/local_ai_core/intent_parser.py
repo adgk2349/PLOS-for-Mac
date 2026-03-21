@@ -12,12 +12,19 @@ from .models import (
     WorkspaceResponse,
 )
 
-_FILE_PATTERN = re.compile(r"([A-Za-z0-9_\-\.]+\.(?:txt|md|markdown|pdf|docx|py|swift|json|yaml|yml))", re.IGNORECASE)
+_FILE_PATTERN = re.compile(
+    r"([A-Za-z가-힣0-9_+\-().\[\]]+\.(?:txt|md|markdown|pdf|docx|py|swift|json|yaml|yml))",
+    re.IGNORECASE,
+)
 _TAG_PATTERN = re.compile(r"#([A-Za-z가-힣0-9_+\-]{2,24})")
 _YEAR_PATTERN = re.compile(r"(19|20)\d{2}")
 _YEAR_RANGE_PATTERN = re.compile(r"(19|20)\d{2}\s*[-~]\s*(19|20)\d{2}")
 _PROJECT_PATTERN = re.compile(r"(?:project|프로젝트)\s*[:\-]?\s*([A-Za-z가-힣0-9 _\-]{2,40})", re.IGNORECASE)
 _TOKEN_PATTERN = re.compile(r"[A-Za-z가-힣0-9_+\-]{2,24}")
+_TARGET_WITH_DOMAIN_PATTERN = re.compile(
+    r"([A-Za-z가-힣0-9_+\-]{2,24})\s*(?:파일|문서|자료|폴더|디렉토리|file|document|folder|directory)",
+    re.IGNORECASE,
+)
 
 _STOPWORDS = {
     "please",
@@ -49,6 +56,98 @@ _STOPWORDS = {
     "것",
     "관련",
 }
+_SCOPE_ALL_TOKENS = ("전체", "전부", "모두", "모든", "all", "every", "entire")
+_SCOPE_TOPN_TOKENS = ("상위", "top", "목록", "리스트", "list", "몇개", "몇 개")
+_OPERATION_OPEN_TOKENS = ("열어", "열기", "open", "show file", "파일 열어")
+_OPERATION_SUMMARIZE_TOKENS = ("요약", "정리", "핵심", "summary", "summarize")
+_OPERATION_FIND_TOKENS = (
+    "찾아",
+    "검색",
+    "어디",
+    "목록",
+    "리스트",
+    "파일",
+    "문서",
+    "폴더",
+    "디렉토리",
+    "find",
+    "search",
+    "list",
+    "file",
+    "document",
+    "folder",
+    "directory",
+)
+_FIND_ACTION_TOKENS = (
+    "찾아",
+    "검색",
+    "보여",
+    "목록",
+    "리스트",
+    "어디",
+    "열어",
+    "뭐뭐",
+    "무슨",
+    "무엇",
+    "뭐있어",
+    "있지",
+    "있어",
+    "몇주차",
+    "몇 주차",
+    "몇개",
+    "몇 개",
+    "what do i have",
+    "what is there",
+    "list",
+    "find",
+    "search",
+    "show",
+    "where",
+    "open",
+)
+_FILE_TARGET_TOKENS = (
+    "파일",
+    "문서",
+    "자료",
+    "폴더",
+    "디렉토리",
+    "주차",
+    "강의",
+    "노트",
+    "file",
+    "document",
+    "folder",
+    "directory",
+    "week",
+    "lecture",
+    "note",
+)
+_SUMMARY_ACTION_TOKENS = (
+    "요약",
+    "정리",
+    "핵심",
+    "요점",
+    "summary",
+    "summarize",
+    "key point",
+)
+_TARGET_NOISE = {
+    *_STOPWORDS,
+    "전체",
+    "전부",
+    "모두",
+    "모든",
+    "상위",
+    "top",
+    "all",
+    "every",
+    "핵심",
+    "요약해줘",
+    "보여줘",
+    "찾아줘",
+    "해줘",
+    "해주세요",
+}
 
 
 class IntentParser:
@@ -69,7 +168,23 @@ class IntentParser:
             included_paths=list(workspace.included_paths),
             excluded_paths=list(workspace.excluded_paths),
         )
-        confidence = self._confidence(intent=intent, entities=entities, query=text)
+        operation = self._infer_operation(lowered_query=lowered, intent=intent)
+        scope = self._extract_scope(query=text, lowered_query=lowered, operation=operation)
+        target = self._extract_target(query=text, entities=entities, operation=operation)
+        ambiguity = self._infer_ambiguity(
+            operation=operation,
+            scope=scope,
+            target=target,
+            entities=entities,
+        )
+        confidence = self._confidence(
+            intent=intent,
+            entities=entities,
+            query=text,
+            operation=operation,
+            scope=scope,
+            ambiguity=ambiguity,
+        )
 
         return ParsedIntent(
             intent=intent,
@@ -77,6 +192,10 @@ class IntentParser:
             time_filters=time_filters,
             workspace_filters=workspace_filters,
             confidence=confidence,
+            operation=operation,
+            target=target,
+            scope=scope,
+            ambiguity=ambiguity,
         )
 
     @staticmethod
@@ -111,7 +230,10 @@ class IntentParser:
         ):
             return ReasoningIntent.LIGHTWEIGHT_ACTION_REQUEST
 
-        if any(token in lowered_query for token in ("1주차", "2주차", "3주차", "4주차", "5주차", "6주차", "7주차", "8주차", "최근 것만", "pdf로")):
+        if (
+            re.search(r"([1-9]|1[0-9]|2[0-4])\s*주차", lowered_query) is not None
+            or any(token in lowered_query for token in ("최근 것만", "pdf로"))
+        ):
             return ReasoningIntent.FOLLOWUP_REFINE
 
         if any(token in lowered_query for token in ("그거?", "그 파일?", "이거지", "right?", "that one?")):
@@ -124,42 +246,7 @@ class IntentParser:
         if any(clue in lowered_query for clue in followup_clues) and len(lowered_query.split()) <= 14:
             return ReasoningIntent.FOLLOWUP_QUESTION
 
-        broad_list_patterns = (
-            "뭐뭐",
-            "무슨",
-            "무엇",
-            "어떤",
-            "있지",
-            "있어",
-            "뭐있어",
-            "몇주차",
-            "몇 주차",
-            "몇개",
-            "몇 개",
-            "목록",
-            "리스트",
-            "what do i have",
-            "what is there",
-            "list",
-        )
-        domain_nouns = (
-            "강의",
-            "노트",
-            "문서",
-            "파일",
-            "자료",
-            "폴더",
-            "디렉토리",
-            "주차",
-            "lecture",
-            "note",
-            "file",
-            "document",
-            "folder",
-            "directory",
-            "week",
-        )
-        if any(p in lowered_query for p in broad_list_patterns) and any(noun in lowered_query for noun in domain_nouns):
+        if IntentParser._has_explicit_find_request(lowered_query):
             return ReasoningIntent.FIND_FILE
 
         classify_clues = ("classify", "분류", "태그", "category", "카테고리")
@@ -174,24 +261,11 @@ class IntentParser:
         if any(clue in lowered_query for clue in compare_clues):
             return ReasoningIntent.COMPARE_FILES
 
-        summarize_clues = (
-            "summary",
-            "summarize",
-            "요약",
-            "핵심",
-            "중요",
-            "important",
-            "시험",
-            "정리",
-            "뭐였지",
-            "key point",
-            "what mattered",
-        )
-        if any(clue in lowered_query for clue in summarize_clues):
+        if IntentParser._has_explicit_summary_request(lowered_query):
             return ReasoningIntent.SUMMARIZE_FILE
 
-        file_find_clues = ("find", "locate", "where", "찾아", "어디", "경로", "파일", "폴더", "디렉토리", "folder", "directory")
-        if any(clue in lowered_query for clue in file_find_clues):
+        file_find_clues = ("find", "locate", "where", "찾아", "어디", "경로")
+        if any(clue in lowered_query for clue in file_find_clues) and IntentParser._has_file_target_token(lowered_query):
             return ReasoningIntent.FIND_FILE
 
         if IntentParser._is_general_chat(lowered_query):
@@ -227,6 +301,20 @@ class IntentParser:
             "심심",
             "피곤",
             "졸려",
+            "잠",
+            "자야",
+            "몇 시",
+            "몇시",
+            "새벽",
+            "아침에",
+            "루틴",
+            "습관",
+            "고민",
+            "괜찮아",
+            "괜찮을까",
+            "운동하고",
+            "목이",
+            "아파",
             "기분",
             "대화",
             "잡담",
@@ -238,34 +326,7 @@ class IntentParser:
             "bored",
             "chat",
         )
-        task_cues = (
-            "요약",
-            "정리",
-            "비교",
-            "분석",
-            "파일",
-            "폴더",
-            "문서",
-            "검색",
-            "찾아",
-            "주차",
-            "연도",
-            "태그",
-            "요청",
-            "summarize",
-            "summary",
-            "compare",
-            "analysis",
-            "file",
-            "folder",
-            "document",
-            "find",
-            "search",
-            "tag",
-            "year",
-            "week",
-        )
-        if any(cue in lowered_query for cue in task_cues):
+        if IntentParser._has_explicit_find_request(lowered_query) or IntentParser._has_explicit_summary_request(lowered_query):
             return False
         if any(cue in lowered_query for cue in social_cues):
             return True
@@ -293,9 +354,119 @@ class IntentParser:
             "tag",
             "search",
         )
-        if token_count <= 7 and not any(cue in lowered_query for cue in anchor_cues):
+        if token_count <= 12 and not any(cue in lowered_query for cue in anchor_cues):
             return True
         return False
+
+    @staticmethod
+    def _has_scope_all_token(lowered_query: str) -> bool:
+        return any(token in lowered_query for token in _SCOPE_ALL_TOKENS)
+
+    @staticmethod
+    def _has_file_target_token(lowered_query: str) -> bool:
+        return any(token in lowered_query for token in _FILE_TARGET_TOKENS)
+
+    @staticmethod
+    def _has_explicit_find_request(lowered_query: str) -> bool:
+        has_target = IntentParser._has_file_target_token(lowered_query)
+        has_action = any(token in lowered_query for token in _FIND_ACTION_TOKENS)
+        if has_target and has_action:
+            return True
+        if has_target and IntentParser._has_scope_all_token(lowered_query):
+            return True
+        return False
+
+    @staticmethod
+    def _has_explicit_summary_request(lowered_query: str) -> bool:
+        has_summary_action = any(token in lowered_query for token in _SUMMARY_ACTION_TOKENS)
+        if has_summary_action and (IntentParser._has_file_target_token(lowered_query) or len(lowered_query.split()) >= 2):
+            return True
+        important_clues = ("중요", "important", "시험", "what mattered")
+        if any(token in lowered_query for token in important_clues) and IntentParser._has_file_target_token(lowered_query):
+            return True
+        return False
+
+    @staticmethod
+    def _infer_operation(*, lowered_query: str, intent: ReasoningIntent) -> str:
+        if any(token in lowered_query for token in _OPERATION_OPEN_TOKENS):
+            return "open"
+        if intent == ReasoningIntent.OPEN_FILE:
+            return "open"
+        if IntentParser._has_explicit_summary_request(lowered_query):
+            return "summarize"
+        if intent in {
+            ReasoningIntent.SUMMARIZE_FILE,
+            ReasoningIntent.COMPARE_FILES,
+            ReasoningIntent.EXPLAIN_CONTENT,
+            ReasoningIntent.DRAFT_EDIT,
+            ReasoningIntent.CLASSIFY,
+            ReasoningIntent.LIGHTWEIGHT_ACTION_REQUEST,
+        }:
+            return "summarize"
+        if IntentParser._has_explicit_find_request(lowered_query):
+            return "find"
+        if intent in {
+            ReasoningIntent.FIND_FILE,
+            ReasoningIntent.FOLLOWUP_QUESTION,
+            ReasoningIntent.FOLLOWUP_REFINE,
+            ReasoningIntent.CONTINUE_PREVIOUS_RESULT,
+            ReasoningIntent.SOFT_CONFIRM,
+            ReasoningIntent.SELECT_PREVIOUS_CANDIDATE,
+            ReasoningIntent.NEXT_CANDIDATE,
+            ReasoningIntent.REDUCE_SCOPE,
+        }:
+            return "find"
+        return "chat"
+
+    @staticmethod
+    def _extract_scope(*, query: str, lowered_query: str, operation: str) -> str:
+        if any(token in lowered_query for token in _SCOPE_ALL_TOKENS):
+            return "all"
+        explicit_top_n = re.search(r"\btop\s*\d+\b", lowered_query) is not None
+        numeric_count = re.search(r"([2-9]|[1-9]\d)\s*(개|개만|files?|docs?)", lowered_query) is not None
+        if explicit_top_n or numeric_count:
+            return "top_n"
+        if operation in {"find", "summarize"} and any(token in lowered_query for token in _SCOPE_TOPN_TOKENS):
+            return "top_n"
+        return "single"
+
+    @staticmethod
+    def _extract_target(*, query: str, entities: ParsedEntities, operation: str) -> str | None:
+        if operation == "chat":
+            return None
+        if entities.file_names:
+            return entities.file_names[0]
+        if entities.projects:
+            return entities.projects[0]
+        if entities.tags:
+            return entities.tags[0]
+        direct = _TARGET_WITH_DOMAIN_PATTERN.search(query)
+        if direct:
+            token = (direct.group(1) or "").strip()
+            if token and token.lower() not in _TARGET_NOISE:
+                return token
+        for token in entities.topics:
+            cleaned = (token or "").strip()
+            if not cleaned:
+                continue
+            if cleaned.lower() in _TARGET_NOISE:
+                continue
+            if cleaned.lower() in _SCOPE_ALL_TOKENS:
+                continue
+            return cleaned
+        return None
+
+    @staticmethod
+    def _infer_ambiguity(*, operation: str, scope: str, target: str | None, entities: ParsedEntities) -> str:
+        if operation == "chat":
+            return "clear"
+        if target:
+            return "clear"
+        if entities.file_names or entities.projects or entities.tags:
+            return "clear"
+        if scope == "all":
+            return "unclear"
+        return "unclear"
 
     @staticmethod
     def _extract_entities(query: str) -> ParsedEntities:
@@ -357,7 +528,15 @@ class IntentParser:
         )
 
     @staticmethod
-    def _confidence(intent: ReasoningIntent, entities: ParsedEntities, query: str) -> float:
+    def _confidence(
+        *,
+        intent: ReasoningIntent,
+        entities: ParsedEntities,
+        query: str,
+        operation: str,
+        scope: str,
+        ambiguity: str,
+    ) -> float:
         score = 0.45
         if intent in {
             ReasoningIntent.FIND_FILE,
@@ -375,10 +554,22 @@ class IntentParser:
             ReasoningIntent.OPEN_FILE,
         }:
             score += 0.15
+        if operation == "chat":
+            score = max(score, 0.72)
+        elif operation in {"find", "summarize", "open"}:
+            score += 0.06
+        if scope == "all":
+            score += 0.02
+        elif scope == "top_n":
+            score += 0.01
         if entities.file_names:
             score += 0.15
         if entities.tags or entities.projects:
             score += 0.1
         if len(query.split()) >= 12:
             score += 0.08
+        if ambiguity == "unclear":
+            score -= 0.18
+        if len(query.split()) <= 3 and ambiguity == "unclear":
+            score -= 0.08
         return max(0.2, min(score, 0.98))

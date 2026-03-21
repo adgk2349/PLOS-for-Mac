@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -129,6 +130,13 @@ class ModelManager:
 
     def install_catalog_model(self, model_id: str) -> ModelCatalogInstallResponse:
         model = self._find_catalog_model(model_id)
+        system_memory_gb = self._system_memory_gb()
+        if system_memory_gb < int(model.recommended_memory_gb):
+            raise ValueError(
+                f"현재 시스템 메모리({system_memory_gb}GB)로는 "
+                f"{model.name} 다운로드를 권장하지 않습니다. "
+                f"최소 권장 사양은 {model.recommended_memory_gb}GB입니다."
+            )
         state = self._load_state()
         self._set_state_record(
             state,
@@ -240,11 +248,13 @@ class ModelManager:
 
         target_dir = self._engine_dir(model.engine) / model.id
         target_dir.mkdir(parents=True, exist_ok=True)
+        allow_patterns = model.allow_patterns or None
         snapshot_download(
             repo_id=model.repo_id,
             local_dir=str(target_dir),
             local_dir_use_symlinks=False,
             resume_download=True,
+            allow_patterns=allow_patterns,
         )
         return str(target_dir)
 
@@ -271,6 +281,27 @@ class ModelManager:
             if model.id == model_id:
                 return model
         raise ValueError(f"지원하지 않는 모델 ID: {model_id}")
+
+    @staticmethod
+    def _system_memory_gb() -> int:
+        override = (os.getenv("LOCAL_AI_SYSTEM_MEMORY_GB_OVERRIDE") or "").strip()
+        if override:
+            try:
+                parsed = int(float(override))
+                if parsed > 0:
+                    return parsed
+            except Exception:
+                pass
+
+        try:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            phys_pages = os.sysconf("SC_PHYS_PAGES")
+            if isinstance(page_size, int) and isinstance(phys_pages, int) and page_size > 0 and phys_pages > 0:
+                total_bytes = page_size * phys_pages
+                return max(1, int(total_bytes / (1024**3)))
+        except Exception:
+            pass
+        return 16
 
     def _load_catalog_manifest(self) -> ModelCatalogManifest:
         if not self._catalog_path.exists():

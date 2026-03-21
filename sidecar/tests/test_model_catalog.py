@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from local_ai_core.model_manager import ModelManager
 from local_ai_core.models import (
     LocalEngine,
@@ -111,6 +113,22 @@ def test_catalog_manifest_includes_high_quality_options(tmp_path: Path):
     manifest = manager._load_catalog_manifest()
     ids = {item.id for item in manifest.models}
     assert "qwen25_7b_mlx_advanced" in ids
-    assert "phi4_mini_mlx_advanced" in ids
+    assert "gemma3_12b_gguf" in ids
+    assert "deepseek_r1_distill_qwen14b_gguf" in ids
     assert "llama31_8b_mlx_advanced" in ids
-    assert "qwen3_8b_gguf_advanced" in ids
+    assert "gpt_oss_20b_gguf" in ids
+    assert "gpt_oss_120b_gguf" in ids
+    assert "qwen35_397b_a17b_gguf" in ids
+    assert "kimi25_gguf" in ids
+
+
+def test_install_catalog_model_blocks_when_memory_is_insufficient(tmp_path: Path, monkeypatch):
+    manager = ModelManager(tmp_path)
+    monkeypatch.setenv("LOCAL_AI_SYSTEM_MEMORY_GB_OVERRIDE", "16")
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr(manager, "_download_huggingface_repo", lambda _model: str(tmp_path / "dummy"))
+        ctx.setattr(manager, "_download_huggingface_file", lambda _model: str(tmp_path / "dummy.gguf"))
+        with pytest.raises(ValueError) as excinfo:
+            manager.install_catalog_model("gpt_oss_20b_gguf")
+        assert "최소 권장 사양은 64GB" in str(excinfo.value)

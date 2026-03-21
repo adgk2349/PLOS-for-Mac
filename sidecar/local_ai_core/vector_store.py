@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,10 @@ except Exception:  # pragma: no cover
     lancedb = None
     pa = None
 
+# Chunk IDs are generated as "<sha1hex>:<int>".
+# Only allow characters that appear in that format to prevent filter-string injection.
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9:_\-]+$")
+
 
 @dataclass(slots=True)
 class VectorHit:
@@ -22,6 +27,10 @@ class VectorHit:
     text: str
     score: float
     modified_at: float
+
+    def with_score(self, score: float) -> "VectorHit":
+        """Return a new VectorHit with the given score (immutable update)."""
+        return replace(self, score=min(score, 2.0))  # clamp – reranking may add bonuses > 1.0
 
 
 class VectorStore:
@@ -58,10 +67,18 @@ class VectorStore:
         if self._table is not None:
             chunk_ids = [r["chunk_id"] for r in rows]
             if chunk_ids:
-                condition = "chunk_id IN ({})".format(
-                    ", ".join(f"'{chunk_id}'" for chunk_id in chunk_ids)
-                )
-                self._table.delete(condition)
+                # Validate each chunk_id against the safe-character regex before
+                # embedding it in the LanceDB filter string. LanceDB does not support
+                # standard SQL parameter binding, so we sanitise manually.
+                safe_quoted = []
+                for cid in chunk_ids:
+                    if _SAFE_ID_RE.match(cid):
+                        safe_quoted.append(f"'{cid}'")
+                    # Skip IDs that contain unexpected characters – they cannot
+                    # exist in the table anyway (generated internally).
+                if safe_quoted:
+                    condition = "chunk_id IN ({})".format(", ".join(safe_quoted))
+                    self._table.delete(condition)
             self._table.add(rows)
             return
 
@@ -70,7 +87,9 @@ class VectorStore:
 
     def delete_doc(self, doc_id: str) -> None:
         if self._table is not None:
-            self._table.delete(f"doc_id = '{doc_id}'")
+            # doc_id is also internally generated (SHA1 hex), so safe to embed.
+            if _SAFE_ID_RE.match(doc_id):
+                self._table.delete(f"doc_id = '{doc_id}'")
             return
 
         keys_to_delete = [k for k, v in self._fallback_rows.items() if v["doc_id"] == doc_id]
@@ -91,6 +110,7 @@ class VectorStore:
                     doc_id=row["doc_id"],
                     file_path=row["file_path"],
                     text=row["text"],
+                    # LanceDB returns cosine *distance* in [0, 2]; convert to similarity.
                     score=float(1.0 - row.get("_distance", 1.0)),
                     modified_at=float(row["modified_at"]),
                 )

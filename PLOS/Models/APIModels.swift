@@ -406,6 +406,10 @@ struct ParsedIntent: Codable {
     var time_filters: ParsedTimeFilters
     var workspace_filters: ParsedWorkspaceFilters
     var confidence: Double
+    var operation: String?
+    var target: String?
+    var scope: String?
+    var ambiguity: String?
 }
 
 struct LocalPlan: Codable {
@@ -810,10 +814,14 @@ struct ChatMessage: Identifiable, Codable {
     let actions: [SuggestedAction]
     let timestamp: Date
 
+    private static func nfc(_ value: String?) -> String? {
+        value?.precomposedStringWithCanonicalMapping
+    }
+
     init(id: UUID = UUID(), source: Source, text: String, timestamp: Date) {
         self.id = id
         self.source = source
-        self.text = text
+        self.text = text.precomposedStringWithCanonicalMapping
         intent = nil
         lead = nil
         resultSummary = nil
@@ -832,14 +840,14 @@ struct ChatMessage: Identifiable, Codable {
         source = .local
         text = nil
         intent = response.intent
-        lead = response.lead
-        resultSummary = response.result_summary
+        lead = Self.nfc(response.lead)
+        resultSummary = Self.nfc(response.result_summary)
         structuredResult = nil
         responseMetadata = nil
         parsedIntent = nil
         plan = nil
         verification = nil
-        reasoningBrief = response.reasoning_brief
+        reasoningBrief = Self.nfc(response.reasoning_brief)
         actions = response.actions
         self.timestamp = timestamp
     }
@@ -849,8 +857,8 @@ struct ChatMessage: Identifiable, Codable {
         source = .local
         text = nil
         intent = nil
-        lead = response.lead
-        resultSummary = response.structured_result.summary
+        lead = response.lead.precomposedStringWithCanonicalMapping
+        resultSummary = response.structured_result.summary.precomposedStringWithCanonicalMapping
         structuredResult = response.structured_result
         responseMetadata = response.metadata
         parsedIntent = response.parsed_intent
@@ -869,6 +877,9 @@ struct ChatRoom: Codable, Identifiable {
     var citations: [Citation]
     var latestQueryForDeepAnalysis: String?
     var updatedAt: Date
+    var archivedAt: Date?
+
+    var isArchived: Bool { archivedAt != nil }
 
     static func makeDefault() -> ChatRoom {
         ChatRoom(
@@ -877,7 +888,8 @@ struct ChatRoom: Codable, Identifiable {
             messages: [],
             citations: [],
             latestQueryForDeepAnalysis: nil,
-            updatedAt: Date()
+            updatedAt: Date(),
+            archivedAt: nil
         )
     }
 }

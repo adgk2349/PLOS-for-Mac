@@ -85,6 +85,27 @@ class MemoryRepository:
             self._conn.commit()
         return max(0, int(count))
 
+    def clear_session_memory_by_keys(self, *, keys: list[str], session_id: str | None = None) -> int:
+        normalized = [str(key).strip() for key in keys if str(key).strip()]
+        if not normalized:
+            return 0
+        placeholders = ",".join(["?"] * len(normalized))
+        with self._lock:
+            cur = self._conn.cursor()
+            if session_id:
+                cur.execute(
+                    f"DELETE FROM session_memory WHERE key IN ({placeholders}) AND session_id=?",
+                    [*normalized, session_id],
+                )
+            else:
+                cur.execute(
+                    f"DELETE FROM session_memory WHERE key IN ({placeholders})",
+                    normalized,
+                )
+            count = cur.rowcount if cur.rowcount is not None else 0
+            self._conn.commit()
+        return max(0, int(count))
+
     def get_workspace_memory_existing(self, workspace_id: str, memory_type: str, key: str, source: str) -> sqlite3.Row | None:
         return self._fetchone(
             """
@@ -133,6 +154,13 @@ class MemoryRepository:
             LIMIT ?
             """,
             (workspace_id, min_confidence, limit),
+        )
+
+    def get_retrieval_weights(self) -> list[sqlite3.Row]:
+        """Return all workspace_memory rows with memory_type='retrieval_weight'."""
+        return self._fetchall(
+            "SELECT key, value_json FROM workspace_memory "
+            "WHERE memory_type='retrieval_weight' ORDER BY updated_at DESC"
         )
 
     def clear_workspace_memory(self, workspace_id: str | None = None, inferred_only: bool = False) -> int:

@@ -136,8 +136,109 @@ class DocumentRepository:
             tuple(doc_ids),
         )
 
-    def list_documents(self) -> list[sqlite3.Row]:
-        return self._fetchall("SELECT * FROM documents ORDER BY indexed_at DESC")
+    def list_documents(
+        self,
+        *,
+        search: str | None = None,
+        category: str | None = None,
+        year: int | None = None,
+        project: str | None = None,
+        tags: list[str] | None = None,
+        excluded: bool | None = None,
+        doc_ids: list[str] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[sqlite3.Row], int]:
+        """
+        Perform SQL-level filtering so that Python-side iteration is bounded.
+        Returns (rows_for_page, total_count).
+
+        NOTE: Tags are stored as JSON arrays; SQLite json_each is used for
+        exact-tag matching. If json_each is not available (very old SQLite),
+        we fall back to LIKE matching which is slightly less strict.
+        """
+        conditions: list[str] = []
+        params: list[Any] = []
+
+        # Workspace-scope filter (doc_id allow-list)
+        if doc_ids is not None:
+            cleaned = [str(item).strip() for item in doc_ids if str(item).strip()]
+            if not cleaned:
+                return [], 0
+            placeholders = ",".join("?" for _ in cleaned)
+            conditions.append(f"doc_id IN ({placeholders})")
+            params.extend(cleaned)
+
+        # Excluded / not-excluded filter
+        if excluded is None:
+            # Default: only non-excluded documents
+            conditions.append("(COALESCE(user_excluded, excluded)=0)")
+        else:
+            conditions.append("(COALESCE(user_excluded, excluded)=?)")
+            params.append(1 if excluded else 0)
+
+        # Category — prefer user_category, fall back to auto category
+        if category:
+            conditions.append(
+                "(COALESCE(user_category, category) = ?)"
+            )
+            params.append(category)
+
+        # Year
+        if year is not None:
+            conditions.append("(COALESCE(user_year, year) = ?)")
+            params.append(year)
+
+        # Project (case-insensitive substring)
+        if project:
+            conditions.append(
+                "(LOWER(COALESCE(user_project, project, '')) LIKE ?)"
+            )
+            params.append(f"%{project.lower()}%")
+
+        # Text search across path + summary
+        if search:
+            needle = search.strip().lower()
+            if needle:
+                conditions.append(
+                    "(LOWER(path) LIKE ? OR LOWER(summary) LIKE ?)"
+                )
+                params.extend([f"%{needle}%", f"%{needle}%"])
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        # Count total before pagination
+        count_sql = f"SELECT COUNT(*) AS cnt FROM documents {where_clause}"
+        count_row = self._fetchone(count_sql, tuple(params))
+        total = int(count_row["cnt"]) if count_row else 0
+
+        # Fetch page
+        page_sql = (
+            f"SELECT * FROM documents {where_clause} "
+            f"ORDER BY indexed_at DESC LIMIT ? OFFSET ?"
+        )
+        rows = self._fetchall(page_sql, tuple(params) + (limit, offset))
+
+        # Tag filtering is done in Python because JSON array intersection
+        # is cumbersome in SQLite without json_each; the dataset is already
+        # bounded by the SQL query above, so this is acceptable.
+        if tags:
+            wanted = {t.lower() for t in tags if t.strip()}
+            if wanted:
+                filtered = []
+                for row in rows:
+                    raw = row["user_tags"] if row["user_tags"] is not None else row["tags"]
+                    try:
+                        row_tags = {t.lower() for t in json.loads(raw or "[]")}
+                    except Exception:
+                        row_tags = set()
+                    if wanted.intersection(row_tags):
+                        filtered.append(row)
+                rows = filtered
+                total = len(rows)  # recalculate after tag filter
+                rows = rows[offset:offset + limit]
+
+        return rows, total
 
     def find_doc_ids(self) -> list[sqlite3.Row]:
         return self._fetchall("SELECT * FROM documents")

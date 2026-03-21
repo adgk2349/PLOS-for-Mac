@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
+import os
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -101,11 +103,56 @@ def _auth_dependency(request: Request) -> None:
     app_state.auth.verify_request(request)
 
 
+def _expected_parent_pid() -> int | None:
+    raw = (os.getenv("LOCAL_AI_PARENT_PID") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value <= 1:
+        return None
+    return value
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+async def _watch_parent_lifecycle(parent_pid: int) -> None:
+    while True:
+        await asyncio.sleep(1.5)
+        if os.getppid() == parent_pid:
+            continue
+        if _pid_alive(parent_pid):
+            continue
+        os._exit(0)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    parent_monitor_task: asyncio.Task | None = None
+    expected_parent = _expected_parent_pid()
+    if expected_parent is not None:
+        parent_monitor_task = asyncio.create_task(_watch_parent_lifecycle(expected_parent))
     app_state.indexing.start_watcher()
-    yield
-    app_state.indexing.stop_watcher()
+    try:
+        yield
+    finally:
+        if parent_monitor_task is not None:
+            parent_monitor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await parent_monitor_task
+        app_state.indexing.stop_watcher()
 
 
 
@@ -207,17 +254,17 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/memory/session/relevant", response_model=SessionMemoryResponse, dependencies=[Depends(_auth_dependency)])
     def get_relevant_session_memory(session_id: str) -> SessionMemoryResponse:
-        items = app_state.memory.getRelevantSessionMemory(session_id)
+        items = app_state.memory.get_relevant_session_memory(session_id)
         return SessionMemoryResponse(items=items)
 
     @app.get("/v1/memory/workspace/relevant", response_model=WorkspaceMemoryResponse, dependencies=[Depends(_auth_dependency)])
     def get_relevant_workspace_memory(workspace_id: str, intent: str | None = None) -> WorkspaceMemoryResponse:
-        items = app_state.memory.getRelevantWorkspaceMemory(workspace_id, intent)
+        items = app_state.memory.get_relevant_workspace_memory(workspace_id, intent)
         return WorkspaceMemoryResponse(items=items)
 
     @app.get("/v1/memory/preferences", response_model=UserPreferencesResponse, dependencies=[Depends(_auth_dependency)])
     def get_user_preferences() -> UserPreferencesResponse:
-        items = app_state.memory.getUserPreferences()
+        items = app_state.memory.get_user_preferences()
         return UserPreferencesResponse(items=items)
 
     @app.get("/v1/memory/episodic/relevant", response_model=EpisodicMemoryResponse, dependencies=[Depends(_auth_dependency)])
@@ -227,7 +274,7 @@ def create_app() -> FastAPI:
         related_file_ids: str | None = None,
     ) -> EpisodicMemoryResponse:
         related = [item.strip() for item in (related_file_ids or "").split(",") if item.strip()]
-        items = app_state.memory.getRelevantEpisodicMemory(workspace_id, intent, related)
+        items = app_state.memory.get_relevant_episodic_memory(workspace_id, intent, related)
         return EpisodicMemoryResponse(items=items)
 
     @app.post("/v1/memory/events", response_model=MemoryEventResponse, dependencies=[Depends(_auth_dependency)])
@@ -287,9 +334,17 @@ def create_app() -> FastAPI:
             project=project,
             excluded=excluded,
         )
+        workspace = app_state.db.get_workspace()
+        allowed_doc_ids = app_state.db.find_doc_ids_for_workspace(
+            included_paths=workspace.included_paths,
+            excluded_paths=workspace.excluded_paths,
+            filters=filters,
+            search=search,
+        )
         docs, total = app_state.db.list_documents(
             search=search,
             filters=filters,
+            allowed_doc_ids=allowed_doc_ids,
             limit=max(1, min(limit, 300)),
             offset=max(0, offset),
         )

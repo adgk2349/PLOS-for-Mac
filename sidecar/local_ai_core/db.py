@@ -192,15 +192,28 @@ class Database:
         *,
         search: str | None = None,
         filters: ChatFilters | None = None,
+        allowed_doc_ids: set[str] | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> tuple[list[DocumentMetadata], int]:
-        rows = self.documents.list_documents()
-        filtered = [self._row_to_effective_dict(row) for row in rows]
-        filtered = self._apply_doc_filters(filtered, search=search, filters=filters)
-        total = len(filtered)
-        page = filtered[offset : offset + limit]
-        return [DocumentMetadata(**item) for item in page], total
+        """
+        Delegate filtering to DocumentRepository which uses SQL WHERE clauses
+        for category / year / project / search / excluded, dramatically reducing
+        the number of rows returned to Python for large document sets.
+        """
+        f = filters or ChatFilters()
+        rows, total = self.documents.list_documents(
+            search=search,
+            category=f.category,
+            year=f.year,
+            project=f.project,
+            tags=f.tags or [],
+            excluded=f.excluded,
+            doc_ids=sorted(allowed_doc_ids) if allowed_doc_ids is not None else None,
+            limit=limit,
+            offset=offset,
+        )
+        return [DocumentMetadata(**self._row_to_effective_dict(row)) for row in rows], total
 
     def find_doc_ids(self, *, filters: ChatFilters | None, search: str | None = None) -> set[str]:
         rows = self.documents.find_doc_ids()
@@ -311,6 +324,9 @@ class Database:
     def clear_session_memory(self, session_id: str | None = None) -> int:
         return self.memory.clear_session_memory(session_id)
 
+    def clear_session_memory_by_keys(self, *, keys: list[str], session_id: str | None = None) -> int:
+        return self.memory.clear_session_memory_by_keys(keys=keys, session_id=session_id)
+
     def upsert_workspace_memory(self, *, workspace_id: str, memory_type: str, key: str, value_json: dict[str, Any], confidence: float = 0.62, source: str = "inferred") -> WorkspaceMemoryItem:
         now = utc_now().isoformat()
         existing = self.memory.get_workspace_memory_existing(workspace_id, memory_type, key, source)
@@ -389,10 +405,27 @@ class Database:
         return self._row_to_episodic_memory(self.memory.get_memory_content_by_id("episodic_memory", item_id))
 
     def get_relevant_episodic_memory(self, *, workspace_id: str | None = None, intent: str | None = None, related_file_ids: list[str] | None = None, limit: int = 15) -> list[EpisodicMemoryEvent]:
-        # 'intent' and 'related_file_ids' are passed by service but original code was mostly relying on workspace_id and limit 
-        # in the basic episodic retrieval.
-        rows = self.memory.get_relevant_episodic_memory(workspace_id, limit)
-        return [self._row_to_episodic_memory(row) for row in rows]
+        rows = self.memory.get_relevant_episodic_memory(workspace_id, max(limit * 3, 30))
+        events = [self._row_to_episodic_memory(row) for row in rows]
+        requested_files = {str(item).strip() for item in (related_file_ids or []) if str(item).strip()}
+        requested_intent = (intent or "").strip().lower()
+
+        def _score(event: EpisodicMemoryEvent) -> float:
+            score = float(event.importance)
+            meta_intent = str(event.metadata_json.get("intent") or "").strip().lower()
+            if requested_intent and meta_intent == requested_intent:
+                score += 0.45
+            if requested_files and requested_files.intersection({str(v).strip() for v in event.related_file_ids}):
+                score += 0.35
+            if event.workspace_id == workspace_id:
+                score += 0.15
+            return score
+
+        if requested_intent or requested_files:
+            events.sort(key=_score, reverse=True)
+        else:
+            events.sort(key=lambda item: item.created_at, reverse=True)
+        return events[:limit]
 
     def list_recent_episodic_memory(self, *, workspace_id: str | None = None, days: int = 7, limit: int = 50) -> list[EpisodicMemoryEvent]:
         cutoff = (utc_now() - timedelta(days=days)).isoformat()
@@ -486,19 +519,15 @@ class Database:
         default_mode_pref = resolved_preferences.get("default_mode")
 
         weights = dict(legacy_weights)
-        workspace_weight_rows = self.memory.get_workspace_memory(workspace_id="", min_confidence=0.0, limit=1000) # Simplified retrieval
-        # Note: the original code had a more specific query for retrieval_weight. 
-        # For simplicity in this facade, it might need refinement if performance is an issue.
-        # But retrieval_weight is just one type of workspace memory.
-        
-        # Let's re-fetch specifically for weights to be accurate to original logic.
-        weight_rows = self._fetchall("SELECT key, value_json FROM workspace_memory WHERE memory_type='retrieval_weight' ORDER BY updated_at DESC")
+        # Fetch retrieval_weight entries via the repository (no raw SQL in facade).
+        weight_rows = self.memory.get_retrieval_weights()
         for row in weight_rows:
             payload = self._parse_json_dict(row["value_json"])
             value = payload.get("weight")
             try:
                 weights[row["key"]] = max(0.5, min(float(value), 1.8))
-            except Exception: continue
+            except Exception:
+                continue
 
         preferred_mode = legacy_mode
         if default_mode_pref:
@@ -591,11 +620,12 @@ class Database:
     # --- Utils ---
 
     def get_workspace_identity(self, workspace: WorkspaceResponse) -> WorkspaceIdentity:
-        paths = sorted(workspace.included_paths)
-        raw = "|".join(paths)
-        sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        paths = sorted([str(item).strip() for item in workspace.included_paths if str(item).strip()])
+        excluded = sorted([str(item).strip() for item in workspace.excluded_paths if str(item).strip()])
+        raw = "|".join(paths + ["--"] + excluded)
+        sha = hashlib.sha1(raw.encode("utf-8")).hexdigest()
         return WorkspaceIdentity(
-            workspace_id=sha[:12],
+            workspace_id=sha[:16],
             included_paths_hash=sha,
             version=1,
         )
@@ -622,21 +652,27 @@ class Database:
 
     @staticmethod
     def _parse_json_dict(raw: Any) -> dict[str, Any]:
-        if raw is None: return {}
-        if isinstance(raw, dict): return raw
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            return raw
         try:
             val = json.loads(raw)
             return val if isinstance(val, dict) else {}
-        except: return {}
+        except Exception:
+            return {}
 
     @staticmethod
     def _parse_json_list(raw: Any) -> list[str]:
-        if raw is None: return []
-        if isinstance(raw, list): return [str(i) for i in raw]
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return [str(i) for i in raw]
         try:
             val = json.loads(raw)
             return [str(i) for i in val] if isinstance(val, list) else []
-        except: return []
+        except Exception:
+            return []
 
     @staticmethod
     def _row_to_session_memory(row: sqlite3.Row) -> SessionMemoryItem:
@@ -691,8 +727,10 @@ class Database:
     def _normalize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
         p = metadata or {}
         tags = [str(t).strip() for t in p.get("tags", []) if str(t).strip()][:8] if isinstance(p.get("tags"), list) else []
-        try: importance = max(0.0, min(1.0, float(p.get("importance", 0.5))))
-        except: importance = 0.5
+        try:
+            importance = max(0.0, min(1.0, float(p.get("importance", 0.5))))
+        except Exception:
+            importance = 0.5
         return {
             "summary": str(p.get("summary") or "")[:260],
             "category": str(p.get("category") or "참고자료"),
