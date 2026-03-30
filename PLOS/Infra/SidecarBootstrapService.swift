@@ -337,9 +337,13 @@ enum SidecarBootstrapService {
         }
     }
 
-    static func prepareRuntimeDirectory() throws -> URL {
+    static func prepareRuntimeDirectory(preferredDirectory: URL? = nil) throws -> URL {
         let fm = FileManager.default
         var candidates: [URL] = []
+
+        if let preferredDirectory {
+            candidates.append(preferredDirectory.standardizedFileURL)
+        }
 
         if let appSupportBase = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
             candidates.append(
@@ -362,8 +366,17 @@ enum SidecarBootstrapService {
                 .appendingPathComponent("SidecarRuntime", isDirectory: true)
         )
 
+        var deduped: [URL] = []
+        var seen = Set<String>()
+        for candidate in candidates {
+            let path = candidate.standardizedFileURL.path
+            if seen.insert(path).inserted {
+                deduped.append(candidate.standardizedFileURL)
+            }
+        }
+
         var errors: [String] = []
-        for dir in candidates {
+        for dir in deduped {
             do {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
                 let probe = dir.appendingPathComponent(".write-test-\(UUID().uuidString)")

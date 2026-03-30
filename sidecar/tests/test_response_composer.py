@@ -554,3 +554,197 @@ def test_naturalize_summary_text_strips_user_message_instruction_leak():
         intent=ReasoningIntent.EXPLAIN_CONTENT,
     )
     assert cleaned == ""
+
+
+def test_naturalize_summary_text_removes_unverified_urls_and_lookup_claims():
+    cleaned = ResponseComposer._naturalize_summary_text(
+        summary=(
+            "잠시만 기다려 주세요. 확인해볼게요. "
+            "공식 문서는 [Swift Book](https://docs.swift.org/swift-book/)에서 볼 수 있고 "
+            "보조 링크는 https://example.com/reference 입니다."
+        ),
+        query="스위프트 어디서 배워?",
+        response_language="ko",
+        result_type="conversation",
+        intent=ReasoningIntent.GENERAL_CHAT,
+        allow_unverified_urls=False,
+    )
+    assert "확인해볼게요" not in cleaned
+    assert "잠시만 기다려" not in cleaned
+    assert "https://docs.swift.org/swift-book/" not in cleaned
+    assert "https://example.com/reference" not in cleaned
+    assert "Swift Book" in cleaned
+
+
+def test_naturalize_summary_text_linkifies_verified_plain_url():
+    cleaned = ResponseComposer._naturalize_summary_text(
+        summary="최신 문서는 https://docs.swift.org/swift-book/ 에 있어요.",
+        query="스위프트 공식 문서 알려줘",
+        response_language="ko",
+        result_type="conversation",
+        intent=ReasoningIntent.GENERAL_CHAT,
+        allow_unverified_urls=True,
+    )
+    assert "<https://docs.swift.org/swift-book/>" in cleaned
+
+
+def test_compose_v2_includes_trace_events_from_tool_logs():
+    composer = ResponseComposer()
+    response = composer.compose_v2(
+        query="스위프트 공부 어떻게 시작해?",
+        mode=WorkMode.GENERAL,
+        response_language="ko",
+        parsed_intent=ParsedIntent(
+            intent=ReasoningIntent.GENERAL_CHAT,
+            entities=ParsedEntities(),
+            time_filters=ParsedTimeFilters(),
+            workspace_filters=ParsedWorkspaceFilters(),
+            confidence=0.8,
+        ),
+        plan=LocalPlan(
+            plan_type="conversation",
+            selected_files=[],
+            selected_chunks=[],
+            response_strategy="conversational_assistant",
+            allowed_actions=[SuggestedActionKind.ASK_FOLLOWUP],
+            external_reasoning_needed=False,
+        ),
+        execution_result=ExecutionResult(
+            result_type="conversation",
+            structured_payload={"style": "general_chat", "ungrounded_allowed": True},
+            citations=[],
+            tool_logs=[
+                "router:intent=general_chat",
+                "agent:conversation_assistant",
+                "retrieving:https://api.openai.com/v1/responses",
+                "retrieved:https://api.openai.com/v1/responses",
+            ],
+            generated_text="Swift Playgrounds부터 시작하면 좋습니다.",
+        ),
+        verification=VerificationResult(
+            is_valid=True,
+            confidence=0.91,
+            issues=[],
+            ambiguity_level=0.06,
+            candidate_mode=False,
+        ),
+        behavior_policy=None,
+        response_length="medium",
+        show_citations=True,
+        prefer_action_suggestions=True,
+        used_profile=StartupProfile.RECOMMENDED,
+        engine_used=None,
+        used_fallback=False,
+        runtime_detail=None,
+    )
+    trace_events = response.metadata.get("trace_events")
+    assert isinstance(trace_events, list)
+    assert any(event.get("status") == "planning" for event in trace_events)
+    assert any(event.get("status") == "retrieving" for event in trace_events)
+    assert any(event.get("status") == "retrieved" for event in trace_events)
+    assert any("api.openai.com/v1/responses" in str(event.get("message", "")) for event in trace_events)
+
+
+def test_compose_v2_trace_events_localized_for_japanese():
+    composer = ResponseComposer()
+    response = composer.compose_v2(
+        query="Swiftの最新情報を教えて",
+        mode=WorkMode.GENERAL,
+        response_language="ja",
+        parsed_intent=ParsedIntent(
+            intent=ReasoningIntent.GENERAL_CHAT,
+            entities=ParsedEntities(),
+            time_filters=ParsedTimeFilters(),
+            workspace_filters=ParsedWorkspaceFilters(),
+            confidence=0.76,
+        ),
+        plan=LocalPlan(
+            plan_type="conversation",
+            selected_files=[],
+            selected_chunks=[],
+            response_strategy="conversational_assistant",
+            allowed_actions=[SuggestedActionKind.ASK_FOLLOWUP],
+            external_reasoning_needed=False,
+        ),
+        execution_result=ExecutionResult(
+            result_type="conversation",
+            structured_payload={"style": "general_chat", "ungrounded_allowed": True},
+            citations=[],
+            tool_logs=[
+                "planning:web_search_requested",
+                "retrieving:https://example.com",
+                "retrieved:https://example.com",
+                "done:web_evidence_composed:2",
+            ],
+            generated_text="Swiftの最新情報を整理しました。",
+        ),
+        verification=VerificationResult(
+            is_valid=True,
+            confidence=0.79,
+            issues=[],
+            ambiguity_level=0.12,
+            candidate_mode=False,
+        ),
+        behavior_policy=None,
+        response_length="medium",
+        show_citations=True,
+        prefer_action_suggestions=True,
+        used_profile=StartupProfile.RECOMMENDED,
+        engine_used=None,
+        used_fallback=False,
+        runtime_detail=None,
+    )
+    trace_events = response.metadata.get("trace_events") or []
+    messages = [str(event.get("message", "")) for event in trace_events]
+    assert any("取得中" in message for message in messages)
+    assert any("取得完了" in message for message in messages)
+    assert any("Web根拠" in message for message in messages)
+
+
+def test_trace_event_maps_searxng_json_forbidden_notice():
+    event = ResponseComposer._trace_event_from_log(
+        "notice:searxng_json_forbidden:http://127.0.0.1:8080/search",
+        at=datetime.now(timezone.utc),
+        response_language="ko",
+    )
+    assert isinstance(event, dict)
+    assert event.get("status") == "planning"
+    assert "HTML 경로로 전환" in str(event.get("message") or "")
+
+
+def test_naturalize_summary_text_preserves_fenced_code_block_and_list_lines():
+    cleaned = ResponseComposer._naturalize_summary_text(
+        summary=(
+            "아래 순서로 진행하세요.\n"
+            "- 1단계: 환경 확인\n"
+            "- 2단계: 실행\n\n"
+            "```bash\n"
+            "python run.py --mode test\n"
+            "echo \"done\"\n"
+            "```\n"
+        ),
+        query="실행 방법 알려줘",
+        response_language="ko",
+        result_type="conversation",
+        intent=ReasoningIntent.GENERAL_CHAT,
+        allow_unverified_urls=True,
+    )
+    assert "- 1단계: 환경 확인" in cleaned
+    assert "- 2단계: 실행" in cleaned
+    assert "```bash" in cleaned
+    assert "python run.py --mode test" in cleaned
+    assert "echo \"done\"" in cleaned
+
+
+def test_naturalize_summary_text_medium_paragraph_wraps_long_single_paragraph():
+    cleaned = ResponseComposer._naturalize_summary_text(
+        summary=(
+            "첫째 문장입니다. 둘째 문장입니다. 셋째 문장입니다. 넷째 문장입니다. "
+            "다섯째 문장입니다. 여섯째 문장입니다."
+        ),
+        query="자세히 설명해줘",
+        response_language="ko",
+        result_type="conversation",
+        intent=ReasoningIntent.GENERAL_CHAT,
+    )
+    assert "\n\n" in cleaned

@@ -40,6 +40,7 @@ class OpenAIProvider:
         mode: WorkMode,
         citations: list[Citation],
         language_preference: str | None = None,
+        allow_web_search: bool = False,
     ) -> ProviderResult:
         response_language = resolve_response_language(query, language_preference)
         prompt = (
@@ -62,10 +63,16 @@ class OpenAIProvider:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {
             "model": self.model,
-            "input": prompt,
+            "messages": [
+                {"role": "system", "content": "You are a deep-analysis assistant. Respect local citations and avoid hallucinations."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 1024,
         }
+        # Note: the mock tools logic for 'allow_web_search' is removed as it's not standard for simple completions
+        
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+            resp = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
 
@@ -84,6 +91,7 @@ class AnthropicProvider:
         mode: WorkMode,
         citations: list[Citation],
         language_preference: str | None = None,
+        allow_web_search: bool = False,
     ) -> ProviderResult:
         response_language = resolve_response_language(query, language_preference)
         prompt = (
@@ -124,7 +132,7 @@ class AnthropicProvider:
 
 class ProviderRouter:
     def __init__(self):
-        self._openai = OpenAIProvider(os.getenv("OPENAI_API_KEY"), model=os.getenv("OPENAI_MODEL", "gpt-5-mini"))
+        self._openai = OpenAIProvider(os.getenv("OPENAI_API_KEY"), model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
         self._anthropic = AnthropicProvider(
             os.getenv("ANTHROPIC_API_KEY"),
             model=os.getenv("ANTHROPIC_MODEL", "claude-3-7-sonnet-latest"),
@@ -137,11 +145,24 @@ class ProviderRouter:
         mode: WorkMode,
         citations: list[Citation],
         language_preference: str | None = None,
+        allow_web_search: bool = False,
     ) -> ProviderResult:
         if provider == "openai":
-            return await self._openai.analyze(query, mode, citations, language_preference=language_preference)
+            return await self._openai.analyze(
+                query,
+                mode,
+                citations,
+                language_preference=language_preference,
+                allow_web_search=allow_web_search,
+            )
         if provider == "anthropic":
-            return await self._anthropic.analyze(query, mode, citations, language_preference=language_preference)
+            return await self._anthropic.analyze(
+                query,
+                mode,
+                citations,
+                language_preference=language_preference,
+                allow_web_search=allow_web_search,
+            )
         raise ValueError(f"Unsupported provider: {provider}")
 
     def provider_has_key(self, provider: str) -> bool:
@@ -158,6 +179,7 @@ class ProviderRouter:
         mode: WorkMode,
         citations: list[Citation],
         language_preference: str | None = None,
+        allow_web_search: bool = False,
     ) -> ProviderResult:
         try:
             return asyncio.run(
@@ -167,6 +189,7 @@ class ProviderRouter:
                     mode=mode,
                     citations=citations,
                     language_preference=language_preference,
+                    allow_web_search=allow_web_search,
                 )
             )
         except RuntimeError:
@@ -180,6 +203,7 @@ class ProviderRouter:
                         mode=mode,
                         citations=citations,
                         language_preference=language_preference,
+                        allow_web_search=allow_web_search,
                     )
                 )
             finally:
@@ -193,18 +217,15 @@ def _missing_api_key_message(provider: str, response_language: str) -> str:
 
 
 def _extract_openai_text(payload: dict) -> str:
-    if "output_text" in payload and isinstance(payload["output_text"], str):
-        return payload["output_text"]
-
-    chunks: list[str] = []
-    for item in payload.get("output", []):
-        for content in item.get("content", []):
-            text = content.get("text")
-            if text:
-                chunks.append(text)
-    if chunks:
-        return "\n".join(chunks)
-    return "Failed to parse external analysis response."
+    choices = payload.get("choices", [])
+    if not choices:
+        return "Failed to parse external analysis response: empty choices."
+    
+    message = choices[0].get("message", {})
+    text = message.get("content")
+    if text:
+        return text
+    return "Failed to parse external analysis response: no content found."
 
 
 def _extract_anthropic_text(payload: dict) -> str:

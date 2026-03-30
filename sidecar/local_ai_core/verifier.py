@@ -13,6 +13,7 @@ class ResultVerifier:
         parsed_intent: ParsedIntent,
         execution_result: ExecutionResult,
         mode: WorkMode,
+        reliability: float = 1.0,
     ) -> VerificationResult:
         issues: list[str] = []
         confidence = parsed_intent.confidence
@@ -64,21 +65,27 @@ class ResultVerifier:
             issues.append("strict_threshold_not_met")
             confidence = min(confidence, 0.2)
 
+        # Stage 5: Source Reliability Check (Phase 20)
+        if reliability < 0.48:
+            issues.append("low_source_reliability")
+            confidence -= (0.5 - reliability) * 0.4
+            
         confidence = max(0.05, min(confidence, 0.99))
         ambiguity = max(0.0, 1.0 - confidence)
-        candidate_mode = confidence < 0.45
+        candidate_mode = confidence < 0.45 or reliability < 0.35
         if execution_result.result_type == "file_list":
             has_items = isinstance(execution_result.structured_payload.get("items"), list) and bool(
                 execution_result.structured_payload.get("items")
             )
-            candidate_mode = not has_items and confidence < 0.3
+            candidate_mode = not has_items and (confidence < 0.3 or reliability < 0.3)
         if ungrounded_allowed and execution_result.result_type in {"answer", "summary"}:
             candidate_mode = False
             confidence = max(confidence, 0.58)
 
         return VerificationResult(
-            is_valid=not issues or confidence >= 0.4,
+            is_valid=not issues or (confidence >= 0.4 and reliability >= 0.35),
             confidence=confidence,
+            reliability=reliability,
             issues=issues,
             ambiguity_level=ambiguity,
             candidate_mode=candidate_mode,

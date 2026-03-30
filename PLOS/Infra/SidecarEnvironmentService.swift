@@ -6,7 +6,8 @@ enum SidecarEnvironmentService {
             .split(separator: ":")
             .map(String.init)
             .filter { segment in
-                !segment.contains("/LocalAICore/SidecarRuntime/.venv/bin")
+                let normalized = URL(fileURLWithPath: segment).standardizedFileURL.path
+                return !normalized.hasSuffix("/.venv/bin")
             }
 
         for required in ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {

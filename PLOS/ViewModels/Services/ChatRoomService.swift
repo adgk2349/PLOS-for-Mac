@@ -142,4 +142,56 @@ final class ChatRoomService {
 
         return text.isEmpty ? "새 채팅" : text
     }
+
+    func summarizeChatRoomTitle(from messages: [ChatMessage]) -> String {
+        let userTexts = messages
+            .filter { $0.source == .user }
+            .compactMap { ($0.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if let firstMeaningful = userTexts.first(where: { !isGenericGreeting($0) }) {
+            return summarizeChatRoomTitle(from: firstMeaningful)
+        }
+        if let firstUser = userTexts.first {
+            return summarizeChatRoomTitle(from: firstUser)
+        }
+
+        let assistantTexts = messages
+            .filter { $0.source == .local || $0.source == .external }
+            .compactMap { ($0.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if let firstAssistant = assistantTexts.first {
+            return summarizeChatRoomTitle(from: firstAssistant)
+        }
+        return "새 채팅"
+    }
+
+    func shouldAutoRetitle(_ title: String) -> Bool {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed == "새 채팅" {
+            return true
+        }
+        return isGenericGreeting(trimmed)
+    }
+
+    private func isGenericGreeting(_ text: String) -> Bool {
+        let lowered = text
+            .precomposedStringWithCanonicalMapping
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let compact = lowered.replacingOccurrences(of: #"[!~?.\s]+"#, with: "", options: .regularExpression)
+        if compact.isEmpty {
+            return true
+        }
+        let greetings: Set<String> = [
+            "안녕",
+            "안녕하세요",
+            "반가워",
+            "반가워요",
+            "hello",
+            "hi",
+            "hey",
+        ]
+        return greetings.contains(compact)
+    }
 }

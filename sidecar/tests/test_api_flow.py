@@ -151,6 +151,33 @@ def test_external_call_privacy_gate(client, auth_headers, tmp_path: Path):
         headers=auth_headers,
         json={
             "privacy_mode": "HYBRID",
+            "hybrid_web_search_enabled": False,
+            "startup_profile": "RECOMMENDED",
+            "model_profile": "recommended",
+            "reindex_policy": "filewatch_incremental",
+            "language": "ko-KR",
+        },
+    )
+
+    blocked_hybrid = client.post(
+        "/v1/chat/deep-analysis",
+        headers=auth_headers,
+        json={
+            "query": "Need deeper analysis",
+            "mode": "GENERAL",
+            "provider": "openai",
+            "selected_citations": [],
+            "user_confirmed": True,
+        },
+    )
+    assert blocked_hybrid.status_code == 403
+
+    client.put(
+        "/v1/settings",
+        headers=auth_headers,
+        json={
+            "privacy_mode": "HYBRID",
+            "hybrid_web_search_enabled": True,
             "startup_profile": "RECOMMENDED",
             "model_profile": "recommended",
             "reindex_policy": "filewatch_incremental",
@@ -175,6 +202,19 @@ def test_external_call_privacy_gate(client, auth_headers, tmp_path: Path):
 
 def test_deep_analysis_provider_rate_limit_maps_to_429(client, auth_headers, monkeypatch):
     from local_ai_core.main import app_state
+
+    client.put(
+        "/v1/settings",
+        headers=auth_headers,
+        json={
+            "privacy_mode": "HYBRID",
+            "hybrid_web_search_enabled": True,
+            "startup_profile": "RECOMMENDED",
+            "model_profile": "recommended",
+            "reindex_policy": "filewatch_incremental",
+            "language": "ko-KR",
+        },
+    )
 
     async def _raise_provider_rate_limit(*_, **__):
         request = httpx.Request("POST", "https://api.openai.com/v1/responses")

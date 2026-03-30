@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default_factory=lambda: Path(os.environ.get("LOCAL_AI_DATA_DIR", "./data")).resolve())
     embedding_dim: int = 384
     local_model_profile: str = "recommended"
+    async_repo_backend: str = "adapter"
 
     @property
     def sqlite_path(self) -> Path:

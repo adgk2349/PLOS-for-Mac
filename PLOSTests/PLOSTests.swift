@@ -6,6 +6,7 @@
 //
 
 import Testing
+import Foundation
 @testable import PLOS
 
 struct PLOSTests {
@@ -37,5 +38,47 @@ struct PLOSTests {
         #expect(QuickInferencePreset.fast.startupProfile == .fast)
         #expect(QuickInferencePreset.quality.startupProfile == .recommended)
         #expect(QuickInferencePreset.highQuality.startupProfile == .deep)
+    }
+
+    @Test
+    func languageSelectionMigrationAndSidecarMapping() {
+        #expect(L10n.selectionFromSettings("ko") == .kor)
+        #expect(L10n.selectionFromSettings("en-us") == .eng)
+        #expect(L10n.selectionFromSettings("ja-jp") == .jpn)
+        #expect(L10n.selectionFromSettings("auto") == .auto)
+
+        #expect(L10n.sidecarLanguageCode(for: .auto) == "auto")
+        #expect(L10n.sidecarLanguageCode(for: .kor) == "ko")
+        #expect(L10n.sidecarLanguageCode(for: .eng) == "en")
+        #expect(L10n.sidecarLanguageCode(for: .jpn) == "ja")
+    }
+
+    @Test
+    func localizationFallbackOrder() {
+        let key = "test.missing_key"
+        let resultEN = L10n.tr(
+            key,
+            language: .eng,
+            fallbackKo: "한국어",
+            fallbackEn: "English",
+            fallbackJa: "日本語"
+        )
+        let resultKO = L10n.tr(
+            key,
+            language: .kor,
+            fallbackKo: "한국어",
+            fallbackEn: "English",
+            fallbackJa: "日本語"
+        )
+        let resultJA = L10n.tr(
+            key,
+            language: .jpn,
+            fallbackKo: "한국어",
+            fallbackEn: "English",
+            fallbackJa: "日本語"
+        )
+        #expect(resultEN == "English")
+        #expect(resultKO == "한국어")
+        #expect(resultJA == "日本語")
     }
 }

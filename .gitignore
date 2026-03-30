@@ -9,6 +9,8 @@ __pycache__/
 *.pyc
 .venv/
 .env
+sidecar/.idea/
+undefined.txt
 sidecar/.state/
 sidecar/.pytest_cache/
 sidecar/data/

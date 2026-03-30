@@ -51,6 +51,91 @@ class InfrastructureRepository:
     def get_latest_external_call(self) -> sqlite3.Row | None:
         return self._fetchone("SELECT provider, timestamp FROM external_calls ORDER BY id DESC LIMIT 1")
 
+    def list_plugin_registry(self) -> list[sqlite3.Row]:
+        return self._fetchall(
+            """
+            SELECT plugin_id, manifest_json, enabled, state, updated_at
+            FROM plugin_registry
+            ORDER BY plugin_id
+            """
+        )
+
+    def get_plugin_registry(self, plugin_id: str) -> sqlite3.Row | None:
+        return self._fetchone(
+            """
+            SELECT plugin_id, manifest_json, enabled, state, updated_at
+            FROM plugin_registry
+            WHERE plugin_id=?
+            LIMIT 1
+            """,
+            (plugin_id,),
+        )
+
+    def upsert_plugin_registry(
+        self,
+        *,
+        plugin_id: str,
+        manifest_json: str,
+        enabled: bool,
+        state: str,
+        updated_at: str,
+    ) -> None:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO plugin_registry(plugin_id, manifest_json, enabled, state, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(plugin_id) DO UPDATE SET
+                  manifest_json=excluded.manifest_json,
+                  enabled=excluded.enabled,
+                  state=excluded.state,
+                  updated_at=excluded.updated_at
+                """,
+                (plugin_id, manifest_json, 1 if enabled else 0, state, updated_at),
+            )
+            self._conn.commit()
+
+    def list_platform_adapters(self) -> list[sqlite3.Row]:
+        return self._fetchall(
+            """
+            SELECT adapter_key, adapter_class, health, updated_at
+            FROM platform_adapters
+            ORDER BY adapter_key
+            """
+        )
+
+    def upsert_platform_adapter(
+        self,
+        *,
+        adapter_key: str,
+        adapter_class: str,
+        health: str,
+        updated_at: str,
+    ) -> None:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO platform_adapters(adapter_key, adapter_class, health, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(adapter_key) DO UPDATE SET
+                  adapter_class=excluded.adapter_class,
+                  health=excluded.health,
+                  updated_at=excluded.updated_at
+                """,
+                (adapter_key, adapter_class, health, updated_at),
+            )
+            self._conn.commit()
+
+    def delete_plugin_registry(self, plugin_id: str) -> bool:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM plugin_registry WHERE plugin_id=?", (plugin_id,))
+            removed = cur.rowcount > 0
+            self._conn.commit()
+            return removed
+
     def _fetchone(self, query: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
         with self._lock:
             cur = self._conn.cursor()

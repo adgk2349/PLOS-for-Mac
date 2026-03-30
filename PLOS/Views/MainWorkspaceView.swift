@@ -38,7 +38,7 @@ struct MainWorkspaceView: View {
     var body: some View {
         GeometryReader { proxy in
             let sidebarWidth = min(300, max(250, proxy.size.width * 0.24))
-            ZStack {
+            ZStack(alignment: .topLeading) {
                 HStack(spacing: 0) {
                     if !isSidebarCollapsed {
                         sidebar
@@ -74,14 +74,31 @@ struct MainWorkspaceView: View {
                         }
                         .zIndex(3)
                 }
+
+                if showStatusPanel {
+                    Color.black.opacity(0.34)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            showStatusPanel = false
+                        }
+
+                    StatusPanelView(viewModel: viewModel)
+                        .padding(18)
+                        .frame(
+                            width: min(920, proxy.size.width * 0.86),
+                            height: min(780, proxy.size.height * 0.9)
+                        )
+                        .plosGlassPanel()
+                        .onTapGesture {
+                            // consume tap inside status panel
+                        }
+                        .zIndex(4)
+                }
             }
         }
+        .animation(.none, value: colorScheme)
         .animation(.easeInOut(duration: 0.18), value: showSettingsPanel)
-        .sheet(isPresented: $showStatusPanel) {
-            StatusPanelView(viewModel: viewModel)
-                .frame(minWidth: 760, minHeight: 560)
-                .padding(16)
-        }
+        .animation(.easeInOut(duration: 0.18), value: showStatusPanel)
         .onChange(of: selectedSidebarFolder) { _, newValue in
             if newValue == .chats {
                 viewModel.selectFirstInboxRoomIfNeeded()
@@ -92,22 +109,22 @@ struct MainWorkspaceView: View {
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
+                iconButton(symbol: "gearshape", helpText: L10n.tr("settings.title", language: viewModel.appLanguage, fallbackKo: "설정", fallbackEn: "Settings", fallbackJa: "設定")) {
+                    showSettingsPanel = true
+                }
                 Spacer(minLength: 0)
-                iconButton(symbol: "square.and.pencil", help: "새 채팅") {
+                iconButton(symbol: "square.and.pencil", helpText: L10n.tr("workspace.sidebar.new_chat", language: viewModel.appLanguage, fallbackKo: "새 채팅", fallbackEn: "New chat", fallbackJa: "新しいチャット")) {
                     selectedSidebarFolder = .chats
                     viewModel.createChatRoom()
                 }
-                iconButton(symbol: "gearshape", help: "설정") {
-                    showSettingsPanel = true
-                }
-                iconButton(symbol: "sidebar.left", help: "사이드바 닫기") {
+                iconButton(symbol: "sidebar.left", helpText: L10n.tr("workspace.sidebar.collapse_sidebar", language: viewModel.appLanguage, fallbackKo: "사이드바 닫기", fallbackEn: "Collapse sidebar", fallbackJa: "サイドバーを閉じる")) {
                     withAnimation(.easeInOut(duration: 0.18)) {
                         isSidebarCollapsed = true
                     }
                 }
             }
 
-            TextField("대화/질문 검색", text: $sidebarSearch)
+            TextField(L10n.tr("workspace.sidebar.search_placeholder", language: viewModel.appLanguage, fallbackKo: "대화/질문 검색", fallbackEn: "Search chats/questions", fallbackJa: "会話/質問を検索"), text: $sidebarSearch)
                 .textFieldStyle(.plain)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
@@ -121,7 +138,11 @@ struct MainWorkspaceView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
                     if filteredChatRooms.isEmpty {
-                        Text(selectedSidebarFolder == .archive ? "보관된 채팅이 없습니다" : "대화를 시작해보세요")
+                        Text(
+                            selectedSidebarFolder == .archive
+                                ? L10n.tr("workspace.sidebar.no_archived_chats", language: viewModel.appLanguage, fallbackKo: "보관된 채팅이 없습니다", fallbackEn: "No archived chats", fallbackJa: "アーカイブされたチャットはありません")
+                                : L10n.tr("workspace.sidebar.start_conversation", language: viewModel.appLanguage, fallbackKo: "대화를 시작해보세요", fallbackEn: "Start a conversation", fallbackJa: "会話を始めましょう")
+                        )
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 10)
@@ -132,9 +153,26 @@ struct MainWorkspaceView: View {
                                 viewModel.selectChatRoom(room.id)
                             } label: {
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(room.title)
-                                        .font(.subheadline.weight(.semibold))
-                                        .lineLimit(1)
+                                    HStack(spacing: 6) {
+                                        Text(room.title)
+                                            .font(.subheadline.weight(.semibold))
+                                            .lineLimit(1)
+                                        if viewModel.roomUsesWorkspaceOverride(room.id) {
+                                            Image(systemName: "folder.badge.gearshape")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                                .help(L10n.tr("workspace.sidebar.room_workspace_override_help", language: viewModel.appLanguage, fallbackKo: "이 채팅방 전용 워크스페이스 경로 사용 중", fallbackEn: "This room uses workspace override", fallbackJa: "このチャットは専用ワークスペースを使用中"))
+                                            if let roomState = viewModel.roomIndexStateByRoomID[room.id], !roomState.isEmpty {
+                                                Text(roomIndexStateLabel(for: room.id, state: roomState))
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 2)
+                                                    .background(Color.white.opacity(0.05))
+                                                    .clipShape(Capsule())
+                                            }
+                                        }
+                                    }
                                     Text(roomPreview(room))
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
@@ -148,18 +186,62 @@ struct MainWorkspaceView: View {
                             }
                             .buttonStyle(.plain)
                             .contextMenu {
+                                if !room.isArchived {
+                                    Button {
+                                        viewModel.addIncludedFolderToRoom(room.id)
+                                    } label: {
+                                        Label(L10n.tr("workspace.sidebar.context.add_room_folder", language: viewModel.appLanguage, fallbackKo: "이 방 폴더 추가", fallbackEn: "Add room folder", fallbackJa: "この部屋にフォルダ追加"), systemImage: "folder.badge.plus")
+                                    }
+
+                                    Button {
+                                        viewModel.addExcludedPathToRoom(room.id)
+                                    } label: {
+                                        Label(L10n.tr("workspace.sidebar.context.add_excluded_path", language: viewModel.appLanguage, fallbackKo: "이 방 제외 경로 추가", fallbackEn: "Add excluded path", fallbackJa: "除外パスを追加"), systemImage: "minus.circle")
+                                    }
+
+                                    if let excludedPaths = room.excludedPaths, !excludedPaths.isEmpty {
+                                        Menu {
+                                            ForEach(excludedPaths, id: \.self) { path in
+                                                Button {
+                                                    viewModel.removeExcludedPathFromRoom(room.id, path: path)
+                                                } label: {
+                                                    Label(path, systemImage: "minus.circle")
+                                                }
+                                            }
+                                        } label: {
+                                            Label(L10n.tr("workspace.sidebar.context.remove_excluded_path", language: viewModel.appLanguage, fallbackKo: "이 방 제외 경로 제거", fallbackEn: "Remove excluded path", fallbackJa: "除外パスを削除"), systemImage: "minus.circle.dotted")
+                                        }
+
+                                        Button {
+                                            viewModel.clearExcludedPathsForRoom(room.id)
+                                        } label: {
+                                            Label(L10n.tr("workspace.sidebar.context.reset_excluded_paths", language: viewModel.appLanguage, fallbackKo: "이 방 제외 경로 초기화", fallbackEn: "Reset excluded paths", fallbackJa: "除外パスを初期化"), systemImage: "arrow.uturn.backward.circle")
+                                        }
+                                    }
+
+                                    if viewModel.roomUsesWorkspaceOverride(room.id) {
+                                        Button {
+                                            viewModel.clearRoomWorkspaceOverride(room.id)
+                                        } label: {
+                                            Label(L10n.tr("workspace.sidebar.context.reset_room_workspace", language: viewModel.appLanguage, fallbackKo: "이 방 폴더 설정 초기화", fallbackEn: "Reset room workspace", fallbackJa: "部屋ワークスペースを初期化"), systemImage: "arrow.uturn.backward.circle")
+                                        }
+                                    }
+
+                                    Divider()
+                                }
+
                                 if room.isArchived {
                                     Button {
                                         selectedSidebarFolder = .chats
                                         viewModel.unarchiveChatRoom(room.id, selectAfterRestore: true)
                                     } label: {
-                                        Label("복원", systemImage: "arrow.uturn.backward")
+                                        Label(L10n.tr("workspace.sidebar.context.restore", language: viewModel.appLanguage, fallbackKo: "복원", fallbackEn: "Restore", fallbackJa: "復元"), systemImage: "arrow.uturn.backward")
                                     }
                                 } else {
                                     Button {
                                         viewModel.archiveChatRoom(room.id)
                                     } label: {
-                                        Label("아카이브", systemImage: "archivebox")
+                                        Label(L10n.tr("workspace.sidebar.context.archive", language: viewModel.appLanguage, fallbackKo: "아카이브", fallbackEn: "Archive", fallbackJa: "アーカイブ"), systemImage: "archivebox")
                                     }
                                 }
 
@@ -168,7 +250,7 @@ struct MainWorkspaceView: View {
                                 Button(role: .destructive) {
                                     viewModel.deleteChatRoom(room.id)
                                 } label: {
-                                    Label("삭제", systemImage: "trash")
+                                    Label(L10n.tr("workspace.sidebar.context.delete", language: viewModel.appLanguage, fallbackKo: "삭제", fallbackEn: "Delete", fallbackJa: "削除"), systemImage: "trash")
                                 }
                             }
                         }
@@ -192,19 +274,22 @@ struct MainWorkspaceView: View {
             .overlay(PLOSGlassTheme.chromeTint(for: colorScheme))
     }
 
-    private func iconButton(symbol: String, help: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    private func iconButton(symbol: String, helpText: String, action: @escaping () -> Void) -> some View {
+        let topBarCircleTint: Color = colorScheme == .dark
+            ? Color.white.opacity(0.08)
+            : Color.black.opacity(0.035)
+        return Button(action: action) {
             ZStack {
                 Circle().fill(Color.clear)
                 Image(systemName: symbol)
                     .font(.system(size: 13, weight: .semibold))
             }
             .frame(width: 40, height: 40)
-            .plosGlassCircle()
+            .plosGlassCircle(tint: topBarCircleTint)
         }
         .buttonStyle(.plain)
         .contentShape(Circle())
-        .help(help)
+        .help(Text(helpText))
     }
 
     private var filteredChatRooms: [ChatRoom] {
@@ -225,7 +310,15 @@ struct MainWorkspaceView: View {
     }
 
     private func folderButton(_ folder: SidebarFolder, count: Int) -> some View {
-        Button {
+        let title: String = {
+            switch folder {
+            case .chats:
+                return L10n.tr("workspace.sidebar.folder.chats", language: viewModel.appLanguage, fallbackKo: "대화", fallbackEn: "Chats", fallbackJa: "チャット")
+            case .archive:
+                return L10n.tr("workspace.sidebar.folder.archive", language: viewModel.appLanguage, fallbackKo: "보관함", fallbackEn: "Archive", fallbackJa: "アーカイブ")
+            }
+        }()
+        return Button {
             selectedSidebarFolder = folder
             if folder == .chats {
                 viewModel.selectFirstInboxRoomIfNeeded()
@@ -234,7 +327,7 @@ struct MainWorkspaceView: View {
             HStack(spacing: 6) {
                 Image(systemName: folder.icon)
                     .font(.caption.weight(.semibold))
-                Text(folder.title)
+                Text(title)
                     .font(.caption.weight(.semibold))
                 Text("\(count)")
                     .font(.caption2.weight(.semibold))
@@ -251,22 +344,45 @@ struct MainWorkspaceView: View {
 
     private func roomPreview(_ room: ChatRoom) -> String {
         guard let last = room.messages.last else {
-            return "대화를 시작해보세요"
+            return L10n.tr("workspace.sidebar.start_conversation", language: viewModel.appLanguage, fallbackKo: "대화를 시작해보세요", fallbackEn: "Start a conversation", fallbackJa: "会話を始めましょう")
         }
         switch last.source {
         case .user:
             return last.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                 ? (last.text ?? "").precomposedStringWithCanonicalMapping
-                : "사용자 입력"
+                : L10n.tr("workspace.sidebar.preview.user_message", language: viewModel.appLanguage, fallbackKo: "사용자 입력", fallbackEn: "User message", fallbackJa: "ユーザー入力")
         case .local:
             return last.resultSummary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                 ? (last.resultSummary ?? "").precomposedStringWithCanonicalMapping
-                : (last.lead ?? "로컬 응답").precomposedStringWithCanonicalMapping
+                : (last.lead ?? L10n.tr("workspace.sidebar.preview.local_response", language: viewModel.appLanguage, fallbackKo: "로컬 응답", fallbackEn: "Local response", fallbackJa: "ローカル応答")).precomposedStringWithCanonicalMapping
         case .external:
             return last.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                 ? (last.text ?? "").precomposedStringWithCanonicalMapping
-                : "외부 분석 응답"
+                : L10n.tr("workspace.sidebar.preview.external_response", language: viewModel.appLanguage, fallbackKo: "외부 분석 응답", fallbackEn: "External analysis response", fallbackJa: "外部分析応答")
+        }
+    }
+
+    private func roomIndexStateLabel(for roomID: String, state: String) -> String {
+        if state == "indexing", let progress = viewModel.roomIndexProgressByRoomID[roomID] {
+            let percent = Int((min(max(progress, 0.0), 1.0) * 100.0).rounded())
+            let label = L10n.tr(
+                "workspace.sidebar.room_index_state.indexing",
+                language: viewModel.appLanguage,
+                fallbackKo: "인덱싱 중",
+                fallbackEn: "Indexing",
+                fallbackJa: "インデックス中"
+            )
+            return "\(label) \(percent)%"
+        }
+        switch state {
+        case "indexing":
+            return L10n.tr("workspace.sidebar.room_index_state.indexing", language: viewModel.appLanguage, fallbackKo: "인덱싱 중", fallbackEn: "Indexing", fallbackJa: "インデックス中")
+        case "ready":
+            return L10n.tr("workspace.sidebar.room_index_state.ready", language: viewModel.appLanguage, fallbackKo: "준비됨", fallbackEn: "Ready", fallbackJa: "準備完了")
+        case "failed":
+            return L10n.tr("workspace.sidebar.room_index_state.failed", language: viewModel.appLanguage, fallbackKo: "실패", fallbackEn: "Failed", fallbackJa: "失敗")
+        default:
+            return L10n.tr("workspace.sidebar.room_index_state.idle", language: viewModel.appLanguage, fallbackKo: "대기", fallbackEn: "Idle", fallbackJa: "待機")
         }
     }
 }
-

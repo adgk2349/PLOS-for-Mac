@@ -3,6 +3,11 @@ import SwiftUI
 
 struct OnboardingView: View {
     @ObservedObject var viewModel: AppViewModel
+    private var language: AppLanguage { viewModel.appLanguage }
+
+    private func t(_ ko: String, _ en: String, _ ja: String) -> String {
+        L10n.text(ko, en, ja, language: language)
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -18,7 +23,7 @@ struct OnboardingView: View {
 
     private var stepSidebar: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("PLOS Setup")
+            Text(t("PLOS 설정", "PLOS Setup", "PLOS セットアップ"))
                 .font(.title3.weight(.bold))
 
             ForEach(OnboardingStep.allCases, id: \.rawValue) { step in
@@ -38,7 +43,7 @@ struct OnboardingView: View {
             }
 
             Spacer()
-            Text("로컬 우선 · 필요할 때만 외부 호출")
+            Text(t("로컬 우선 · 필요할 때만 외부 호출", "Local first · external only when needed", "ローカル優先 · 必要時のみ外部呼び出し"))
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -80,8 +85,8 @@ struct OnboardingView: View {
 
     private var welcomeView: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("선택한 자료만 로컬에서 정리하고, 필요할 때만 외부 AI를 사용합니다.")
-            Button("시작하기") {
+            Text(t("선택한 자료만 로컬에서 정리하고, 필요할 때만 외부 AI를 사용합니다.", "Use selected data locally, and use external AI only when necessary.", "選択した資料のみローカルで処理し、必要時のみ外部AIを使います。"))
+            Button(t("시작하기", "Get started", "開始する")) {
                 viewModel.onboardingStep = .dataSelection
             }
             .buttonStyle(.plain)
@@ -94,13 +99,13 @@ struct OnboardingView: View {
     private var dataSelectionView: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                presetFolderButton("Documents", path: homePath("Documents"))
-                presetFolderButton("Desktop", path: homePath("Desktop"))
-                presetFolderButton("Downloads", path: homePath("Downloads"))
+                presetFolderButton(t("문서", "Documents", "書類"), path: homePath("Documents"))
+                presetFolderButton(t("데스크탑", "Desktop", "デスクトップ"), path: homePath("Desktop"))
+                presetFolderButton(t("다운로드", "Downloads", "ダウンロード"), path: homePath("Downloads"))
             }
 
             HStack(spacing: 8) {
-                Button("특정 폴더 추가") {
+                Button(t("특정 폴더 추가", "Add custom folder", "特定フォルダを追加")) {
                     viewModel.addFolder()
                 }
                 .buttonStyle(.plain)
@@ -108,9 +113,9 @@ struct OnboardingView: View {
                 .padding(.vertical, 9)
                 .plosGlassControl()
 
-                Button("다음") {
+                Button(t("다음", "Next", "次へ")) {
                     guard !viewModel.includedFolderURLs.isEmpty else {
-                        viewModel.lastError = "최소 1개 이상의 폴더를 선택해 주세요."
+                        viewModel.lastError = t("최소 1개 이상의 폴더를 선택해 주세요.", "Please select at least one folder.", "少なくとも1つ以上のフォルダを選択してください。")
                         return
                     }
                     viewModel.onboardingStep = .startProfile
@@ -122,7 +127,7 @@ struct OnboardingView: View {
             }
 
             if viewModel.includedFolderURLs.isEmpty {
-                Text("아직 선택된 폴더가 없습니다.")
+                Text(t("아직 선택된 폴더가 없습니다.", "No folders selected yet.", "まだ選択されたフォルダはありません。"))
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(viewModel.includedFolderURLs, id: \.path) { url in
@@ -130,7 +135,7 @@ struct OnboardingView: View {
                         Text(url.path)
                             .lineLimit(1)
                         Spacer()
-                        Button("제거") {
+                        Button(t("제거", "Remove", "削除")) {
                             viewModel.removeFolder(url.path)
                         }
                         .buttonStyle(.plain)
@@ -145,18 +150,19 @@ struct OnboardingView: View {
 
     private var startProfileView: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Picker("시작 방식", selection: $viewModel.startupProfile) {
+            Picker(t("시작 방식", "Startup profile", "開始プロファイル"), selection: $viewModel.startupProfile) {
                 ForEach(StartupProfile.allCases) { profile in
-                    Text(profile.title).tag(profile)
+                    Text(profile.title(language: language)).tag(profile)
                 }
             }
             .pickerStyle(.menu)
+            .id("onboarding-startup-profile-\(language.rawValue)")
             .frame(maxWidth: 280)
 
-            Text("나중에 설정에서 변경할 수 있습니다.")
+            Text(t("나중에 설정에서 변경할 수 있습니다.", "You can change this later in settings.", "後で設定から変更できます。"))
                 .foregroundStyle(.secondary)
 
-            Button("다음") {
+            Button(t("다음", "Next", "次へ")) {
                 viewModel.onboardingStep = .privacyInfo
             }
             .buttonStyle(.plain)
@@ -168,8 +174,8 @@ struct OnboardingView: View {
 
     private var privacyView: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("기본적으로 로컬에서 처리하며 외부 AI 사용 여부는 설정에서 바꿀 수 있습니다.")
-            Button("인덱싱 시작") {
+            Text(t("기본적으로 로컬에서 처리하며 외부 AI 사용 여부는 설정에서 바꿀 수 있습니다.", "By default everything runs locally; external AI usage can be changed in settings.", "既定ではローカル処理で、外部AI利用は設定で変更できます。"))
+            Button(t("인덱싱 시작", "Start indexing", "インデックス開始")) {
                 Task {
                     await viewModel.startOnboardingIndexingFlow()
                 }
@@ -190,7 +196,7 @@ struct OnboardingView: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             if viewModel.isBusy {
-                Text("문서 분석 중입니다…")
+                Text(t("문서 분석 중입니다…", "Analyzing documents…", "文書を分析中…"))
                     .foregroundStyle(.secondary)
             }
         }
@@ -198,8 +204,8 @@ struct OnboardingView: View {
 
     private var readyView: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("준비가 끝났습니다. 이제 자료 기반 질의응답을 시작할 수 있습니다.")
-            Button("시작") {
+            Text(t("준비가 끝났습니다. 이제 자료 기반 질의응답을 시작할 수 있습니다.", "Setup is complete. You can start grounded Q&A now.", "準備が完了しました。資料ベースのQ&Aを開始できます。"))
+            Button(t("시작", "Start", "開始")) {
                 viewModel.finalizeOnboarding()
             }
             .buttonStyle(.plain)
@@ -208,11 +214,11 @@ struct OnboardingView: View {
             .plosGlassControl()
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("추천 질문")
+                Text(t("추천 질문", "Suggested prompts", "おすすめ質問"))
                     .font(.headline)
-                Text("• 이 프로젝트의 핵심 목표가 뭐였지?")
-                Text("• 이 폴더 문서들 핵심만 요약해줘")
-                Text("• 지난번 메모 기준으로 다음 할 일 정리해줘")
+                Text(t("• 이 프로젝트의 핵심 목표가 뭐였지?", "• What is the core goal of this project?", "• このプロジェクトの核心目標は何？"))
+                Text(t("• 이 폴더 문서들 핵심만 요약해줘", "• Summarize key points from this folder", "• このフォルダ文書の要点を要約して"))
+                Text(t("• 지난번 메모 기준으로 다음 할 일 정리해줘", "• Organize next actions from previous notes", "• 前回メモを基に次の作業を整理して"))
             }
             .padding(.top, 4)
         }
@@ -221,34 +227,34 @@ struct OnboardingView: View {
     private func stepTitle(_ step: OnboardingStep) -> String {
         switch step {
         case .welcome:
-            return "당신의 Mac에서 시작되는 개인 AI"
+            return t("당신의 Mac에서 시작되는 개인 AI", "Personal AI that starts on your Mac", "あなたのMacで始まる個人AI")
         case .dataSelection:
-            return "어떤 자료를 참고할까요?"
+            return t("어떤 자료를 참고할까요?", "Which data should be used?", "どの資料を使いますか？")
         case .startProfile:
-            return "어떤 방식으로 시작할까요?"
+            return t("어떤 방식으로 시작할까요?", "How would you like to start?", "どの方式で始めますか？")
         case .privacyInfo:
-            return "기본적으로 로컬에서 처리합니다"
+            return t("기본적으로 로컬에서 처리합니다", "Local processing by default", "既定ではローカル処理")
         case .indexing:
-            return "로컬 인덱싱 진행"
+            return t("로컬 인덱싱 진행", "Local indexing in progress", "ローカルインデックス進行中")
         case .ready:
-            return "준비가 끝났습니다"
+            return t("준비가 끝났습니다", "Ready to go", "準備完了")
         }
     }
 
     private func stepDescription(_ step: OnboardingStep) -> String {
         switch step {
         case .welcome:
-            return "선택한 자료만 로컬에서 정리하고, 필요할 때만 외부 AI를 사용합니다."
+            return t("선택한 자료만 로컬에서 정리하고, 필요할 때만 외부 AI를 사용합니다.", "Only selected data is processed locally, with optional external AI.", "選択した資料だけをローカル処理し、必要時のみ外部AIを使います。")
         case .dataSelection:
-            return "선택한 자료만 인덱싱됩니다. 나중에 언제든 변경할 수 있습니다."
+            return t("선택한 자료만 인덱싱됩니다. 나중에 언제든 변경할 수 있습니다.", "Only selected data will be indexed. You can change it anytime later.", "選択した資料のみインデックスされます。後でいつでも変更できます。")
         case .startProfile:
-            return "빠른 시작 / 추천 설정 / 깊은 분석 중에서 선택하세요."
+            return t("빠른 시작 / 추천 설정 / 깊은 분석 중에서 선택하세요.", "Choose fast / recommended / deep analysis.", "高速 / おすすめ / 深い分析 から選択してください。")
         case .privacyInfo:
-            return "외부 AI 사용 정책은 설정에서 언제든 조정할 수 있습니다."
+            return t("외부 AI 사용 정책은 설정에서 언제든 조정할 수 있습니다.", "External AI policy can be adjusted in settings at any time.", "外部AI利用ポリシーは設定でいつでも調整できます。")
         case .indexing:
-            return "문서를 스캔하고 검색/응답 준비를 진행합니다."
+            return t("문서를 스캔하고 검색/응답 준비를 진행합니다.", "Scanning documents and preparing retrieval/response.", "文書をスキャンし、検索/応答準備を進めます。")
         case .ready:
-            return "첫 질문을 입력해 작업을 시작하세요."
+            return t("첫 질문을 입력해 작업을 시작하세요.", "Enter your first prompt to begin.", "最初の質問を入力して開始してください。")
         }
     }
 

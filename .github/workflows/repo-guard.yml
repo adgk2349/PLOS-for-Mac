@@ -1,0 +1,25 @@
+name: repo-guard
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - develop
+      - "codex/**"
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run repository guard
+        run: python3 cicd/scripts/repo_guard.py --mode tracked --size-limit-mb 25
+

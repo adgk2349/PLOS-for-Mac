@@ -1,55 +1,16 @@
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import dataclass
-from datetime import datetime, timezone
-import json
 import logging
-import re
-import time
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
 from .db import Database
 from .models import (
-    MemoryClearResponse,
-    MemoryClearScope,
-    MemoryEventRequest,
-    MemoryEventResponse,
-    PinnedMemoryItem,
-    RelevantMemoryBundle,
-    UserPreferenceItem,
     WorkspaceIdentity,
-    WorkspaceMemoryMode,
 )
-from .response_composer import ResponseComposer
-
+from .memory.preferences import ResolvedMemoryPreferences
+from .memory import service_mixins as _memory_service_mixins
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(slots=True)
-class ResolvedMemoryPreferences:
-    response_length: str = "medium"
-    show_citations: bool = True
-    confirm_external_calls: bool = False
-    prefer_action_suggestions: bool = True
-    default_action_order: list[str] = None  # type: ignore[assignment]
-    default_mode: str | None = None
-    workspace_weights: dict[str, float] = None  # type: ignore[assignment]
-
-    def __post_init__(self):
-        if self.default_action_order is None:
-            self.default_action_order = []
-        if self.workspace_weights is None:
-            self.workspace_weights = {}
-
-
-def _episodic_disabled(mode: WorkspaceMemoryMode) -> bool:
-    """Return True when episodic/workspace memory should not be used."""
-    return mode in {WorkspaceMemoryMode.DISABLED, WorkspaceMemoryMode.PINNED_ONLY}
-
-
-from .memory import service_mixins as _memory_service_mixins
 
 class MemoryService(_memory_service_mixins.MemoryServiceMethodsMixin):
     _DIGEST_KEY = "conversation_digest_v1"
@@ -109,6 +70,12 @@ class MemoryService(_memory_service_mixins.MemoryServiceMethodsMixin):
         self._db = db
         self._last_inferred_refresh_by_workspace: dict[str, float] = {}
         self._digest_model_refresher: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None
+        self._vector_store: Any = None
+        self._embedding_service: Any = None
+
+    def set_dependencies(self, *, vector_store: Any, embedding_service: Any) -> None:
+        self._vector_store = vector_store
+        self._embedding_service = embedding_service
 
     def get_workspace_identity(self) -> WorkspaceIdentity:
         workspace = self._db.get_workspace()
@@ -117,8 +84,3 @@ class MemoryService(_memory_service_mixins.MemoryServiceMethodsMixin):
     # ------------------------------------------------------------------
     # Session memory
     # ------------------------------------------------------------------
-
-
-_memory_service_mixins.ResolvedMemoryPreferences = ResolvedMemoryPreferences
-_memory_service_mixins._episodic_disabled = _episodic_disabled
-

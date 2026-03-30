@@ -1,22 +1,193 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import hashlib
+import json
+import os
 from pathlib import Path
+import time
 
 from .language_utils import resolve_response_language
 from .models import (
+    AgentAction,
     Citation,
     ExecutionResult,
     LocalEngine,
     LocalPlan,
+    PluginCapabilitySource,
     ReasoningIntent,
     WorkMode,
+    SystemFilePermission,
 )
 from .models import StartupProfile as StartupProfileType
+from .storage.async_adapter import AsyncAdapter
 
 
 class LocalExecutor:
-    def __init__(self, local_inference):
+    def __init__(self, local_inference, capability_router=None):
         self._local_inference = local_inference
+        self._capabilities = capability_router
+        self._async_adapter = AsyncAdapter()
+        self._conversation_cache: dict[str, tuple[float, ExecutionResult]] = {}
+        self._conversation_cache_max = max(0, int(os.getenv("LOCAL_AI_CONV_CACHE_MAX", "96")))
+        self._conversation_cache_ttl = max(0.0, float(os.getenv("LOCAL_AI_CONV_CACHE_TTL_SECONDS", "45")))
+
+    def _conversation_cache_key(
+        self,
+        *,
+        query: str,
+        mode: WorkMode,
+        startup_profile: StartupProfileType,
+        engine: LocalEngine,
+        mlx_model_path: str | None,
+        llama_model_path: str | None,
+        language_preference: str | None,
+        session_summary: str | None,
+        max_tokens: int,
+    ) -> str:
+        payload = {
+            "q": str(query or ""),
+            "m": str(mode.value),
+            "p": str(startup_profile.value),
+            "e": str(engine.value),
+            "mlx": str(mlx_model_path or ""),
+            "llama": str(llama_model_path or ""),
+            "lang": str(language_preference or ""),
+            "s": str(session_summary or ""),
+            "t": int(max_tokens),
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8", errors="ignore")
+        return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+    def _conversation_cache_get(self, key: str) -> ExecutionResult | None:
+        if self._conversation_cache_max <= 0 or self._conversation_cache_ttl <= 0:
+            return None
+        row = self._conversation_cache.get(key)
+        if row is None:
+            return None
+        created_at, value = row
+        if (time.time() - created_at) > self._conversation_cache_ttl:
+            self._conversation_cache.pop(key, None)
+            return None
+        return value.model_copy(deep=True)
+
+    def _conversation_cache_put(self, key: str, value: ExecutionResult) -> None:
+        if self._conversation_cache_max <= 0 or self._conversation_cache_ttl <= 0:
+            return
+        self._conversation_cache[key] = (time.time(), value.model_copy(deep=True))
+        if len(self._conversation_cache) <= self._conversation_cache_max:
+            return
+        oldest_key = min(self._conversation_cache.items(), key=lambda item: item[1][0])[0]
+        self._conversation_cache.pop(oldest_key, None)
+
+    async def execute_conversation_async(
+        self,
+        *,
+        query: str,
+        mode: WorkMode,
+        startup_profile: StartupProfileType,
+        engine: LocalEngine,
+        mlx_model_path: str | None,
+        llama_model_path: str | None,
+        language_preference: str | None,
+        session_summary: str | None,
+        max_tokens: int = 320,
+        timeout_seconds: float | None = None,
+    ) -> ExecutionResult:
+        offloaded = self._async_adapter.run(
+            self.execute_conversation,
+            query=query,
+            mode=mode,
+            startup_profile=startup_profile,
+            engine=engine,
+            mlx_model_path=mlx_model_path,
+            llama_model_path=llama_model_path,
+            language_preference=language_preference,
+            session_summary=session_summary,
+            max_tokens=max_tokens,
+        )
+        result = (
+            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
+            if timeout_seconds and timeout_seconds > 0
+            else await offloaded
+        )
+        result.tool_logs.append("inference_offload:conversation")
+        return result
+
+    async def execute_async(
+        self,
+        *,
+        query: str,
+        mode: WorkMode,
+        parsed_intent: ReasoningIntent,
+        plan: LocalPlan,
+        citations: list[Citation],
+        startup_profile: StartupProfileType,
+        engine: LocalEngine,
+        mlx_model_path: str | None,
+        llama_model_path: str | None,
+        language_preference: str | None,
+        response_length: str = "medium",
+        timeout_seconds: float | None = None,
+    ) -> ExecutionResult:
+        offloaded = self._async_adapter.run(
+            self.execute,
+            query=query,
+            mode=mode,
+            parsed_intent=parsed_intent,
+            plan=plan,
+            citations=citations,
+            startup_profile=startup_profile,
+            engine=engine,
+            mlx_model_path=mlx_model_path,
+            llama_model_path=llama_model_path,
+            language_preference=language_preference,
+            response_length=response_length,
+        )
+        result = (
+            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
+            if timeout_seconds and timeout_seconds > 0
+            else await offloaded
+        )
+        result.tool_logs.append("inference_offload:executor_execute")
+        return result
+
+    async def generate_async(self, *, timeout_seconds: float | None = None, **kwargs):
+        offloaded = self._async_adapter.run(self._local_inference.generate, **kwargs)
+        inference = (
+            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
+            if timeout_seconds and timeout_seconds > 0
+            else await offloaded
+        )
+        return inference
+
+    async def generate_conversational_async(self, *, timeout_seconds: float | None = None, **kwargs):
+        offloaded = self._async_adapter.run(self._local_inference.generate_conversational, **kwargs)
+        inference = (
+            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
+            if timeout_seconds and timeout_seconds > 0
+            else await offloaded
+        )
+        return inference
+
+    async def generate_agentic_step_async(self, *, timeout_seconds: float | None = None, **kwargs):
+        offloaded = self._async_adapter.run(self._local_inference.generate_agentic_step, **kwargs)
+        action = (
+            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
+            if timeout_seconds and timeout_seconds > 0
+            else await offloaded
+        )
+        return action
+
+    async def generate_reflection_async(self, *, timeout_seconds: float | None = None, **kwargs):
+        offloaded = self._async_adapter.run(self._local_inference.generate_reflection, **kwargs)
+        reflection = (
+            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
+            if timeout_seconds and timeout_seconds > 0
+            else await offloaded
+        )
+        return reflection
 
     def execute_conversation(
         self,
@@ -31,6 +202,21 @@ class LocalExecutor:
         session_summary: str | None,
         max_tokens: int = 320,
     ) -> ExecutionResult:
+        cache_key = self._conversation_cache_key(
+            query=query,
+            mode=mode,
+            startup_profile=startup_profile,
+            engine=engine,
+            mlx_model_path=mlx_model_path,
+            llama_model_path=llama_model_path,
+            language_preference=language_preference,
+            session_summary=session_summary,
+            max_tokens=max_tokens,
+        )
+        cached = self._conversation_cache_get(cache_key)
+        if cached is not None:
+            cached.tool_logs.append("prompt_cache:conversation_hit")
+            return cached
         conversational = self._local_inference.generate_conversational(
             query=query,
             mode=mode,
@@ -43,7 +229,7 @@ class LocalExecutor:
             session_summary=session_summary,
             allow_static_fallback=False,
         )
-        return ExecutionResult(
+        result = ExecutionResult(
             result_type="conversation",
             structured_payload={
                 "style": "general_chat",
@@ -56,6 +242,39 @@ class LocalExecutor:
             used_fallback=conversational.used_fallback,
             runtime_detail=conversational.detail,
         )
+        if str(result.generated_text or "").strip() and not result.used_fallback:
+            self._conversation_cache_put(cache_key, result)
+        return result
+    def execute_agent_action(self, action: AgentAction, permission_level: SystemFilePermission) -> str:
+        """Map LLM-generated AgentAction to actual system tool calls."""
+        if not self._capabilities or not self._capabilities.system_tools:
+            return "Error: System tools not available for this platform."
+
+        tools = self._capabilities.system_tools
+        if action.kind == "spotlight_search":
+            query = action.params.get("query") or action.params.get("q") or ""
+            results = tools.spotlight_search(str(query))
+            return "\n".join(results) if results else "No files found via Spotlight."
+        
+        if action.kind == "get_metadata":
+            path = action.params.get("path") or ""
+            meta = tools.get_metadata(str(path))
+            if not meta:
+                return "Error: No metadata found for this path."
+            return json.dumps(meta, indent=2, ensure_ascii=False)
+            
+        if action.kind == "execute_command":
+            command = action.params.get("command") or ""
+            # Whitelist validation is enforced in SystemToolProvider implementation
+            return tools.execute_command(str(command), permission_level)
+
+        return f"Error: Unsupported action kind '{action.kind}'"
+
+    def _max_tokens_for(self, response_length: str, mode: WorkMode) -> int:
+        # Re-using logic or referencing reasoning_mixins if needed, 
+        # but for internal calls we use safe defaults.
+        mapping = {"short": 256, "medium": 512, "long": 1024}
+        return mapping.get(response_length, 512)
 
     def execute(
         self,
@@ -124,6 +343,13 @@ class LocalExecutor:
                 used_fallback=False,
                 runtime_detail=None,
             )
+
+        summary_hook_source = PluginCapabilitySource.BUILT_IN
+        if plan.plan_type == "summary" and self._capabilities is not None:
+            summary_hook = self._capabilities.process_summarizer_generate(
+                fallback=lambda: None,
+            )
+            summary_hook_source = summary_hook.source
 
         if plan.plan_type == "file_lookup":
             files = self._file_items(selected)
@@ -213,6 +439,8 @@ class LocalExecutor:
                 language=language,
             )
             if focused_file is not None:
+                if summary_hook_source != PluginCapabilitySource.BUILT_IN:
+                    focused_file.tool_logs.append(f"capability:{summary_hook_source.value}:summarizer.generate")
                 return focused_file
 
         if plan.plan_type == "summary" and plan.response_strategy == "map_reduce_grounded_summary":
@@ -229,6 +457,8 @@ class LocalExecutor:
                 language=language,
             )
             if multi_file is not None:
+                if summary_hook_source != PluginCapabilitySource.BUILT_IN:
+                    multi_file.tool_logs.append(f"capability:{summary_hook_source.value}:summarizer.generate")
                 return multi_file
 
         prompt = query
@@ -271,7 +501,7 @@ class LocalExecutor:
         if result_type == "draft":
             payload["editable"] = True
 
-        return ExecutionResult(
+        result = ExecutionResult(
             result_type=result_type,
             structured_payload=payload,
             citations=selected,
@@ -281,6 +511,9 @@ class LocalExecutor:
             used_fallback=inference.used_fallback,
             runtime_detail=inference.detail,
         )
+        if plan.plan_type == "summary" and summary_hook_source != PluginCapabilitySource.BUILT_IN:
+            result.tool_logs.append(f"capability:{summary_hook_source.value}:summarizer.generate")
+        return result
 
     @staticmethod
     def _selected_citations(*, plan: LocalPlan, citations: list[Citation]) -> list[Citation]:
@@ -342,12 +575,14 @@ class LocalExecutor:
         map_logs: list[str] = []
         map_used_fallback = False
         detail_parts: list[str] = []
-        for doc_id, citations in docs:
-            ranked = sorted(citations, key=lambda item: item.score, reverse=True)
-            file_name = Path(ranked[0].file_path).name
-            map_prompt = self._per_file_map_prompt(file_name=file_name, response_language=language)
-            map_inference = self._local_inference.generate(
-                query=map_prompt,
+
+        def _process_doc(doc_item: tuple[str, list[Citation]]) -> tuple[dict, str, bool, str | None]:
+            did, cits = doc_item
+            ranked = sorted(cits, key=lambda item: item.score, reverse=True)
+            file_name_val = Path(ranked[0].file_path).name
+            prompt = self._per_file_map_prompt(file_name=file_name_val, response_language=language)
+            inference = self._local_inference.generate(
+                query=prompt,
                 mode=mode,
                 citations=ranked[:4],
                 profile=startup_profile.value,
@@ -357,30 +592,38 @@ class LocalExecutor:
                 language_preference=language_preference,
                 max_tokens=self._max_tokens_for(response_length="short", mode=mode),
             )
-            map_summary = map_inference.answer.strip()
-            if not map_summary:
-                map_summary = ranked[0].snippet.strip()
+            summary_val = inference.answer.strip()
+            fallback_used = False
+            if not summary_val:
+                summary_val = ranked[0].snippet.strip()
+                fallback_used = True
+            row_dict = {
+                "doc_id": did,
+                "file_path": ranked[0].file_path,
+                "file_name": file_name_val,
+                "summary": summary_val,
+                "score": float(ranked[0].score),
+                "modified_at": ranked[0].modified_at,
+                "category": ranked[0].category,
+                "subcategory": ranked[0].subcategory,
+                "tags": ranked[0].tags,
+                "document_type": ranked[0].document_type,
+                "importance": ranked[0].importance,
+            }
+            log_str = f"map_summary:{inference.engine_used.value}:{file_name_val}"
+            det_str = f"map[{file_name_val}]={inference.detail}" if inference.detail else None
+            return row_dict, log_str, inference.used_fallback or fallback_used, det_str
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(docs), 4)) as pool:
+            results = list(pool.map(_process_doc, docs))
+
+        for row, log_entry, fallback, detail in results:
+            map_rows.append(row)
+            map_logs.append(log_entry)
+            if fallback:
                 map_used_fallback = True
-            map_rows.append(
-                {
-                    "doc_id": doc_id,
-                    "file_path": ranked[0].file_path,
-                    "file_name": file_name,
-                    "summary": map_summary,
-                    "score": float(ranked[0].score),
-                    "modified_at": ranked[0].modified_at,
-                    "category": ranked[0].category,
-                    "subcategory": ranked[0].subcategory,
-                    "tags": ranked[0].tags,
-                    "document_type": ranked[0].document_type,
-                    "importance": ranked[0].importance,
-                }
-            )
-            map_logs.append(f"map_summary:{map_inference.engine_used.value}:{file_name}")
-            if map_inference.used_fallback:
-                map_used_fallback = True
-            if map_inference.detail:
-                detail_parts.append(f"map[{file_name}]={map_inference.detail}")
+            if detail:
+                detail_parts.append(detail)
 
         reduce_citations: list[Citation] = []
         for idx, row in enumerate(map_rows, start=1):
@@ -508,14 +751,14 @@ class LocalExecutor:
     def _max_tokens_for(*, response_length: str, mode: WorkMode) -> int:
         base = {
             "short": 160,
-            "medium": 280,
-            "long": 420,
-        }.get((response_length or "medium").lower(), 280)
+            "medium": 320,
+            "long": 520,
+        }.get((response_length or "long").lower(), 520)
         if mode in {WorkMode.RESEARCH, WorkMode.DEVELOPMENT, WorkMode.PLANNING}:
             base += 40
         if mode == WorkMode.STRICT_SEARCH:
             base = min(base, 220)
-        return max(96, min(base, 560))
+        return max(96, min(base, 760))
 
     @staticmethod
     def _file_items(citations: list[Citation]) -> list[dict]:
@@ -559,26 +802,34 @@ class LocalExecutor:
     def _per_file_map_prompt(*, file_name: str, response_language: str) -> str:
         if response_language == "ko":
             return (
-                f"{file_name} 내용만 기준으로 핵심을 2~3문장으로 요약해줘. "
-                "중복 문장/복붙 없이 자연스러운 문장으로만 답해줘."
+                f"### {file_name} 분석\n"
+                f"{file_name}의 주요 내용을 2~3개의 불렛 포인트로 정리해줘. "
+                "핵심 키워드와 수치를 포함해서 간결하고 전문적인 톤으로 작성해줘."
             )
         return (
-            f"Summarize only {file_name} in 2-3 sentences. "
-            "Use natural wording and avoid repetitive copy-paste phrasing."
+            f"### Analysis of {file_name}\n"
+            f"Summarize the key points of {file_name} in 2-3 bullet points. "
+            "Use a professional tone and include specific keywords or metrics."
         )
 
     @staticmethod
     def _reduce_summary_prompt(*, file_count: int, response_language: str) -> str:
         if response_language == "ko":
             return (
-                f"아래는 파일 {file_count}개의 부분 요약입니다. "
-                "중복을 제거해서 전체 흐름 중심으로 5~7줄 핵심 요약을 작성해줘. "
-                "파일별 차이가 크면 마지막 줄에 차이점 1줄만 덧붙여줘."
+                f"## 📂 통합 리포트 (총 {file_count}개 파일)\n"
+                "아래 파일별 요약본들을 바탕으로 전문적인 통합 분석 결과를 작성해줘. "
+                "1. **핵심 요약**: 전체를 관통하는 주제 1문장.\n"
+                "2. **상세 분석**: 마크다운 불렛 포인트를 사용하여 주제별로 분류하여 정리.\n"
+                "3. **결론 및 시사점**: 데이터가 시사하는 바를 1줄로 결론.\n"
+                "가독성을 위해 적절한 굵게(**text**) 표기를 사용하고, 파일간 차이점이 있다면 명시해줘."
             )
         return (
-            f"These are partial summaries from {file_count} files. "
-            "Merge them into a concise 5-7 line overall summary without repetition. "
-            "If differences matter, add one final line for key differences."
+            f"## 📂 Integrated Analysis Report ({file_count} files)\n"
+            "Based on the following summaries, provide a professional integrated analysis. "
+            "1. **Executive Summary**: One overarching theme.\n"
+            "2. **Key Findings**: Use Markdown bullet points categorized by topic.\n"
+            "3. **Conclusion**: One final takeaway line.\n"
+            "Use bold text for emphasis and highlight any critical differences between files."
         )
 
     @staticmethod
@@ -602,14 +853,16 @@ class LocalExecutor:
     def _focused_file_summary_prompt(*, file_name: str, response_language: str) -> str:
         if response_language == "ko":
             return (
-                f"{file_name} 전체 내용을 읽고 핵심을 자연스럽게 5~7줄로 요약해줘. "
-                "원문 문장을 그대로 반복하지 말고 개념 중심으로 재서술해줘. "
-                "답변에 파일명 괄호 표기나 로그 문구는 넣지 마."
+                f"## 📄 {file_name} 정밀 분석\n"
+                f"{file_name}의 전체 내용을 읽고 구조화된 분석 리포트를 작성해줘. "
+                "**주요 골자**, **세부 내용**, **특이 사항**을 각각 구분하여 마크다운 리스트로 정리해줘. "
+                "단순 요약을 넘어 문서가 전달하려는 핵심 가치를 재구성해서 설명해줘."
             )
         return (
-            f"Read the full content of {file_name} and produce a natural 5-7 line summary. "
-            "Paraphrase conceptually instead of copying original sentences. "
-            "Do not include file-name markers or log-like boilerplate."
+            f"## 📄 Precision Analysis: {file_name}\n"
+            f"Read the entire content of {file_name} and generate a structured analytical report. "
+            "Organize into sections: **Main Objective**, **Key Details**, and **Notable Items** using Markdown lists. "
+            "Synthesize the core value of the document instead of providing a passive summary."
         )
 
     @staticmethod

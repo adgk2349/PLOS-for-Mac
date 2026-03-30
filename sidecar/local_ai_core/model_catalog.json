@@ -45,18 +45,19 @@
       "default": false
     },
     {
-      "id": "llama31_8b_mlx_advanced",
-      "name": "Llama 3.1 8B Instruct",
+      "id": "qwen35_9b_gguf",
+      "name": "Qwen 3.5 9B MLX (4bit)",
       "profile": "advanced",
       "engine": "mlx",
       "distribution_type": "huggingface_repo",
-      "repo_id": "mlx-community/Llama-3.1-8B-Instruct-4bit",
-      "download_label": "16GB 안정형",
-      "description": "8B급 안정형 모델. 설명/요약/비교 작업에서 균형 잡힌 품질.",
-      "size_gb": 4.9,
+      "repo_id": "mlx-community/Qwen3.5-9B-MLX-4bit",
+      "repo_url": "https://huggingface.co/mlx-community/Qwen3.5-9B-MLX-4bit",
+      "download_label": "16GB+ 품질형",
+      "description": "Qwen 3.5 9B MLX 4bit. 현재 런타임 기준으로 안정적으로 사용할 수 있는 경로.",
+      "size_gb": 6.2,
       "recommended_for": ["M2", "M3", "M4"],
       "recommended_memory_gb": 16,
-      "tags": ["advanced", "local", "mlx", "stable", "apple_silicon"],
+      "tags": ["advanced", "local", "mlx", "quality", "apple_silicon"],
       "supports": {
         "chat": true,
         "rag": true,
@@ -64,28 +65,6 @@
         "vision": false
       },
       "default": true
-    },
-    {
-      "id": "qwen3_8b_gguf_advanced",
-      "name": "Qwen 3 8B Instruct GGUF",
-      "profile": "advanced",
-      "engine": "llama_cpp",
-      "distribution_type": "huggingface_file",
-      "repo_id": "Qwen/Qwen3-8B-GGUF",
-      "filename": "Qwen3-8B-Q4_K_M.gguf",
-      "download_label": "16GB 호환성",
-      "description": "Qwen3 8B GGUF. llama.cpp 기반 호환성 경로.",
-      "size_gb": 4.7,
-      "recommended_for": ["M2", "M3", "M4"],
-      "recommended_memory_gb": 16,
-      "tags": ["advanced", "local", "gguf", "llama_cpp", "quality"],
-      "supports": {
-        "chat": true,
-        "rag": true,
-        "tool_use": false,
-        "vision": false
-      },
-      "default": false
     },
     {
       "id": "gemma3_12b_gguf",
@@ -142,11 +121,11 @@
       "repo_id": "ggml-org/gpt-oss-20b-GGUF",
       "repo_url": "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF",
       "filename": "gpt-oss-20b-mxfp4.gguf",
-      "download_label": "64GB 이상",
-      "description": "20B급 고품질 모델. 64GB 이상 환경 권장.",
+      "download_label": "16GB 이상",
+      "description": "20B급 고품질 모델. 16GB 이상 환경에서 사용 가능.",
       "size_gb": 12.8,
-      "recommended_for": ["M3", "M4"],
-      "recommended_memory_gb": 64,
+      "recommended_for": ["M2", "M3", "M4"],
+      "recommended_memory_gb": 16,
       "tags": ["advanced", "local", "gguf", "llama_cpp", "pro"],
       "supports": {
         "chat": true,

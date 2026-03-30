@@ -14,9 +14,17 @@ def test_parse_txt_file(tmp_path: Path):
     assert result.parser == "plain-text"
 
 
+def test_parse_code_file_as_text(tmp_path: Path):
+    path = tmp_path / "main.py"
+    path.write_text("def hello():\n    return 'ok'\n", encoding="utf-8")
+    result = parse_file(path)
+    assert "hello" in result.text
+    assert result.parser == "plain-text"
+
+
 def test_unsupported_extension_raises(tmp_path: Path):
-    path = tmp_path / "data.csv"
-    path.write_text("a,b", encoding="utf-8")
+    path = tmp_path / "data.exe"
+    path.write_text("binary-like", encoding="utf-8")
     with pytest.raises(ParseError):
         parse_file(path)
 

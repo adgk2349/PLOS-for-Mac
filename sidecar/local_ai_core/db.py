@@ -9,11 +9,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .infrastructure.docker_service import DockerService
 from . import schema
 from .models import (
     BehaviorPolicy,
     ChatFilters,
     EpisodicMemoryEvent,
+    LocalEngine,
     MemoryClearScope,
     PinnedMemoryItem,
     DocumentMetadata,
@@ -37,11 +39,13 @@ def utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 class Database:
-    def __init__(self, sqlite_path: Path):
+    def __init__(self, sqlite_path: Path, skip_init: bool = False, docker: DockerService | None = None):
         self._path = sqlite_path
         self._lock = threading.RLock()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self.docker = docker
         
         # Initialize repositories
         self.documents = DocumentRepository(self._conn, self._lock)
@@ -49,8 +53,18 @@ class Database:
         self.settings = SettingsRepository(self._conn, self._lock)
         self.infra = InfrastructureRepository(self._conn, self._lock)
         
+        if not skip_init:
+            self._migrate()
+            self._bootstrap_defaults()
+
+    def initialize(self) -> None:
+        """Perform heavy setup (migrations and bootstrapping) after instantiation."""
         self._migrate()
         self._bootstrap_defaults()
+
+    @property
+    def sqlite_path(self) -> Path:
+        return self._path
 
     def _migrate(self) -> None:
         with self._lock:
@@ -74,7 +88,7 @@ class Database:
 
     def _bootstrap_memory_defaults(self) -> None:
         defaults: list[tuple[str, dict[str, Any]]] = [
-            ("response_length", {"value": "medium"}),
+            ("response_length", {"value": "long"}),
             ("show_citations", {"value": True}),
             ("confirm_external_calls", {"value": False}),
             ("default_action_order", {"value": []}),
@@ -88,6 +102,20 @@ class Database:
             self.upsert_user_preference(
                 key=key,
                 value_json=value,
+                source="explicit",
+                confidence=1.0,
+            )
+
+        # Keep legacy installs on the new default unless the user explicitly changed it.
+        resolved = self.get_resolved_user_preferences()
+        response_pref = resolved.get("response_length")
+        current_value = ""
+        if response_pref is not None:
+            current_value = str(response_pref.value_json.get("value") or "").strip().lower()
+        if current_value in {"", "medium"}:
+            self.upsert_user_preference(
+                key="response_length",
+                value_json={"value": "long"},
                 source="explicit",
                 confidence=1.0,
             )
@@ -118,11 +146,29 @@ class Database:
         )
 
     def update_settings(self, settings: SettingsModel) -> SettingsModel:
+        previous = self.get_settings()
         now = utc_now().isoformat()
         self.settings.update_settings_payload(
             payload_json=settings.model_dump_json(),
             updated_at=now,
         )
+        
+        # Handle SearXNG Docker automation if service is available
+        if self.docker:
+            prev_auto_start = bool(getattr(previous, "auto_start_searxng", False))
+            next_auto_start = bool(settings.auto_start_searxng)
+            if next_auto_start and not prev_auto_start:
+                # Run in background to avoid blocking the API response
+                threading.Thread(
+                    target=lambda: self.docker.start(keep_running=True),
+                    daemon=True,
+                ).start()
+            elif prev_auto_start and not next_auto_start:
+                threading.Thread(
+                    target=lambda: self.docker.stop(shutdown_desktop=False, remove_stack=False),
+                    daemon=True,
+                ).start()
+
         return self.get_settings()
 
     def get_settings(self) -> SettingsModel:
@@ -130,9 +176,30 @@ class Database:
         if row is None:
             return SettingsModel()
         try:
-            return SettingsModel.model_validate_json(row["payload"])
+            settings = SettingsModel.model_validate_json(row["payload"])
+            return self._sanitize_engine_model_paths(settings)
         except Exception:
             return SettingsModel()
+
+    @staticmethod
+    def _sanitize_engine_model_paths(settings: SettingsModel) -> SettingsModel:
+        mlx_path = str(settings.mlx_model_path or "").strip()
+        llama_path = str(settings.llama_model_path or "").strip()
+
+        if settings.local_engine == LocalEngine.MLX:
+            if mlx_path:
+                settings.llama_model_path = None
+            elif llama_path:
+                settings.local_engine = LocalEngine.LLAMA_CPP
+                settings.mlx_model_path = None
+        else:
+            if llama_path:
+                settings.mlx_model_path = None
+            elif mlx_path:
+                settings.local_engine = LocalEngine.MLX
+                settings.llama_model_path = None
+
+        return settings
 
     # --- Document & Chunks ---
 
@@ -511,7 +578,7 @@ class Database:
             legacy_actions = json.loads((legacy_row["preferred_action_order"] if legacy_row else "[]") or "[]")
         except Exception:
             legacy_actions = []
-        legacy_length = legacy_row["preferred_response_length"] if legacy_row else "medium"
+        legacy_length = legacy_row["preferred_response_length"] if legacy_row else "long"
 
         resolved_preferences = self.get_resolved_user_preferences()
         response_length_pref = resolved_preferences.get("response_length")
@@ -536,7 +603,7 @@ class Database:
         if action_order_pref:
             raw = action_order_pref.value_json.get("value")
             if isinstance(raw, list): preferred_actions = raw
-        preferred_response_length = legacy_length or "medium"
+        preferred_response_length = legacy_length or "long"
         if response_length_pref:
             preferred_response_length = str(response_length_pref.value_json.get("value") or preferred_response_length)
 
@@ -605,6 +672,70 @@ class Database:
         now = utc_now()
         self.infra.record_external_call(provider, sent_chars, approved_by_user, now.isoformat())
         return now
+
+    def list_plugin_registry_entries(self) -> list[dict[str, Any]]:
+        rows = self.infra.list_plugin_registry()
+        return [
+            {
+                "plugin_id": row["plugin_id"],
+                "manifest_json": row["manifest_json"],
+                "enabled": bool(row["enabled"]),
+                "state": row["state"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def get_plugin_registry_entry(self, plugin_id: str) -> dict[str, Any] | None:
+        row = self.infra.get_plugin_registry(plugin_id)
+        if row is None:
+            return None
+        return {
+            "plugin_id": row["plugin_id"],
+            "manifest_json": row["manifest_json"],
+            "enabled": bool(row["enabled"]),
+            "state": row["state"],
+            "updated_at": row["updated_at"],
+        }
+
+    def upsert_plugin_registry_entry(
+        self,
+        *,
+        plugin_id: str,
+        manifest_json: str,
+        enabled: bool,
+        state: str,
+    ) -> None:
+        self.infra.upsert_plugin_registry(
+            plugin_id=plugin_id,
+            manifest_json=manifest_json,
+            enabled=enabled,
+            state=state,
+            updated_at=utc_now().isoformat(),
+        )
+
+    def list_platform_adapters(self) -> list[dict[str, Any]]:
+        rows = self.infra.list_platform_adapters()
+        return [
+            {
+                "adapter_key": row["adapter_key"],
+                "adapter_class": row["adapter_class"],
+                "health": row["health"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def upsert_platform_adapter(self, *, adapter_key: str, adapter_class: str, health: str) -> None:
+        self.infra.upsert_platform_adapter(
+            adapter_key=adapter_key,
+            adapter_class=adapter_class,
+            health=health,
+            updated_at=utc_now().isoformat(),
+        )
+
+    def delete_plugin_registry_entry(self, plugin_id: str) -> bool:
+        return self.infra.delete_plugin_registry(plugin_id)
 
     def get_status_snapshot(self) -> dict[str, Any]:
         row = self.documents.get_status_snapshot_base()

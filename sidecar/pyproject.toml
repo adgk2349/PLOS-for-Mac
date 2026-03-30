@@ -9,6 +9,7 @@ dependencies = [
   "pydantic>=2.8.0",
   "pydantic-settings>=2.3.0",
   "httpx>=0.28.0",
+  "aiosqlite>=0.20.0",
   "lancedb>=0.22.0",
   "numpy>=2.2.0",
   "pypdf>=5.3.0",
@@ -18,7 +19,8 @@ dependencies = [
   "pypdfium2>=4.30.0",
   "rapidocr_onnxruntime>=1.4.4",
   "cryptography>=3.1",
-  "huggingface-hub>=0.30.0"
+  "huggingface-hub>=0.30.0",
+  "dependency-injector>=4.44.0"
 ]
 
 [project.optional-dependencies]
@@ -40,3 +42,6 @@ local_ai_core = ["*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+filterwarnings = [
+  "ignore:The 'app' shortcut is now deprecated\\. Use the explicit style 'transport=WSGITransport\\(app=\\.\\.\\.\\)' instead\\.:DeprecationWarning:httpx\\._client",
+]

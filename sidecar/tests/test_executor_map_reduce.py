@@ -26,7 +26,7 @@ class _StubInference:
     def generate(self, **kwargs):
         query = str(kwargs.get("query") or "")
         self.calls.append(query)
-        if "부분 요약" in query or "partial summaries" in query:
+        if "통합 리포트" in query or "Integrated Analysis" in query:
             return InferenceResult(
                 answer="전체 핵심은 데이터 통신 절차와 오류 처리 흐름입니다.",
                 engine_used=LocalEngine.MLX,

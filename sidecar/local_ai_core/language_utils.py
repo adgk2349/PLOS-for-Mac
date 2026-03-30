@@ -73,9 +73,14 @@ def detect_query_language(query: str) -> str:
 
 def resolve_response_language(query: str, language_preference: str | None) -> str:
     forced = normalize_language_code(language_preference)
-    if forced:
+    if forced in {"ko", "en", "ja"}:
         return forced
-    return detect_query_language(query)
+    if forced:
+        return "ko"
+    detected = detect_query_language(query)
+    if detected in {"ko", "en", "ja"}:
+        return detected
+    return "ko"
 
 
 def response_language_instruction(language_code: str) -> str:
@@ -100,5 +105,6 @@ def insufficient_evidence_message(language_code: str) -> str:
     code = normalize_language_code(language_code) or "en"
     if code == "ko":
         return "근거 부족: 현재 로컬 자료에서 신뢰할 수 있는 근거를 찾지 못했습니다."
+    if code == "ja":
+        return "根拠不足: 現在のローカル資料から信頼できる根拠を見つけられませんでした。"
     return "Insufficient evidence: no reliable support was found in the current local sources."
-

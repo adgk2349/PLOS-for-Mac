@@ -8,7 +8,7 @@ struct PLOSGlassTheme {
         if scheme == .dark {
             return Color.black.opacity(0.24)
         }
-        return Color.black.opacity(0.12)
+        return Color.black.opacity(0.06)
     }
 
     static func userBubbleTint(for scheme: ColorScheme) -> Color {
@@ -23,6 +23,17 @@ struct PLOSGlassTheme {
             return Color.white.opacity(0.18)
         }
         return Color.black.opacity(0.20)
+    }
+
+    static func titlebarBase(for scheme: ColorScheme) -> Color {
+#if os(macOS)
+        return Color(nsColor: .windowBackgroundColor)
+#else
+        if scheme == .dark {
+            return Color.black.opacity(0.88)
+        }
+        return Color.white.opacity(0.94)
+#endif
     }
 }
 

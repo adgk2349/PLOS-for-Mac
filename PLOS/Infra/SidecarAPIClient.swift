@@ -70,12 +70,98 @@ final class SidecarAPIClient {
         try await request(path: "/v1/index/failures", method: "GET")
     }
 
+    func getRoomStorageStatus(roomID: String) async throws -> RoomStorageStatusResponse {
+        try await request(path: "/v1/rooms/\(roomID)/storage/status", method: "GET")
+    }
+
+    func reindexRoomStorage(
+        roomID: String,
+        scope: String = "full",
+        includedPaths: [String]? = nil,
+        excludedPaths: [String]? = nil
+    ) async throws -> RoomStorageReindexResponse {
+        let payload = RoomStorageReindexRequest(
+            scope: scope,
+            included_paths: includedPaths,
+            excluded_paths: excludedPaths
+        )
+        return try await request(path: "/v1/rooms/\(roomID)/storage/reindex", method: "POST", body: payload)
+    }
+
+    func deleteRoomStorage(roomID: String) async throws -> Bool {
+        let response: [String: JSONValue] = try await request(path: "/v1/rooms/\(roomID)/storage", method: "DELETE")
+        return response["removed"]?.boolCoercedValue ?? false
+    }
+
+    func getExtensionCapabilities() async throws -> ExtensionCapabilitiesResponse {
+        try await request(path: "/v1/extensions/capabilities", method: "GET")
+    }
+
+    func listExtensionPlugins() async throws -> PluginRegistryResponse {
+        try await request(path: "/v1/extensions/plugins", method: "GET")
+    }
+
+    func registerExtensionPlugin(_ payload: PluginRegisterRequest) async throws -> PluginRegistryResponse {
+        try await request(path: "/v1/extensions/plugins/register", method: "POST", body: payload)
+    }
+
+    func enableExtensionPlugin(pluginID: String) async throws -> PluginEnableResponse {
+        try await request(path: "/v1/extensions/plugins/\(pluginID)/enable", method: "POST")
+    }
+
+    func disableExtensionPlugin(pluginID: String) async throws -> PluginEnableResponse {
+        try await request(path: "/v1/extensions/plugins/\(pluginID)/disable", method: "POST")
+    }
+
+    func deleteExtensionPlugin(pluginID: String) async throws -> Bool {
+        let response: [String: JSONValue] = try await request(path: "/v1/extensions/plugins/\(pluginID)", method: "DELETE")
+        return response["removed"]?.boolCoercedValue ?? false
+    }
+
     func localChat(_ payload: LocalChatRequest) async throws -> LocalChatResponse {
         try await request(path: "/v1/chat/local", method: "POST", body: payload)
     }
 
     func localChatV2(_ payload: LocalChatRequestV2) async throws -> ComposedChatResponseV2 {
         try await request(path: "/v2/chat/local", method: "POST", body: payload)
+    }
+
+    func localChatV2Stream(_ payload: LocalChatRequestV2) async throws -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        guard let url = URL(string: "/v2/chat/local/stream", relativeTo: baseURL) else {
+            throw APIError(message: "Invalid URL path: /v2/chat/local/stream")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(sessionToken, forHTTPHeaderField: "x-session-token")
+        
+        req.httpBody = try encoder.encode(payload)
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 300 // long timeout for SSE
+        
+        let (bytes, response) = try await urlSession.bytes(for: req)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError(message: "Invalid response")
+        }
+        guard (200 ..< 300).contains(http.statusCode) else {
+            throw APIError(message: "HTTP \(http.statusCode) stream error")
+        }
+        
+        return AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    for try await line in bytes.lines {
+                        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty else { continue }
+                        guard let data = trimmed.data(using: .utf8) else { continue }
+                        let event = try self.decoder.decode(ChatStreamEvent.self, from: data)
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
     }
 
     func deepAnalysis(_ payload: DeepAnalysisRequest) async throws -> DeepAnalysisResponse {
@@ -101,6 +187,28 @@ final class SidecarAPIClient {
         return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
     }
 
+    func getRoomRelevantSessionMemory(
+        roomID: String,
+        sessionID: String?,
+        roomScopeHash: String? = nil
+    ) async throws -> SessionMemoryResponse {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/rooms/\(roomID)/memory/session/relevant"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid room memory session URL")
+        }
+        var items: [URLQueryItem] = []
+        if let sessionID, !sessionID.isEmpty {
+            items.append(URLQueryItem(name: "session_id", value: sessionID))
+        }
+        if let roomScopeHash, !roomScopeHash.isEmpty {
+            items.append(URLQueryItem(name: "room_scope_hash", value: roomScopeHash))
+        }
+        components.queryItems = items.isEmpty ? nil : items
+        guard let url = components.url else {
+            throw APIError(message: "Invalid room memory session query URL")
+        }
+        return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
+    }
+
     func getRelevantWorkspaceMemory(workspaceID: String, intent: String?) async throws -> WorkspaceMemoryResponse {
         guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/memory/workspace/relevant"), resolvingAgainstBaseURL: true) else {
             throw APIError(message: "Invalid memory workspace URL")
@@ -112,6 +220,32 @@ final class SidecarAPIClient {
         components.queryItems = items
         guard let url = components.url else {
             throw APIError(message: "Invalid memory workspace query URL")
+        }
+        return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
+    }
+
+    func getRoomRelevantWorkspaceMemory(
+        roomID: String,
+        workspaceID: String?,
+        intent: String?,
+        roomScopeHash: String? = nil
+    ) async throws -> WorkspaceMemoryResponse {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/rooms/\(roomID)/memory/workspace/relevant"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid room memory workspace URL")
+        }
+        var items = [URLQueryItem]()
+        if let workspaceID, !workspaceID.isEmpty {
+            items.append(URLQueryItem(name: "workspace_id", value: workspaceID))
+        }
+        if let intent, !intent.isEmpty {
+            items.append(URLQueryItem(name: "intent", value: intent))
+        }
+        if let roomScopeHash, !roomScopeHash.isEmpty {
+            items.append(URLQueryItem(name: "room_scope_hash", value: roomScopeHash))
+        }
+        components.queryItems = items.isEmpty ? nil : items
+        guard let url = components.url else {
+            throw APIError(message: "Invalid room memory workspace query URL")
         }
         return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
     }
@@ -145,21 +279,116 @@ final class SidecarAPIClient {
         return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
     }
 
+    func getRoomRelevantEpisodicMemory(
+        roomID: String,
+        workspaceID: String?,
+        intent: String?,
+        relatedFileIDs: [String],
+        roomScopeHash: String? = nil
+    ) async throws -> EpisodicMemoryResponse {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/rooms/\(roomID)/memory/episodic/relevant"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid room memory episodic URL")
+        }
+        var items: [URLQueryItem] = []
+        if let workspaceID, !workspaceID.isEmpty {
+            items.append(URLQueryItem(name: "workspace_id", value: workspaceID))
+        }
+        if let intent, !intent.isEmpty {
+            items.append(URLQueryItem(name: "intent", value: intent))
+        }
+        if !relatedFileIDs.isEmpty {
+            items.append(URLQueryItem(name: "related_file_ids", value: relatedFileIDs.joined(separator: ",")))
+        }
+        if let roomScopeHash, !roomScopeHash.isEmpty {
+            items.append(URLQueryItem(name: "room_scope_hash", value: roomScopeHash))
+        }
+        components.queryItems = items.isEmpty ? nil : items
+        guard let url = components.url else {
+            throw APIError(message: "Invalid room memory episodic query URL")
+        }
+        return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
+    }
+
     func writeMemoryEvent(_ payload: MemoryEventRequest) async throws -> MemoryEventResponse {
         try await request(path: "/v1/memory/events", method: "POST", body: payload)
+    }
+
+    func writeRoomMemoryEvent(
+        roomID: String,
+        payload: MemoryEventRequest,
+        roomScopeHash: String? = nil
+    ) async throws -> MemoryEventResponse {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/rooms/\(roomID)/memory/events"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid room memory events URL")
+        }
+        if let roomScopeHash, !roomScopeHash.isEmpty {
+            components.queryItems = [URLQueryItem(name: "room_scope_hash", value: roomScopeHash)]
+        }
+        guard let url = components.url else {
+            throw APIError(message: "Invalid room memory events query URL")
+        }
+        return try await request(url: url, method: "POST", body: payload)
     }
 
     func clearMemory(_ payload: MemoryClearRequest) async throws -> MemoryClearResponse {
         try await request(path: "/v1/memory/clear", method: "POST", body: payload)
     }
 
+    func clearRoomMemory(
+        roomID: String,
+        _ payload: MemoryClearRequest,
+        roomScopeHash: String? = nil
+    ) async throws -> MemoryClearResponse {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/rooms/\(roomID)/memory/clear"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid room memory clear URL")
+        }
+        if let roomScopeHash, !roomScopeHash.isEmpty {
+            components.queryItems = [URLQueryItem(name: "room_scope_hash", value: roomScopeHash)]
+        }
+        guard let url = components.url else {
+            throw APIError(message: "Invalid room memory clear query URL")
+        }
+        return try await request(url: url, method: "POST", body: payload)
+    }
+
     func pinMemory(_ payload: MemoryPinRequest) async throws -> MemoryPinResponse {
         try await request(path: "/v1/memory/pin", method: "POST", body: payload)
     }
 
+    func pinRoomMemory(
+        roomID: String,
+        _ payload: MemoryPinRequest,
+        roomScopeHash: String? = nil
+    ) async throws -> MemoryPinResponse {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/rooms/\(roomID)/memory/pin"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid room memory pin URL")
+        }
+        if let roomScopeHash, !roomScopeHash.isEmpty {
+            components.queryItems = [URLQueryItem(name: "room_scope_hash", value: roomScopeHash)]
+        }
+        guard let url = components.url else {
+            throw APIError(message: "Invalid room memory pin query URL")
+        }
+        return try await request(url: url, method: "POST", body: payload)
+    }
+
     func unpinMemory(memoryID: String) async throws -> Bool {
-        let response: [String: Bool] = try await request(path: "/v1/memory/pin/\(memoryID)", method: "DELETE")
-        return response["removed"] ?? false
+        let response: [String: JSONValue] = try await request(path: "/v1/memory/pin/\(memoryID)", method: "DELETE")
+        return response["removed"]?.boolCoercedValue ?? false
+    }
+
+    func unpinRoomMemory(roomID: String, memoryID: String, roomScopeHash: String? = nil) async throws -> Bool {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/rooms/\(roomID)/memory/pin/\(memoryID)"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid room memory unpin URL")
+        }
+        if let roomScopeHash, !roomScopeHash.isEmpty {
+            components.queryItems = [URLQueryItem(name: "room_scope_hash", value: roomScopeHash)]
+        }
+        guard let url = components.url else {
+            throw APIError(message: "Invalid room memory unpin query URL")
+        }
+        let response: [String: JSONValue] = try await request(url: url, method: "DELETE", body: Optional<String>.none as String?)
+        return response["removed"]?.boolCoercedValue ?? false
     }
 
     func listPins(scope: String?, workspaceID: String?) async throws -> PinnedMemoryResponse {
@@ -176,6 +405,32 @@ final class SidecarAPIClient {
         components.queryItems = items.isEmpty ? nil : items
         guard let url = components.url else {
             throw APIError(message: "Invalid memory pins query URL")
+        }
+        return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
+    }
+
+    func listRoomPins(
+        roomID: String,
+        scope: String?,
+        workspaceID: String?,
+        roomScopeHash: String? = nil
+    ) async throws -> PinnedMemoryResponse {
+        guard var components = URLComponents(url: baseURL.appendingPathComponent("/v1/rooms/\(roomID)/memory/pins"), resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid room memory pins URL")
+        }
+        var items: [URLQueryItem] = []
+        if let scope, !scope.isEmpty {
+            items.append(URLQueryItem(name: "scope", value: scope))
+        }
+        if let workspaceID, !workspaceID.isEmpty {
+            items.append(URLQueryItem(name: "workspace_id", value: workspaceID))
+        }
+        if let roomScopeHash, !roomScopeHash.isEmpty {
+            items.append(URLQueryItem(name: "room_scope_hash", value: roomScopeHash))
+        }
+        components.queryItems = items.isEmpty ? nil : items
+        guard let url = components.url else {
+            throw APIError(message: "Invalid room memory pins query URL")
         }
         return try await request(url: url, method: "GET", body: Optional<String>.none as String?)
     }
@@ -248,6 +503,10 @@ final class SidecarAPIClient {
             body: ModelCatalogInstallRequest(model_id: modelID),
             timeout: 3600
         )
+    }
+
+    func getModelDownloadProgress() async throws -> DownloadProgressResponse {
+        try await request(path: "/v1/models/download/progress", method: "GET")
     }
 
     func activateCatalogModel(modelID: String) async throws -> ModelCatalogActivateResponse {

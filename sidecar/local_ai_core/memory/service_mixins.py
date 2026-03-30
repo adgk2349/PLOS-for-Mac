@@ -1,61 +1,33 @@
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
+import math
 import re
 import time
+import uuid
 from typing import Any, Callable, Literal
 
-from ..db import Database
 from ..models import (
-    MemoryClearResponse,
-    MemoryClearScope,
-    MemoryEventRequest,
-    MemoryEventResponse,
-    PinnedMemoryItem,
-    RelevantMemoryBundle,
-    UserPreferenceItem,
-    WorkspaceIdentity,
-    WorkspaceMemoryMode,
+    WebMemoryEntry,
 )
-from ..response_composer import ResponseComposer
+from ..composition.composer import ResponseComposer
+from .mixins.workspace_methods import MemoryServiceWorkspaceMethodsMixin
 
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(slots=True)
-class ResolvedMemoryPreferences:
-    response_length: str = "medium"
-    show_citations: bool = True
-    confirm_external_calls: bool = False
-    prefer_action_suggestions: bool = True
-    default_action_order: list[str] = None  # type: ignore[assignment]
-    default_mode: str | None = None
-    workspace_weights: dict[str, float] = None  # type: ignore[assignment]
-
-    def __post_init__(self):
-        if self.default_action_order is None:
-            self.default_action_order = []
-        if self.workspace_weights is None:
-            self.workspace_weights = {}
-
-
-def _episodic_disabled(mode: WorkspaceMemoryMode) -> bool:
-    """Return True when episodic/workspace memory should not be used."""
-    return mode in {WorkspaceMemoryMode.DISABLED, WorkspaceMemoryMode.PINNED_ONLY}
-
-
-ResolvedMemoryPreferences = None  # patched by memory_service.py
-_episodic_disabled = None  # patched by memory_service.py
-
-class MemoryServiceMethodsMixin:
+class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
+    _WEB_MEMORY_KEY = "web_memory_entry"
+    _WEB_MEMORY_KEEP_RECENT = 6
+    _WEB_MEMORY_VECTOR_LIMIT = 4
+    _WEB_MEMORY_VECTOR_PREFIX = "webmem"
     _SESSION_CONTEXT_KEYS = (
         "conversation_digest_v1",
         "last_conversational_context",
+        _WEB_MEMORY_KEY,
         "recent_query",
         "recent_event",
         "recent_file_ids",
@@ -63,14 +35,14 @@ class MemoryServiceMethodsMixin:
     )
     _SESSION_CONTEXT_CLEANUP_MARKER = "__session_context_cleanup_v2"
 
-    def get_relevant_session_memory(self, session_id: str) -> list:
+    def get_relevant_session_memory(self, *, session_id: str) -> list:
         settings = self._db.get_settings()
         if not settings.session_memory_enabled:
             return []
         return self._db.get_relevant_session_memory(session_id=session_id, limit=40)
 
     def get_last_conversational_context(self, session_id: str) -> dict[str, Any] | None:
-        for item in self.get_relevant_session_memory(session_id):
+        for item in self.get_relevant_session_memory(session_id=session_id):
             if item.key != "last_conversational_context":
                 continue
             payload = item.value_json
@@ -89,7 +61,7 @@ class MemoryServiceMethodsMixin:
                         output.append(item.strip())
         if output:
             return output[:8]
-        for item in self.get_relevant_session_memory(session_id):
+        for item in self.get_relevant_session_memory(session_id=session_id):
             if item.key != "recent_file_ids":
                 continue
             file_ids = item.value_json.get("file_ids")
@@ -103,7 +75,7 @@ class MemoryServiceMethodsMixin:
             value = context.get("selected_file")
             if isinstance(value, str) and value.strip():
                 return value.strip()
-        for item in self.get_relevant_session_memory(session_id):
+        for item in self.get_relevant_session_memory(session_id=session_id):
             if item.key != "recent_file_ids":
                 continue
             file_ids = item.value_json.get("file_ids")
@@ -126,6 +98,337 @@ class MemoryServiceMethodsMixin:
                 output.append(item.strip())
         return output[:8]
 
+    def write_web_memory_entry(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        answer_summary: str,
+        sources: list[dict[str, Any]] | None,
+        source_count: int,
+        confidence: float,
+        conversation_path: str,
+    ) -> WebMemoryEntry | None:
+        settings = self._db.get_settings()
+        if not settings.session_memory_enabled:
+            return None
+
+        clean_query = self._sanitize_digest_text(str(query or ""), max_chars=260)
+        clean_answer = self._sanitize_digest_text(str(answer_summary or ""), max_chars=500)
+        clean_sources = self._normalize_web_memory_sources(sources or [])
+        if not clean_sources or not clean_answer:
+            return None
+
+        entry_id = str(uuid.uuid4())
+        created_at = self._now_iso()
+        safe_confidence = max(0.0, min(1.0, float(confidence or 0.0)))
+        normalized_source_count = max(1, int(source_count or len(clean_sources)))
+        vector_memory_id = self._web_memory_vector_id(session_id=session_id, entry_id=entry_id)
+
+        entry_payload = {
+            "entry_id": entry_id,
+            "query": clean_query,
+            "answer_summary": clean_answer,
+            "sources": clean_sources[:4],
+            "source_count": normalized_source_count,
+            "confidence": safe_confidence,
+            "created_at": created_at,
+            "conversation_path": str(conversation_path or "").strip()[:80],
+            "vector_memory_id": vector_memory_id,
+        }
+        self._db.write_session_memory(
+            session_id=session_id,
+            key=self._WEB_MEMORY_KEY,
+            value_json=entry_payload,
+            ttl_hours=24,
+            keep_recent=40,
+        )
+        self._prune_web_memory_entries(session_id=session_id, keep_recent=self._WEB_MEMORY_KEEP_RECENT)
+        self._vectorize_web_memory_entry(session_id=session_id, payload=entry_payload)
+        try:
+            return WebMemoryEntry.model_validate(entry_payload)
+        except Exception:
+            return None
+
+    def get_recent_web_memory_entries(self, *, session_id: str, limit: int = 6) -> list[dict[str, Any]]:
+        max_limit = max(1, int(limit or self._WEB_MEMORY_KEEP_RECENT))
+        items = self.get_relevant_session_memory(session_id=session_id)
+        output: list[dict[str, Any]] = []
+        for item in items:
+            if item.key != self._WEB_MEMORY_KEY:
+                continue
+            normalized = self._normalize_web_memory_entry(item.value_json)
+            if not normalized:
+                continue
+            output.append(normalized)
+            if len(output) >= max_limit:
+                break
+        return output
+
+    def get_ranked_web_memory_entries(self, *, session_id: str, query: str, limit: int = 4) -> list[dict[str, Any]]:
+        if not str(query or "").strip():
+            return []
+
+        max_limit = max(1, int(limit or self._WEB_MEMORY_VECTOR_LIMIT))
+        recent = self.get_recent_web_memory_entries(session_id=session_id, limit=self._WEB_MEMORY_KEEP_RECENT)
+        if not recent:
+            return []
+
+        vector_scores = self._vector_scores_for_web_memory(
+            session_id=session_id,
+            query=str(query or ""),
+            limit=max(self._WEB_MEMORY_VECTOR_LIMIT, max_limit * 2),
+        )
+        has_vector_signal = bool(vector_scores)
+        candidate_map: dict[str, dict[str, Any]] = {}
+        for entry in recent:
+            vector_memory_id = str(entry.get("vector_memory_id") or "").strip()
+            if vector_memory_id:
+                candidate_map[vector_memory_id] = entry
+        if vector_scores:
+            for item in self.get_relevant_session_memory(session_id=session_id):
+                if item.key != self._WEB_MEMORY_KEY:
+                    continue
+                normalized = self._normalize_web_memory_entry(item.value_json)
+                if not normalized:
+                    continue
+                vector_memory_id = str(normalized.get("vector_memory_id") or "").strip()
+                if not vector_memory_id:
+                    continue
+                if vector_memory_id in vector_scores:
+                    candidate_map.setdefault(vector_memory_id, normalized)
+                if len(candidate_map) >= max(self._WEB_MEMORY_KEEP_RECENT + self._WEB_MEMORY_VECTOR_LIMIT, max_limit * 3):
+                    break
+        candidates = list(candidate_map.values()) if candidate_map else recent
+        now_ts = time.time()
+        ranked: list[dict[str, Any]] = []
+        for entry in candidates:
+            lexical = self._web_memory_lexical_score(query=str(query or ""), entry=entry)
+            vector = max(0.0, min(1.0, float(vector_scores.get(str(entry.get("vector_memory_id") or ""), 0.0))))
+            recency = self._web_memory_recency_score(created_at=str(entry.get("created_at") or ""), now_ts=now_ts)
+            prior_confidence = max(0.0, min(1.0, float(entry.get("confidence") or 0.0)))
+            if has_vector_signal:
+                rank_score = max(0.0, min(1.0, (0.45 * lexical) + (0.40 * vector) + (0.15 * recency)))
+            else:
+                # VectorDB unavailable or empty result set: keep KV-only reuse path alive.
+                rank_score = max(
+                    0.0,
+                    min(1.0, (0.55 * lexical) + (0.25 * recency) + (0.20 * prior_confidence)),
+                )
+            ranked.append(
+                {
+                    **entry,
+                    "lexical_score": lexical,
+                    "vector_score": vector,
+                    "recency_score": recency,
+                    "confidence": rank_score,
+                }
+            )
+        ranked.sort(key=lambda row: float(row.get("confidence") or 0.0), reverse=True)
+        return ranked[:max_limit]
+
+    def _prune_web_memory_entries(self, *, session_id: str, keep_recent: int) -> None:
+        target = max(1, int(keep_recent or self._WEB_MEMORY_KEEP_RECENT))
+        try:
+            rows = self._db.memory.get_session_memory(session_id, 200)
+        except Exception:
+            return
+        web_ids: list[str] = []
+        row_map: dict[str, Any] = {}
+        for row in rows:
+            try:
+                key = str(row["key"] or "").strip()
+            except Exception:
+                key = ""
+            if key != self._WEB_MEMORY_KEY:
+                continue
+            memory_id = str(row["id"] or "").strip()
+            if memory_id:
+                web_ids.append(memory_id)
+                row_map[memory_id] = row
+        if len(web_ids) <= target:
+            return
+        stale = web_ids[target:]
+        if not stale:
+            return
+        stale_vector_ids: list[str] = []
+        for stale_id in stale:
+            row = row_map.get(stale_id)
+            if row is None:
+                continue
+            payload = row["value_json"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            if not isinstance(payload, dict):
+                continue
+            vector_id = str(payload.get("vector_memory_id") or "").strip()
+            if vector_id:
+                stale_vector_ids.append(vector_id)
+        try:
+            self._db.memory.delete_session_memory_by_ids(stale)
+        except Exception:
+            return
+        if stale_vector_ids and self._vector_store:
+            try:
+                self._vector_store.delete_memories(stale_vector_ids)
+            except Exception:
+                return
+
+    def _normalize_web_memory_sources(self, sources: list[dict[str, Any]]) -> list[dict[str, str]]:
+        output: list[dict[str, str]] = []
+        for raw in sources[:6]:
+            if not isinstance(raw, dict):
+                continue
+            url = str(raw.get("url") or "").strip()[:500]
+            if not url:
+                continue
+            title = self._sanitize_digest_text(str(raw.get("title") or ""), max_chars=160)
+            snippet = self._sanitize_digest_text(str(raw.get("snippet") or ""), max_chars=280)
+            output.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet,
+                }
+            )
+        return output
+
+    def _normalize_web_memory_entry(self, payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        entry_id = str(payload.get("entry_id") or "").strip()
+        query = self._sanitize_digest_text(str(payload.get("query") or ""), max_chars=260)
+        answer = self._sanitize_digest_text(str(payload.get("answer_summary") or ""), max_chars=500)
+        sources = self._normalize_web_memory_sources(payload.get("sources") if isinstance(payload.get("sources"), list) else [])
+        if not entry_id or not answer or not sources:
+            return None
+        source_count = max(1, int(payload.get("source_count") or len(sources)))
+        confidence = max(0.0, min(1.0, float(payload.get("confidence") or 0.0)))
+        created_at = str(payload.get("created_at") or "").strip() or self._now_iso()
+        conversation_path = str(payload.get("conversation_path") or "").strip()[:80]
+        vector_memory_id = str(payload.get("vector_memory_id") or "").strip()
+        if not vector_memory_id:
+            vector_memory_id = self._web_memory_vector_id(session_id="session", entry_id=entry_id)
+        return {
+            "entry_id": entry_id,
+            "query": query,
+            "answer_summary": answer,
+            "sources": sources[:4],
+            "source_count": source_count,
+            "confidence": confidence,
+            "created_at": created_at,
+            "conversation_path": conversation_path,
+            "vector_memory_id": vector_memory_id,
+        }
+
+    @staticmethod
+    def _web_memory_vector_id(*, session_id: str, entry_id: str) -> str:
+        safe_session = re.sub(r"[^A-Za-z0-9:_-]+", "_", str(session_id or "session")).strip("_") or "session"
+        safe_entry = re.sub(r"[^A-Za-z0-9:_-]+", "_", str(entry_id or "")).strip("_") or str(uuid.uuid4()).replace("-", "")
+        return f"webmem:{safe_session[:40]}:{safe_entry[:64]}"
+
+    def _vectorize_web_memory_entry(self, *, session_id: str, payload: dict[str, Any]) -> None:
+        if not self._vector_store or not self._embedding_service:
+            return
+        snippets: list[str] = []
+        for source in payload.get("sources", [])[:4]:
+            if not isinstance(source, dict):
+                continue
+            title = str(source.get("title") or "").strip()
+            snippet = str(source.get("snippet") or "").strip()
+            if title:
+                snippets.append(title)
+            if snippet:
+                snippets.append(snippet)
+        text = "\n".join(
+            [
+                f"query: {str(payload.get('query') or '').strip()}",
+                f"summary: {str(payload.get('answer_summary') or '').strip()}",
+                f"sources: {' | '.join(snippets[:8])}",
+            ]
+        ).strip()
+        if len(text) < 16:
+            return
+        try:
+            vector = self._embedding_service.embed_query(text)
+            self._vector_store.upsert_memories(
+                [
+                    {
+                        "memory_id": str(payload.get("vector_memory_id") or ""),
+                        "session_id": session_id,
+                        "workspace_id": "",
+                        "text": text[:2000],
+                        "vector": vector,
+                        "created_at": str(payload.get("created_at") or self._now_iso()),
+                    }
+                ]
+            )
+        except Exception as exc:
+            logger.warning("Failed to vectorize web memory for session %s: %s", session_id, exc)
+
+    def _vector_scores_for_web_memory(self, *, session_id: str, query: str, limit: int) -> dict[str, float]:
+        if not self._vector_store or not self._embedding_service:
+            return {}
+        try:
+            query_vector = self._embedding_service.embed_query(query)
+            hits = self._vector_store.search_memories_hybrid(
+                query_text=query,
+                query_vector=query_vector,
+                session_id=session_id,
+                limit=max(1, int(limit or self._WEB_MEMORY_VECTOR_LIMIT)),
+            )
+        except Exception:
+            return {}
+
+        scores: dict[str, float] = {}
+        for hit in hits:
+            memory_id = str(getattr(hit, "chunk_id", "") or "").strip()
+            if not memory_id.startswith(f"{self._WEB_MEMORY_VECTOR_PREFIX}:"):
+                continue
+            hit_session = str(getattr(hit, "doc_id", "") or "").strip()
+            if hit_session and hit_session != session_id:
+                continue
+            scores[memory_id] = max(scores.get(memory_id, 0.0), float(getattr(hit, "score", 0.0) or 0.0))
+        if not scores:
+            return {}
+        peak = max(scores.values()) if scores else 0.0
+        if peak <= 0.0:
+            return {}
+        for key in list(scores.keys()):
+            scores[key] = max(0.0, min(1.0, float(scores[key]) / float(peak)))
+        return scores
+
+    def _web_memory_lexical_score(self, *, query: str, entry: dict[str, Any]) -> float:
+        query_terms = set(re.findall(r"[A-Za-z가-힣0-9_]{2,24}", str(query or "").lower()))
+        if not query_terms:
+            return 0.0
+        texts = [str(entry.get("query") or ""), str(entry.get("answer_summary") or "")]
+        for source in entry.get("sources", [])[:4]:
+            if not isinstance(source, dict):
+                continue
+            texts.append(str(source.get("title") or ""))
+            texts.append(str(source.get("snippet") or ""))
+        entry_terms = set(re.findall(r"[A-Za-z가-힣0-9_]{2,24}", " ".join(texts).lower()))
+        if not entry_terms:
+            return 0.0
+        inter = len(query_terms.intersection(entry_terms))
+        union = len(query_terms.union(entry_terms))
+        if union <= 0:
+            return 0.0
+        return max(0.0, min(1.0, inter / union))
+
+    @staticmethod
+    def _web_memory_recency_score(*, created_at: str, now_ts: float) -> float:
+        try:
+            ts = datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.25
+        elapsed_hours = max(0.0, (now_ts - ts) / 3600.0)
+        return max(0.05, min(1.0, math.exp(-elapsed_hours / 36.0)))
+
     def set_digest_model_refresher(
         self,
         refresher: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None,
@@ -133,7 +436,7 @@ class MemoryServiceMethodsMixin:
         self._digest_model_refresher = refresher
 
     def get_session_digest(self, session_id: str) -> dict[str, Any] | None:
-        for item in self.get_relevant_session_memory(session_id):
+        for item in self.get_relevant_session_memory(session_id=session_id):
             if item.key != self._DIGEST_KEY:
                 continue
             payload = item.value_json
@@ -266,13 +569,76 @@ class MemoryServiceMethodsMixin:
         )
 
     def _write_digest(self, *, session_id: str, payload: dict[str, Any]) -> None:
+        normalized = self._normalize_digest_payload(payload)
         self._db.write_session_memory(
             session_id=session_id,
             key=self._DIGEST_KEY,
-            value_json=self._normalize_digest_payload(payload),
+            value_json=normalized,
             ttl_hours=24,
             keep_recent=40,
         )
+        # Phase 18: Vectorize memory for long-term retrieval
+        self._vectorize_memory(session_id=session_id, payload=normalized)
+
+    def _vectorize_memory(self, *, session_id: str, payload: dict[str, Any]) -> None:
+        """Embed and store memory in LanceDB."""
+        if not self._vector_store or not self._embedding_service:
+            return
+
+        # Combine topics and facts for a rich semantic representation
+        topics = ", ".join(payload.get("active_topics", []))
+        facts = " ".join(payload.get("stable_facts", []))
+        text = f"Topics: {topics}. Facts: {facts}".strip()
+        
+        if not text or len(text) < 10:
+            return
+
+        try:
+            vector = self._embedding_service.embed_query(text)
+            try:
+                workspace_id = str(self.get_workspace_identity().workspace_id or "default")
+            except Exception:
+                workspace_id = "default"
+            
+            self._vector_store.upsert_memories([{
+                "memory_id": f"digest:{session_id}", # Overwrite existing digest for same session
+                "session_id": session_id,
+                "workspace_id": workspace_id,
+                "text": text,
+                "vector": vector,
+                "created_at": payload.get("updated_at", ""),
+            }])
+        except Exception as exc:
+            logger.warning("Failed to vectorize memory for session %s: %s", session_id, exc)
+
+    def get_relevant_vector_memory(
+        self, 
+        *, 
+        query: str, 
+        session_id: str | None = None,
+        workspace_id: str | None = None,
+        limit: int = 4
+    ) -> list[dict[str, Any]]:
+        """Perform semantic search across memories."""
+        if not self._vector_store or not self._embedding_service:
+            return []
+            
+        try:
+            query_vector = self._embedding_service.embed_query(query)
+            # Level 2: Use hybrid search for memories (Dense + Sparse)
+            hits = self._vector_store.search_memories_hybrid(
+                query_text=query,
+                query_vector=query_vector, 
+                session_id=session_id, 
+                workspace_id=workspace_id,
+                limit=limit
+            )
+            return [
+                {"text": hit.text, "session_id": hit.doc_id, "score": hit.score}
+                for hit in hits
+            ]
+        except Exception:
+            return []
 
     def _empty_digest(self) -> dict[str, Any]:
         return {
@@ -546,566 +912,3 @@ class MemoryServiceMethodsMixin:
         )
         lowered = value.lower()
         return any(cue in lowered for cue in cues)
-
-    @staticmethod
-    def _looks_like_open_loop(text: str) -> bool:
-        value = (text or "").strip()
-        if not value:
-            return False
-        lowered = value.lower()
-        if "?" in value:
-            return True
-        ask_cues = (
-            "어떻게",
-            "어디",
-            "무엇",
-            "뭐",
-            "언제",
-            "왜",
-            "될까",
-            "해줘",
-            "추천",
-            "how",
-            "what",
-            "where",
-            "when",
-            "why",
-            "can you",
-            "should i",
-        )
-        return any(cue in lowered for cue in ask_cues)
-
-    def _resolve_closed_loops(self, loops: list[str], assistant_text: str) -> list[str]:
-        if not loops:
-            return []
-        answer_tokens = set(self._extract_topics(assistant_text))
-        if not answer_tokens:
-            return loops
-        unresolved: list[str] = []
-        for loop in loops:
-            loop_tokens = set(self._extract_topics(loop))
-            if not loop_tokens:
-                unresolved.append(loop)
-                continue
-            overlap = len(loop_tokens.intersection(answer_tokens))
-            ratio = overlap / max(1, len(loop_tokens))
-            if ratio >= 0.45:
-                continue
-            unresolved.append(loop)
-        return unresolved
-
-    @staticmethod
-    def _now_iso() -> str:
-        return datetime.now(timezone.utc).isoformat()
-
-    # ------------------------------------------------------------------
-    # Workspace / episodic memory
-    # ------------------------------------------------------------------
-
-    def get_relevant_workspace_memory(self, workspace_id: str, intent: str | None) -> list:
-        settings = self._db.get_settings()
-        if not settings.workspace_memory_enabled:
-            return []
-        if _episodic_disabled(settings.workspace_memory_mode):
-            return []
-        return self._db.get_relevant_workspace_memory(workspace_id=workspace_id, intent=intent, limit=30)
-
-    def get_relevant_episodic_memory(self, workspace_id: str | None, intent: str | None, related_files: list[str]) -> list:
-        settings = self._db.get_settings()
-        if not settings.workspace_memory_enabled:
-            return []
-        if _episodic_disabled(settings.workspace_memory_mode):
-            return []
-        return self._db.get_relevant_episodic_memory(
-            workspace_id=workspace_id,
-            intent=intent,
-            related_file_ids=related_files,
-            limit=20,
-        )
-
-    def get_user_preferences(self) -> list[UserPreferenceItem]:
-        settings = self._db.get_settings()
-        items = self._db.get_user_preferences()
-        if settings.adaptive_personalization_enabled:
-            return items
-        return [item for item in items if item.source == "explicit"]
-
-    def get_relevant_memory_bundle(
-        self,
-        *,
-        session_id: str,
-        workspace_id: str,
-        intent: str,
-        related_file_ids: list[str],
-    ) -> RelevantMemoryBundle:
-        settings = self._db.get_settings()
-        session_items = self.get_relevant_session_memory(session_id)
-        pref_items = self.get_user_preferences()
-        pinned_items = self._db.list_pinned_memory(workspace_id=workspace_id, limit=30)
-
-        # Episodic and workspace memory are skipped together when disabled.
-        if _episodic_disabled(settings.workspace_memory_mode) or not settings.workspace_memory_enabled:
-            workspace_items: list = []
-            episodic_items: list = []
-        else:
-            workspace_items = self._db.get_relevant_workspace_memory(
-                workspace_id=workspace_id, intent=intent, limit=30
-            )
-            episodic_items = self._db.get_relevant_episodic_memory(
-                workspace_id=workspace_id,
-                intent=intent,
-                related_file_ids=related_file_ids,
-                limit=20,
-            )
-
-        identity = self.get_workspace_identity()
-        return RelevantMemoryBundle(
-            workspace_identity=identity,
-            session_items=session_items,
-            workspace_items=workspace_items,
-            preference_items=pref_items,
-            episodic_items=episodic_items,
-            pinned_items=pinned_items,
-        )
-
-    # ------------------------------------------------------------------
-    # Write memory event
-    # ------------------------------------------------------------------
-
-    def write_memory_event(self, event: MemoryEventRequest) -> MemoryEventResponse:
-        settings = self._db.get_settings()
-        event_id = ""
-
-        if settings.session_memory_enabled and event.session_id:
-            self._write_session_event_batch(event)
-
-        if (
-            settings.workspace_memory_enabled
-            and event.workspace_id
-            and settings.workspace_memory_mode != WorkspaceMemoryMode.DISABLED
-            and settings.workspace_memory_mode != WorkspaceMemoryMode.PINNED_ONLY
-        ):
-            # Explicit workspace rules from user-initiated setting changes.
-            if event.event_type.value == "manual_override":
-                if "default_mode" in event.metadata_json:
-                    self._db.upsert_workspace_memory(
-                        workspace_id=event.workspace_id,
-                        memory_type="default_mode",
-                        key="default_mode",
-                        value_json={"value": event.metadata_json.get("default_mode")},
-                        confidence=1.0,
-                        source="explicit",
-                    )
-                if "privacy_rule" in event.metadata_json:
-                    self._db.upsert_workspace_memory(
-                        workspace_id=event.workspace_id,
-                        memory_type="privacy_rule",
-                        key="privacy_rule",
-                        value_json={"value": event.metadata_json.get("privacy_rule")},
-                        confidence=1.0,
-                        source="explicit",
-                    )
-
-        episodic_enabled = not _episodic_disabled(settings.workspace_memory_mode)
-        if settings.workspace_memory_enabled and episodic_enabled:
-            record = self._db.insert_episodic_memory(
-                workspace_id=event.workspace_id,
-                event_type=event.event_type.value,
-                summary=event.summary,
-                related_file_ids=event.related_file_ids,
-                related_action_ids=event.related_action_ids,
-                metadata_json=event.metadata_json,
-                importance=event.importance,
-            )
-            event_id = record.id
-            if (
-                event.workspace_id
-                and settings.adaptive_personalization_enabled
-                and self._should_refresh_inferred(event.event_type)
-            ):
-                self._refresh_inferred_with_throttle(event.workspace_id, min_interval_seconds=30.0)
-
-        return MemoryEventResponse(event_id=event_id or "session-only", accepted=True)
-
-    def _write_session_event_batch(self, event: MemoryEventRequest) -> None:
-        """Write all session-level memory entries for one event in close succession."""
-        self._db.write_session_memory(
-            session_id=event.session_id,
-            key="recent_event",
-            value_json={
-                "event_type": event.event_type.value,
-                "summary": event.summary,
-                "metadata": event.metadata_json,
-            },
-            ttl_hours=24,
-            keep_recent=40,
-        )
-        if event.event_type.value == "query":
-            self._db.write_session_memory(
-                session_id=event.session_id,
-                key="recent_query",
-                value_json={
-                    "summary": event.summary,
-                    "mode": event.metadata_json.get("mode"),
-                    "workspace_id": event.workspace_id,
-                },
-                ttl_hours=24,
-                keep_recent=40,
-            )
-        if event.related_file_ids:
-            self._db.write_session_memory(
-                session_id=event.session_id,
-                key="recent_file_ids",
-                value_json={"file_ids": event.related_file_ids[:8]},
-                ttl_hours=24,
-                keep_recent=40,
-            )
-        if event.related_action_ids:
-            self._db.write_session_memory(
-                session_id=event.session_id,
-                key="recent_action",
-                value_json={"action_ids": event.related_action_ids[:4]},
-                ttl_hours=24,
-                keep_recent=40,
-            )
-
-    # kept for backward compat with callers that haven't migrated to snake_case
-    def writeMemoryEvent(self, event: MemoryEventRequest) -> MemoryEventResponse:  # noqa: N802
-        return self.write_memory_event(event)
-
-    # ------------------------------------------------------------------
-    # Clear / pin memory
-    # ------------------------------------------------------------------
-
-    def clear_memory(
-        self,
-        *,
-        scope: MemoryClearScope,
-        workspace_id: str | None = None,
-        session_id: str | None = None,
-    ) -> MemoryClearResponse:
-        count = self._db.clear_memory(scope=scope, workspace_id=workspace_id, session_id=session_id)
-        return MemoryClearResponse(cleared_rows=count, scope=scope)
-
-    def pin_memory(
-        self,
-        *,
-        memory_id: str | None,
-        scope: str,
-        workspace_id: str | None,
-        title: str | None,
-        content: str | None,
-    ) -> PinnedMemoryItem:
-        if memory_id:
-            item = self._db.create_pin_from_memory(memory_id=memory_id, scope=scope, workspace_id=workspace_id)
-            if item is not None:
-                return item
-
-        safe_title = (title or "Pinned Memory").strip() or "Pinned Memory"
-        safe_content = (content or "").strip()
-        if not safe_content:
-            safe_content = "No content"
-        return self._db.create_pinned_memory(
-            scope=scope,
-            workspace_id=workspace_id,
-            title=safe_title,
-            content=safe_content,
-        )
-
-    def unpin_memory(self, memory_id: str) -> bool:
-        return self._db.delete_pinned_memory(memory_id=memory_id)
-
-    def list_pinned_memory(self, *, scope: str | None = None, workspace_id: str | None = None) -> list[PinnedMemoryItem]:
-        return self._db.list_pinned_memory(scope=scope, workspace_id=workspace_id, limit=120)
-
-    # Backward-compat shims (camelCase aliases)
-    def clearMemory(self, *, scope: MemoryClearScope, workspace_id: str | None = None, session_id: str | None = None) -> MemoryClearResponse:  # noqa: N802
-        return self.clear_memory(scope=scope, workspace_id=workspace_id, session_id=session_id)
-
-    def pinMemory(self, *, memory_id: str | None, scope: str, workspace_id: str | None, title: str | None, content: str | None) -> PinnedMemoryItem:  # noqa: N802
-        return self.pin_memory(memory_id=memory_id, scope=scope, workspace_id=workspace_id, title=title, content=content)
-
-    def unpinMemory(self, memory_id: str) -> bool:  # noqa: N802
-        return self.unpin_memory(memory_id)
-
-    def listPinnedMemory(self, *, scope: str | None = None, workspace_id: str | None = None) -> list[PinnedMemoryItem]:  # noqa: N802
-        return self.list_pinned_memory(scope=scope, workspace_id=workspace_id)
-
-    def getRelevantSessionMemory(self, session_id: str):  # noqa: N802
-        return self.get_relevant_session_memory(session_id)
-
-    def getRelevantWorkspaceMemory(self, workspace_id: str, intent: str | None = None):  # noqa: N802
-        return self.get_relevant_workspace_memory(workspace_id, intent)
-
-    def getUserPreferences(self):  # noqa: N802
-        return self.get_user_preferences()
-
-    def getRelevantEpisodicMemory(self, workspace_id: str | None, intent: str | None, related_files: list[str]):  # noqa: N802
-        return self.get_relevant_episodic_memory(workspace_id, intent, related_files)
-
-    # ------------------------------------------------------------------
-    # Preference resolution
-    # ------------------------------------------------------------------
-
-    def resolve_preferences(self, bundle: RelevantMemoryBundle) -> ResolvedMemoryPreferences:
-        explicit_map: dict[str, UserPreferenceItem] = {}
-        inferred_map: dict[str, UserPreferenceItem] = {}
-        for item in bundle.preference_items:
-            if item.source == "explicit":
-                explicit_map[item.key] = item
-            else:
-                existing = inferred_map.get(item.key)
-                if existing is None or item.confidence > existing.confidence:
-                    inferred_map[item.key] = item
-
-        merged = dict(inferred_map)
-        merged.update(explicit_map)
-
-        resolved = ResolvedMemoryPreferences()
-        if "response_length" in merged:
-            resolved.response_length = str(merged["response_length"].value_json.get("value") or "medium")
-        if "show_citations" in merged:
-            resolved.show_citations = bool(merged["show_citations"].value_json.get("value", True))
-        if "confirm_external_calls" in merged:
-            resolved.confirm_external_calls = bool(merged["confirm_external_calls"].value_json.get("value", False))
-        if "prefer_action_suggestions" in merged:
-            resolved.prefer_action_suggestions = bool(merged["prefer_action_suggestions"].value_json.get("value", True))
-        action_order: list[str] = []
-        explicit_action = explicit_map.get("default_action_order")
-        inferred_action = inferred_map.get("default_action_order")
-        if explicit_action:
-            action_order = self._as_str_list(explicit_action.value_json.get("value"))
-        if not action_order:
-            action_order = self._action_order_from_pins(bundle.pinned_items)
-        if not action_order:
-            action_order = self._action_order_from_workspace(bundle.workspace_items)
-        if not action_order:
-            action_order = self._action_order_from_episodic(bundle.episodic_items)
-        if not action_order and inferred_action:
-            action_order = self._as_str_list(inferred_action.value_json.get("value"))
-        resolved.default_action_order = action_order
-
-        default_mode: str | None = None
-        explicit_mode = explicit_map.get("default_mode")
-        inferred_mode = inferred_map.get("default_mode")
-        if explicit_mode:
-            value = explicit_mode.value_json.get("value")
-            default_mode = str(value).strip() if value else None
-        if not default_mode:
-            default_mode = self._default_mode_from_pins(bundle.pinned_items)
-        if not default_mode:
-            default_mode = self._default_mode_from_workspace(bundle.workspace_items)
-        if not default_mode:
-            default_mode = self._default_mode_from_episodic(bundle.episodic_items)
-        if not default_mode and inferred_mode:
-            value = inferred_mode.value_json.get("value")
-            default_mode = str(value).strip() if value else None
-        resolved.default_mode = default_mode
-
-        weights: dict[str, float] = {}
-        for item in bundle.workspace_items:
-            if item.memory_type != "retrieval_weight":
-                continue
-            weight = item.value_json.get("weight")
-            try:
-                weights[item.key] = max(0.5, min(float(weight), 1.8))
-            except Exception:
-                continue
-        resolved.workspace_weights = weights
-        return resolved
-
-    # ------------------------------------------------------------------
-    # Inferred memory refresh
-    # ------------------------------------------------------------------
-
-    def _refresh_inferred_workspace_memory(self, workspace_id: str) -> None:
-        events = self._db.list_recent_episodic_memory(workspace_id=workspace_id, days=7, limit=240)
-        if not events:
-            return
-        # Single pass — count modes and actions together.
-        mode_counter: Counter[str] = Counter()
-        action_counter: Counter[str] = Counter()
-        for event in events:
-            mode = str(event.metadata_json.get("mode") or "").strip()
-            if mode:
-                mode_counter[mode] += 1
-            action = str(event.metadata_json.get("action_kind") or "").strip()
-            if action:
-                action_counter[action] += 1
-
-        if mode_counter:
-            mode, count = mode_counter.most_common(1)[0]
-            if count >= 3:
-                self._db.upsert_workspace_memory(
-                    workspace_id=workspace_id,
-                    memory_type="default_mode",
-                    key="default_mode",
-                    value_json={"value": mode},
-                    confidence=0.62,
-                    source="inferred",
-                )
-
-        if action_counter:
-            ordered = [item for item, count in action_counter.most_common(5) if count >= 3]
-            if ordered:
-                self._db.upsert_workspace_memory(
-                    workspace_id=workspace_id,
-                    memory_type="preferred_actions",
-                    key="preferred_actions",
-                    value_json={"actions": ordered},
-                    confidence=0.62,
-                    source="inferred",
-                )
-
-    def _refresh_inferred_user_preferences(self, workspace_id: str, events: list) -> None:
-        """Refresh user preference inferences from the *already-fetched* events list."""
-        action_counter: Counter[str] = Counter()
-        for event in events:
-            action = str(event.metadata_json.get("action_kind") or "").strip()
-            if action:
-                action_counter[action] += 1
-        ordered = [item for item, count in action_counter.most_common(5) if count >= 3]
-        if ordered:
-            self._db.upsert_user_preference(
-                key="default_action_order",
-                value_json={"value": ordered},
-                source="inferred",
-                confidence=0.62,
-            )
-
-    @staticmethod
-    def _as_str_list(value: Any) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        output: list[str] = []
-        for item in value:
-            raw = str(item).strip()
-            if raw:
-                output.append(raw)
-        return output
-
-    def _action_order_from_workspace(self, items: list) -> list[str]:
-        for item in items:
-            if item.memory_type != "preferred_actions":
-                continue
-            actions = self._as_str_list(item.value_json.get("actions"))
-            if actions:
-                return actions
-        return []
-
-    @staticmethod
-    def _default_mode_from_workspace(items: list) -> str | None:
-        for item in items:
-            if item.memory_type != "default_mode":
-                continue
-            value = str(item.value_json.get("value") or "").strip()
-            if value:
-                return value
-        return None
-
-    @staticmethod
-    def _default_mode_from_episodic(items: list) -> str | None:
-        counter: Counter[str] = Counter()
-        for item in items:
-            mode = str(item.metadata_json.get("mode") or "").strip()
-            if mode:
-                counter[mode] += 1
-        if not counter:
-            return None
-        return counter.most_common(1)[0][0]
-
-    def _action_order_from_episodic(self, items: list) -> list[str]:
-        counter: Counter[str] = Counter()
-        for item in items:
-            action = str(item.metadata_json.get("action_kind") or "").strip()
-            if action:
-                counter[action] += 1
-        return [action for action, count in counter.most_common(5) if count >= 2]
-
-    def _action_order_from_pins(self, pins: list[PinnedMemoryItem]) -> list[str]:
-        for pin in pins:
-            payload = self._parse_pin_content(pin.content)
-            for key in ("actions", "value"):
-                actions = self._as_str_list(payload.get(key))
-                if actions:
-                    return actions
-        return []
-
-    def _default_mode_from_pins(self, pins: list[PinnedMemoryItem]) -> str | None:
-        for pin in pins:
-            payload = self._parse_pin_content(pin.content)
-            for key in ("default_mode", "value", "mode"):
-                value = payload.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-        return None
-
-    @staticmethod
-    def _parse_pin_content(content: str) -> dict[str, Any]:
-        raw = (content or "").strip()
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-        return {}
-
-    @staticmethod
-    def _should_refresh_inferred(event_type) -> bool:
-        return event_type.value in {
-            "action_executed",
-            "manual_override",
-            "external_analysis",
-            "comparison",
-            "summary_created",
-            "draft_created",
-        }
-
-    def _refresh_inferred_with_throttle(self, workspace_id: str, *, min_interval_seconds: float) -> None:
-        now = time.monotonic()
-        last = self._last_inferred_refresh_by_workspace.get(workspace_id, 0.0)
-        if (now - last) < min_interval_seconds:
-            return
-        self._last_inferred_refresh_by_workspace[workspace_id] = now
-        # Fetch events once and share with both refresh methods to avoid duplicate DB queries.
-        events = self._db.list_recent_episodic_memory(workspace_id=workspace_id, days=7, limit=240)
-        if events:
-            # Reuse the count loop from _refresh_inferred_workspace_memory inline
-            mode_counter: Counter[str] = Counter()
-            action_counter: Counter[str] = Counter()
-            for event in events:
-                mode = str(event.metadata_json.get("mode") or "").strip()
-                if mode:
-                    mode_counter[mode] += 1
-                action = str(event.metadata_json.get("action_kind") or "").strip()
-                if action:
-                    action_counter[action] += 1
-
-            if mode_counter:
-                mode, count = mode_counter.most_common(1)[0]
-                if count >= 3:
-                    self._db.upsert_workspace_memory(
-                        workspace_id=workspace_id,
-                        memory_type="default_mode",
-                        key="default_mode",
-                        value_json={"value": mode},
-                        confidence=0.62,
-                        source="inferred",
-                    )
-            if action_counter:
-                ordered = [a for a, c in action_counter.most_common(5) if c >= 3]
-                if ordered:
-                    self._db.upsert_workspace_memory(
-                        workspace_id=workspace_id,
-                        memory_type="preferred_actions",
-                        key="preferred_actions",
-                        value_json={"actions": ordered},
-                        confidence=0.62,
-                        source="inferred",
-                    )
-
-            # User preferences — reuse same events list, no second DB query.
-            self._refresh_inferred_user_preferences(workspace_id, events)

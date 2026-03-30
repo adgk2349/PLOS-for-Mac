@@ -8,10 +8,42 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+def _patch_llama_cpp_unraisable_destructor() -> None:
+    """
+    Test-only guard for a known llama-cpp-python destructor issue:
+    partially initialized LlamaModel can raise AttributeError('sampler') in __del__.
+    """
+    try:
+        internals = importlib.import_module("llama_cpp._internals")
+        cls = getattr(internals, "LlamaModel", None)
+        if cls is None:
+            return
+        original = getattr(cls, "__del__", None)
+        if original is None or getattr(cls, "_plos_safe_del_patched", False):
+            return
+
+        def _safe_del(self):
+            try:
+                original(self)
+            except AttributeError as exc:
+                if "sampler" in str(exc):
+                    return
+                raise
+
+        cls.__del__ = _safe_del
+        setattr(cls, "_plos_safe_del_patched", True)
+    except Exception:
+        return
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    _patch_llama_cpp_unraisable_destructor()
+
 
 def _reload_sidecar_modules() -> None:
     for module_name in [
         "local_ai_core.config",
+        "local_ai_core.container",
         "local_ai_core.db",
         "local_ai_core.main",
     ]:

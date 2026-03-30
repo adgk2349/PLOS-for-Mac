@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS behavior_policies (
     id INTEGER PRIMARY KEY CHECK (id=1),
     preferred_mode TEXT,
     preferred_action_order TEXT NOT NULL DEFAULT '[]',
-    preferred_response_length TEXT NOT NULL DEFAULT 'medium',
+    preferred_response_length TEXT NOT NULL DEFAULT 'long',
     updated_at TEXT NOT NULL
 );
 
@@ -119,6 +119,21 @@ CREATE TABLE IF NOT EXISTS pinned_memory (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plugin_registry (
+    plugin_id TEXT PRIMARY KEY,
+    manifest_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'disabled',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS platform_adapters (
+    adapter_key TEXT PRIMARY KEY,
+    adapter_class TEXT NOT NULL,
+    health TEXT NOT NULL DEFAULT 'unknown',
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_session_memory_session_updated
 ON session_memory(session_id, updated_at DESC);
 
@@ -127,6 +142,9 @@ ON workspace_memory(workspace_id, memory_type, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_episodic_memory_ws_created
 ON episodic_memory(workspace_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_plugin_registry_enabled
+ON plugin_registry(enabled, updated_at DESC);
 """
 
 DOCUMENT_COLUMN_ADDITIONS = [

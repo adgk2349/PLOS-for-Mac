@@ -1,0 +1,13 @@
+from __future__ import annotations
+
+from typing import Protocol
+
+from ..models import LocalEngine
+
+
+class InferenceRuntimeController(Protocol):
+    def load(self, *, engine: LocalEngine, model_ref: str | None, profile: str = "recommended") -> tuple[bool, str]: ...
+    def unload(self, target: str | LocalEngine = "all") -> str: ...
+    def switch(self, *, engine: LocalEngine, model_ref: str | None, profile: str = "recommended") -> tuple[bool, str]: ...
+    def health(self) -> dict: ...
+
