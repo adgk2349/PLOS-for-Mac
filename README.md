@@ -1,17 +1,22 @@
 # PLOS for Mac
 
+[![Platform](https://img.shields.io/badge/platform-macOS%2014%2B-black)](#system-requirements)
+[![SwiftUI](https://img.shields.io/badge/UI-SwiftUI-orange)](#architecture)
+[![Sidecar](https://img.shields.io/badge/backend-FastAPI-009688)](#architecture)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 Local-first AI workspace for macOS.
 
 English | [한국어](README.ko.md) | [日本語](README.ja.md)
 
-## Overview
-PLOS combines a native SwiftUI desktop app with a local FastAPI sidecar to deliver private, citation-aware AI workflows on your machine.
+## Why PLOS
+PLOS combines a native SwiftUI app and a local Python sidecar to run chat, retrieval, and memory workflows primarily on-device.
 
-- Local-first chat and RAG over your workspace files
-- Hybrid routing (local by default, external provider only when policy allows)
+- Local-first chat and retrieval (RAG) over workspace files
+- Policy-gated external web/provider usage
 - Multi-layer memory (session/workspace/preferences/pinned)
-- Model catalog with hardware-aware recommendations
-- Conversational direct-first response policy for natural chat
+- Hardware-aware local model catalog
+- Conversational direct-first response policy
 
 ## Architecture
 ```mermaid
@@ -20,33 +25,31 @@ graph TD
   B --> C["Local Inference (MLX / llama.cpp)"]
   B --> D["SQLite (settings, memory, metadata)"]
   B --> E["LanceDB (vector index)"]
-  B --> F["File Parsers (txt/md/pdf/ocr)"]
-  B --> G["External Providers (policy-gated, optional)"]
+  B --> F["Parsers (txt/md/pdf/ocr)"]
+  B --> G["External Providers (optional, policy-gated)"]
 ```
 
 ## Repository Layout
-- `PLOS/`: SwiftUI macOS app
-- `sidecar/local_ai_core/`: FastAPI sidecar core
+- `PLOS/`: macOS app (SwiftUI)
+- `sidecar/local_ai_core/`: reasoning, inference, memory, API
 - `sidecar/tests/`: sidecar tests
-- `PLOSTests/`, `PLOSUITests/`: Swift test targets
+- `PLOSTests/`, `PLOSUITests/`: app tests
 
 ## System Requirements
 - Apple Silicon Mac recommended (M-series)
 - macOS 14+
 - Xcode 15+
 - Python 3.11+
-- Optional OCR dependencies:
-  - `tesseract`
-  - `poppler`
+- Optional OCR tools: `tesseract`, `poppler`
 
-## Installation
+## Quick Start
 ### 1) Clone
 ```bash
 git clone https://github.com/adgk2349/PLOS-for-Mac.git
 cd PLOS-for-Mac
 ```
 
-### 2) Prepare sidecar environment
+### 2) Sidecar environment
 ```bash
 cd sidecar
 python3 -m venv .venv
@@ -55,15 +58,15 @@ pip install -e .
 pip install -e '.[test]'
 ```
 
-### 3) (Optional) OCR tooling
+### 3) Optional OCR
 ```bash
 brew install tesseract poppler
 ```
 
 ### 4) Run app
 - Open `PLOS.xcodeproj` in Xcode
-- Run the `PLOS` target
-- The app starts/stops sidecar lifecycle automatically
+- Run `PLOS` target
+- Sidecar lifecycle is managed by the app
 
 ## Sidecar Standalone (Dev)
 ```bash
@@ -74,37 +77,26 @@ export LOCAL_AI_DATA_DIR="$(pwd)/data"
 uvicorn local_ai_core.main:create_app --factory --host 127.0.0.1 --port 8787
 ```
 
-## Model Setup
-Use **Settings > Model Catalog** in the app to install and activate models.
-
-Practical hardware tiers (current catalog policy):
-- 16GB: 7B/8B class, up to 12B~14B upper-bound attempts
+## Model Tiers (Practical)
+- 16GB: 7B/8B class, limited 12B/14B attempts
 - 64GB+: 20B/70B class
-- 256GB+: GPT-OSS 120B
+- 256GB+: GPT-OSS 120B class
 - 500GB+: Kimi 2.5 / Qwen 3.5 397B class
 
-## Memory Model
-PLOS separates memory by scope:
-- Session memory: isolated per chat room
-- Workspace memory: project-level context
-- Preference/pinned memory: user-controlled durable facts
-
-Session memory is designed to avoid cross-room leakage; global memory is explicit and user-managed.
-
 ## Testing
-### Sidecar tests
+### Sidecar
 ```bash
 cd sidecar
 source .venv/bin/activate
 pytest -q
 ```
 
-### Focused regression suites
+### Focused regressions
 ```bash
 pytest -q tests/test_v2_pipeline.py tests/test_local_inference_sanitize.py tests/test_memory_service_digest.py
 ```
 
-### Swift tests (Xcode CLI)
+### App tests
 ```bash
 xcodebuild \
   -project PLOS.xcodeproj \
@@ -113,20 +105,13 @@ xcodebuild \
   test
 ```
 
-## Performance Testing
-See [PERFORMANCE.md](PERFORMANCE.md) for repeatable benchmark scenarios:
-- chat latency
-- RAG retrieval quality checks
-- summary quality checks
-- model profile comparisons
-
-## Contributing
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Changelog
+## Docs
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [PERFORMANCE.md](PERFORMANCE.md)
+- [PLUGIN_RUNTIME_SPEC.md](PLUGIN_RUNTIME_SPEC.md)
 - [CHANGELOG.en.md](CHANGELOG.en.md)
 - [CHANGELOG.ko.md](CHANGELOG.ko.md)
 - [CHANGELOG.ja.md](CHANGELOG.ja.md)
 
 ## License
-This project is licensed under the MIT License. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
