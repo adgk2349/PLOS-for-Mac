@@ -386,6 +386,23 @@ class ResponseComposer(ComposerTraceHelpers, ComposerSummaryHelpers):
             candidate_mode=verification.candidate_mode,
             response_mode=response_mode,
         )
+        if bool(execution_result.structured_payload.get("offer_regenerate")):
+            regen_prompt = str(execution_result.structured_payload.get("regenerate_prompt") or query).strip() or str(query or "").strip()
+            regen_label = (
+                "응답 다시 생성"
+                if response_language == "ko"
+                else ("再生成" if response_language == "ja" else "Regenerate")
+            )
+            actions.insert(
+                0,
+                SuggestedAction(
+                    action_id="retry_generation",
+                    kind=SuggestedActionKind.ASK_FOLLOWUP,
+                    label=regen_label,
+                    execution_mode=ActionExecutionMode.PROMPT_INJECTION,
+                    payload={"prompt": regen_prompt, "source_query": query, "retry_generation": "1"},
+                ),
+            )
         if not prefer_action_suggestions:
             actions = []
         if len(actions) > 3:
@@ -785,4 +802,3 @@ class ResponseComposer(ComposerTraceHelpers, ComposerSummaryHelpers):
         if total <= 12:
             return "I found matching files:\n" + "\n".join(f"{idx}. {name}" for idx, name in enumerate(names, start=1))
         return f"I found matching files. The top result is {preview[0]}, with {total} strong candidates.\nFiles: {', '.join(full_list)}{suffix}"
-

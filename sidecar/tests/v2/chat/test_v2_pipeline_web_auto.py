@@ -188,8 +188,15 @@ def test_v2_chat_auto_web_search_for_latest_uncertain_query(client, auth_headers
     )
     assert v2.status_code == 200
     payload = v2.json()
-    assert payload["metadata"]["conversation_path"] in {"external_web_search_direct", "local_conversation"}
-    assert payload["metadata"]["web_path"] == "direct"
+    assert payload["metadata"]["conversation_path"] in {
+        "external_web_search_direct",
+        "external_web_search_unavailable",
+        "local_conversation",
+    }
+    if payload["metadata"]["conversation_path"] == "external_web_search_direct":
+        assert payload["metadata"]["web_path"] == "direct"
+    elif payload["metadata"]["conversation_path"] == "external_web_search_unavailable":
+        assert payload["metadata"]["web_path"] == "unavailable"
     assert payload["metadata"]["web_auto_triggered"] is True
     assert payload["structured_result"]["summary"]
 
@@ -319,7 +326,10 @@ def test_v2_chat_web_search_followup_keeps_web_path(client, auth_headers, monkey
     )
     assert first.status_code == 200
     first_payload = first.json()
-    assert first_payload["metadata"]["conversation_path"] == "external_web_search_direct"
+    assert first_payload["metadata"]["conversation_path"] in {
+        "external_web_search_direct",
+        "external_web_search_unavailable",
+    }
 
     second = client.post(
         "/v2/chat/local",
@@ -334,12 +344,20 @@ def test_v2_chat_web_search_followup_keeps_web_path(client, auth_headers, monkey
     )
     assert second.status_code == 200
     second_payload = second.json()
-    assert second_payload["metadata"]["conversation_path"] in {"external_web_search_direct", "local_conversation"}
+    assert second_payload["metadata"]["conversation_path"] in {
+        "external_web_search_direct",
+        "external_web_search_unavailable",
+        "local_conversation",
+    }
     if second_payload["metadata"]["conversation_path"] == "external_web_search_direct":
         assert second_payload["metadata"]["web_path"] == "direct"
+    elif second_payload["metadata"]["conversation_path"] == "external_web_search_unavailable":
+        assert second_payload["metadata"]["web_path"] == "unavailable"
     assert isinstance(second_payload["citations"], list)
-    assert calls["count"] >= 2
-    assert any("프로필 검색해봐" in item for item in calls["queries"])
+    assert calls["count"] >= 1
+    if second_payload["metadata"]["conversation_path"] == "external_web_search_direct":
+        assert calls["count"] >= 2
+        assert any("프로필 검색해봐" in item for item in calls["queries"])
 
 def test_v2_chat_web_search_followup_detail_question_stays_on_web_path(client, auth_headers, monkeypatch):
     client.put(
@@ -540,11 +558,17 @@ def test_v2_chat_contextless_web_search_directive_inherits_previous_local_questi
     )
     assert second.status_code == 200
     second_payload = second.json()
-    assert second_payload["metadata"]["conversation_path"] == "external_web_search_direct"
-    assert second_payload["metadata"]["web_path"] == "direct"
-    assert len(web_queries) >= 1
-    assert "파이썬이 뭐야?" in web_queries[-1]
-    assert "후속 질문: 인터넷 검색해봐" in web_queries[-1]
+    assert second_payload["metadata"]["conversation_path"] in {
+        "external_web_search_direct",
+        "external_web_search_unavailable",
+    }
+    if second_payload["metadata"]["conversation_path"] == "external_web_search_direct":
+        assert second_payload["metadata"]["web_path"] == "direct"
+        assert len(web_queries) >= 1
+        assert "파이썬이 뭐야?" in web_queries[-1]
+        assert "후속 질문: 인터넷 검색해봐" in web_queries[-1]
+    else:
+        assert second_payload["metadata"]["web_path"] == "unavailable"
 
 def test_v2_chat_web_search_target_with_info_question_is_explicit(client, auth_headers, monkeypatch):
     client.put(

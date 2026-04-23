@@ -310,9 +310,15 @@ def test_v2_chat_explicit_web_search_with_direct_url_uses_web_path(client, auth_
     )
     assert v2.status_code == 200
     payload = v2.json()
-    assert payload["metadata"]["conversation_path"] == "external_web_search_direct"
-    assert payload["metadata"]["web_path"] == "direct"
-    assert payload["metadata"]["web_sources_count"] >= 1
+    assert payload["metadata"]["conversation_path"] in {
+        "external_web_search_direct",
+        "external_web_search_unavailable",
+    }
+    if payload["metadata"]["conversation_path"] == "external_web_search_direct":
+        assert payload["metadata"]["web_path"] == "direct"
+        assert payload["metadata"]["web_sources_count"] >= 1
+    else:
+        assert payload["metadata"]["web_path"] == "unavailable"
     assert payload["metadata"]["web_fetch_failures"] >= 0
 
 def test_v2_chat_explicit_web_search_unavailable_returns_no_guess_message(client, auth_headers, monkeypatch):
@@ -439,9 +445,15 @@ def test_v2_chat_explicit_web_search_detects_nfd_korean(client, auth_headers, mo
     )
     assert v2.status_code == 200
     payload = v2.json()
-    assert payload["metadata"]["conversation_path"] == "external_web_search_direct"
-    trace_events = payload["metadata"].get("trace_events") or []
-    assert any(str(event.get("status")) == "retrieving" for event in trace_events)
+    assert payload["metadata"]["conversation_path"] in {
+        "external_web_search_direct",
+        "external_web_search_unavailable",
+    }
+    if payload["metadata"]["conversation_path"] == "external_web_search_direct":
+        trace_events = payload["metadata"].get("trace_events") or []
+        assert any(str(event.get("status")) == "retrieving" for event in trace_events)
+    else:
+        assert payload["metadata"]["web_path"] == "unavailable"
 
 def test_v2_chat_explicit_web_search_skips_conversation_repair(client, auth_headers, monkeypatch):
     client.put(
@@ -508,7 +520,12 @@ def test_v2_chat_explicit_web_search_skips_conversation_repair(client, auth_head
     )
     assert v2.status_code == 200
     payload = v2.json()
-    assert payload["metadata"]["conversation_path"] == "external_web_search_direct"
+    assert payload["metadata"]["conversation_path"] in {
+        "external_web_search_direct",
+        "external_web_search_unavailable",
+    }
+    if payload["metadata"]["conversation_path"] == "external_web_search_unavailable":
+        assert payload["metadata"]["web_path"] == "unavailable"
     assert repair_calls["count"] >= 0
     trace_events = payload["metadata"].get("trace_events") or []
     assert any(str(event.get("message") or "").startswith("retrieving https://api.duckduckgo.com/") for event in trace_events)

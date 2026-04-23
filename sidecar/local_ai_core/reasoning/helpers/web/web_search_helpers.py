@@ -146,6 +146,8 @@ class WebSearchHelpers:
         lowered = utils._normalized_match_text(query)
         if not lowered:
             return False
+        if utils._contains_explicit_local_only_constraint(lowered):
+            return False
         if utils._is_context_carryover_web_search_request(query=lowered, last_context=last_context):
             return True
         path = str(last_context.get("conversation_path") or "").strip().lower()

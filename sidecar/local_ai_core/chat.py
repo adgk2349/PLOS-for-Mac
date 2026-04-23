@@ -68,9 +68,11 @@ class RoomRoutingService:
 
 class ChatExecutionService:
     def __init__(self) -> None:
-        self._route_timeout_seconds = float(os.getenv("LOCAL_AI_ROUTE_TIMEOUT_SECONDS", "75"))
+        self._route_timeout_seconds = float(os.getenv("LOCAL_AI_ROUTE_TIMEOUT_SECONDS", "240"))
 
     def execute(self, *, target_chat: "ChatService", req: LocalChatRequestV2):
+        if self._route_timeout_seconds <= 0:
+            return target_chat._pipeline.run(req)
         return asyncio.wait_for(
             target_chat._pipeline.run(req),
             timeout=max(1.0, self._route_timeout_seconds),
