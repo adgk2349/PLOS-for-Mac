@@ -14,6 +14,19 @@ if TYPE_CHECKING:
 
 # Component: result_sanitizer.py
 class ResultSanitizer(BaseDelegate):
+    @staticmethod
+    def _collapse_punctuation_loops(text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        # Collapse runaway comma sequences like ",,,,,,," into a single comma.
+        value = re.sub(r"(?:,\s*){3,}", ", ", value)
+        # Normalize repeated terminal punctuation.
+        value = re.sub(r"([.!?])(?:\s*\1){2,}", r"\1", value)
+        # If content ends with a dangling comma, finish as a sentence for UX.
+        value = re.sub(r",\s*$", ".", value)
+        value = re.sub(r"\s{2,}", " ", value).strip()
+        return value
 
     @staticmethod
     def _normalize_korean_leading_address(text: str) -> str:
@@ -386,6 +399,7 @@ class ResultSanitizer(BaseDelegate):
             return text
         text = re.sub(r"\.\s*입니다\.$", ".", text)
         text = re.sub(r"\s{2,}", " ", text).strip()
+        text = self._collapse_punctuation_loops(text)
         text = re.sub(r"(?im)^\s*(?:최종\s*답변|final\s*answer)\s*[:：]\s*", "", text).strip()
         text = re.sub(r"(?i)\bokay,\s*let\s*me\s*process\s*this\.?\s*", "", text).strip()
         text = re.sub(r"(?i)\bthat'?s\s*straightforward\.?\s*", "", text).strip()
@@ -404,6 +418,7 @@ class ResultSanitizer(BaseDelegate):
         text = re.sub(r"최대한\s*짧고\s*명확하게\s*답하세요\.?\s*", "", text).strip()
         text = self._dedupe_conversation_sentences(text)
         text = self._limit_question_sentences(text, max_questions=1)
+        text = self._collapse_punctuation_loops(text)
         if not text:
             return ""
 

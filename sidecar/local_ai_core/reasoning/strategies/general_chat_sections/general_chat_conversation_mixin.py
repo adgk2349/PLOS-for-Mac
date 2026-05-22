@@ -193,8 +193,8 @@ class GeneralChatConversationMixin:
         # Inject conversation history from session_digest into MessageState.
         # L2: rolling_summary (compressed older turns) → injected as system message first.
         # L1: recent verbatim turns → injected as user/assistant messages.
-        # Default: keep last 8 verbatim turns (= 16 messages). Tunable via env var.
-        _max_history_turns = int(str(os.getenv("LOCAL_AI_HISTORY_TURNS", "1")).strip() or "1")
+        # Default: keep last 4 turn-pairs (= 8 messages). Tunable via env var.
+        _max_history_turns = int(str(os.getenv("LOCAL_AI_HISTORY_TURNS", "4")).strip() or "4")
         dangling_user_text = ""
         try:
             digest_obj = getattr(context, "session_digest_payload", None)
@@ -209,11 +209,11 @@ class GeneralChatConversationMixin:
                 else:
                     digest_obj = raw_digest or {}
             if isinstance(digest_obj, dict):
-                # L2: rolling_summary as a compact system message (compressed older turns)
-                # Keep model output natural: avoid injecting compressed summary text
-                # that can cause stale recap openings on topic-shift turns.
                 rolling_summary = str(digest_obj.get("rolling_summary") or "").strip()
-                _ = rolling_summary
+                if rolling_summary:
+                    compact_summary = re.sub(r"\s+", " ", rolling_summary).strip()
+                    if compact_summary:
+                        state.add_system(f"Previous conversation summary: {compact_summary[:420]}")
 
                 # L1: verbatim recent turns
                 raw_turns = digest_obj.get("recent_turns") or []
