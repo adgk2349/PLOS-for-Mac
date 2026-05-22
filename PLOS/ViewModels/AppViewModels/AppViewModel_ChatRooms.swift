@@ -152,9 +152,11 @@ extension AppViewModel {
 
 
     func selectChatRoom(_ roomID: String) {
+        flushStreamingRoomState(updateTimestamp: true, reorder: true, persist: true)
         guard let room = chatRooms.first(where: { $0.id == roomID }) else {
             return
         }
+        selectedMainPanel = .chat
         selectedChatRoomID = room.id
         chatMessages = room.messages
         citations = room.citations
@@ -301,22 +303,59 @@ extension AppViewModel {
     }
 
     @discardableResult
-    func mutateChatMessage(id: UUID, mutate: (inout ChatMessage) -> Void) -> Bool {
+    func mutateChatMessage(
+        id: UUID,
+        shouldSyncActiveRoom: Bool = true,
+        shouldUpdateTimestamp: Bool = true,
+        shouldAutoRetitle: Bool = true,
+        shouldReorder: Bool = true,
+        shouldPersist: Bool = true,
+        mutate: (inout ChatMessage) -> Void
+    ) -> Bool {
         guard let index = chatMessages.firstIndex(where: { $0.id == id }) else {
             return false
         }
         mutate(&chatMessages[index])
-        syncActiveRoom(messages: chatMessages)
+        if shouldSyncActiveRoom {
+            syncActiveRoom(
+                messages: chatMessages,
+                shouldUpdateTimestamp: shouldUpdateTimestamp,
+                shouldAutoRetitle: shouldAutoRetitle,
+                shouldReorder: shouldReorder,
+                shouldPersist: shouldPersist
+            )
+        }
         return true
     }
 
     @discardableResult
     func upsertStreamingLocalMessage(messageID: UUID?, delta: String, timestamp: Date = Date()) -> UUID {
-        if let existingID = messageID, mutateChatMessage(id: existingID, mutate: { message in
-            let original = message.text ?? ""
-            message.text = (original + delta).precomposedStringWithCanonicalMapping
-            message.isStreaming = true
-        }) {
+        if
+            let existingID = messageID,
+            let lastIndex = chatMessages.indices.last,
+            chatMessages[lastIndex].id == existingID
+        {
+            appendStreamingDelta(delta, to: &chatMessages[lastIndex])
+            objectWillChange.send()
+            markStreamingRoomDirty()
+            return existingID
+        }
+        if
+            let existingID = messageID,
+            mutateChatMessage(
+                id: existingID,
+                shouldSyncActiveRoom: false,
+                shouldUpdateTimestamp: false,
+                shouldAutoRetitle: false,
+                shouldReorder: false,
+                shouldPersist: false,
+                mutate: { message in
+                    appendStreamingDelta(delta, to: &message)
+                }
+            )
+        {
+            objectWillChange.send()
+            markStreamingRoomDirty()
             return existingID
         }
         var message = ChatMessage(source: .local, text: delta, timestamp: timestamp)
@@ -332,10 +371,11 @@ extension AppViewModel {
         finalText: String?
     ) -> UUID? {
         guard let messageID else { return nil }
-        let updated = mutateChatMessage(id: messageID) { message in
+        let updated = mutateChatMessage(id: messageID, shouldSyncActiveRoom: false) { message in
             if let response {
                 var merged = ChatMessage(id: message.id, localV2: response, timestamp: message.timestamp)
-                if let finalText, !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let isDegraded = response.used_fallback ?? false
+                if let finalText, !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !isDegraded {
                     merged.text = finalText.precomposedStringWithCanonicalMapping
                     merged.lead = nil
                     merged.resultSummary = nil
@@ -349,6 +389,10 @@ extension AppViewModel {
                 message.isStreaming = false
             }
         }
+        if updated {
+            markStreamingRoomDirty()
+            flushStreamingRoomState(updateTimestamp: true, reorder: true, persist: true)
+        }
         return updated ? messageID : nil
     }
 
@@ -356,7 +400,11 @@ extension AppViewModel {
     func syncActiveRoom(
         messages: [ChatMessage]? = nil,
         citations: [Citation]? = nil,
-        latestQueryForDeepAnalysis: String? = nil
+        latestQueryForDeepAnalysis: String? = nil,
+        shouldUpdateTimestamp: Bool = true,
+        shouldAutoRetitle: Bool = true,
+        shouldReorder: Bool = true,
+        shouldPersist: Bool = true
     ) {
         guard let index = activeRoomIndex else {
             return
@@ -370,20 +418,68 @@ extension AppViewModel {
         if let latestQueryForDeepAnalysis {
             chatRooms[index].latestQueryForDeepAnalysis = latestQueryForDeepAnalysis
         }
-        chatRooms[index].updatedAt = Date()
-        if chatRoomService.shouldAutoRetitle(chatRooms[index].title) {
+        if shouldUpdateTimestamp {
+            chatRooms[index].updatedAt = Date()
+        }
+        if shouldAutoRetitle, chatRoomService.shouldAutoRetitle(chatRooms[index].title) {
             let generated = summarizeChatRoomTitle(from: chatRooms[index].messages)
             if generated != "새 채팅" {
                 chatRooms[index].title = generated
             }
         }
-        // Keep newest rooms at top like GPT-style history list.
         let activeID = chatRooms[index].id
-        chatRooms.sort { $0.updatedAt > $1.updatedAt }
+        if shouldReorder {
+            // Keep newest rooms at top like GPT-style history list.
+            chatRooms.sort { $0.updatedAt > $1.updatedAt }
+        }
         if selectedChatRoomID != activeID {
             selectedChatRoomID = activeID
         }
-        persistChatRooms()
+        if shouldPersist {
+            persistChatRooms()
+        }
+    }
+
+    private func appendStreamingDelta(_ delta: String, to message: inout ChatMessage) {
+        guard !delta.isEmpty else { return }
+        if message.text == nil {
+            message.text = delta
+        } else {
+            message.text?.append(delta)
+        }
+        message.isStreaming = true
+    }
+
+    func markStreamingRoomDirty() {
+        let roomID = activeConversationID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !roomID.isEmpty else { return }
+        if streamingDirtyRoomID == nil {
+            streamingDirtyRoomID = roomID
+        }
+        guard streamingDirtyRoomID == roomID else { return }
+        isStreamingRoomStateDirty = true
+    }
+
+    func flushStreamingRoomState(
+        updateTimestamp: Bool = true,
+        reorder: Bool = true,
+        persist: Bool = true
+    ) {
+        guard isStreamingRoomStateDirty else { return }
+        defer {
+            isStreamingRoomStateDirty = false
+            streamingDirtyRoomID = nil
+        }
+        let roomID = streamingDirtyRoomID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !roomID.isEmpty else { return }
+        guard roomID == activeConversationID else { return }
+        syncActiveRoom(
+            messages: chatMessages,
+            shouldUpdateTimestamp: updateTimestamp,
+            shouldAutoRetitle: false,
+            shouldReorder: reorder,
+            shouldPersist: persist
+        )
     }
 
     func workspaceScopeForRoom(_ roomID: String?) -> (includedPaths: [String], excludedPaths: [String]) {
@@ -660,6 +756,8 @@ extension AppViewModel {
         activeGeneratingMessageID = nil
         liveThinkingTraceEvents = []
         isGeneratingChatResponse = false
+        isStreamingRoomStateDirty = false
+        streamingDirtyRoomID = nil
     }
 
     private func syncRoomIndexPolling(for roomID: String, roomState: String) {

@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import threading
 import gc
+import re
 from datetime import datetime, timezone
 from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING
@@ -78,6 +79,9 @@ class LocalInferenceEngine:
             "local_ai_stream_token_callback",
             default=None,
         )
+        # Thread-safe fallback callback slot for cross-thread streaming when ContextVar
+        # propagation is lost through offload boundaries.
+        self._stream_token_callback_shared = None
 
     def __getattr__(self, name):
         """Routes method calls to the appropriate modular component."""
@@ -241,14 +245,26 @@ class LocalInferenceEngine:
             "load_failures": dict(self._load_failures),
         }
 
-    def set_stream_token_callback(self, callback) -> Token:
-        return self._stream_token_callback_var.set(callback)
+    def set_stream_token_callback(self, callback) -> Token | tuple[Token, object | None]:
+        token = self._stream_token_callback_var.set(callback)
+        prev_shared = self._stream_token_callback_shared
+        self._stream_token_callback_shared = callback
+        return (token, prev_shared)
 
-    def reset_stream_token_callback(self, token: Token) -> None:
+    def reset_stream_token_callback(self, token: Token | tuple[Token, object | None]) -> None:
+        if isinstance(token, tuple) and len(token) == 2:
+            ctx_token, prev_shared = token
+            self._stream_token_callback_var.reset(ctx_token)
+            self._stream_token_callback_shared = prev_shared
+            return
         self._stream_token_callback_var.reset(token)
+        self._stream_token_callback_shared = None
 
     def _current_stream_token_callback(self):
-        return self._stream_token_callback_var.get()
+        cb = self._stream_token_callback_var.get()
+        if cb is not None:
+            return cb
+        return self._stream_token_callback_shared
 
     def _is_streaming_active(self) -> bool:
         return self._current_stream_token_callback() is not None
@@ -318,6 +334,9 @@ class LocalInferenceEngine:
         normalized_mlx = self._normalize_model_reference(mlx_model_path)
         normalized_llama = self._normalize_model_reference(llama_model_path)
         routing_notes: list[str] = []
+        disable_autoswitch = str(os.getenv("LOCAL_AI_DISABLE_ENGINE_AUTOSWITCH", "0") or "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
 
         if normalized_llama and not self._looks_llama_model_reference(normalized_llama):
             if self._looks_pathlike_reference(normalized_llama):
@@ -339,7 +358,7 @@ class LocalInferenceEngine:
             routing_notes.append("copied_gguf_from_mlx_path")
 
         # Auto-discover model refs when settings paths are empty.
-        if not normalized_llama:
+        if not normalized_llama and not (disable_autoswitch and engine == LocalEngine.MLX):
             env_llama = self._normalize_model_reference(os.getenv("LOCAL_AI_MODEL_LLAMA"))
             if env_llama:
                 normalized_llama = env_llama
@@ -349,7 +368,7 @@ class LocalInferenceEngine:
                 if discovered_llama:
                     normalized_llama = discovered_llama
                     routing_notes.append("autodetect:llama_from_downloads")
-        if not normalized_mlx:
+        if not normalized_mlx and not (disable_autoswitch and engine == LocalEngine.LLAMA_CPP):
             env_mlx = (
                 self._normalize_model_reference(os.getenv("LOCAL_AI_MODEL_RECOMMENDED"))
                 or self._normalize_model_reference(os.getenv("LOCAL_AI_MODEL_FAST"))
@@ -372,6 +391,17 @@ class LocalInferenceEngine:
         effective_engine = engine
         mlx_usable = self._looks_mlx_model_reference(normalized_mlx)
         llama_usable = self._looks_llama_model_reference(normalized_llama)
+
+        if disable_autoswitch:
+            if engine == LocalEngine.MLX:
+                routing_notes.append("engine_strict=mlx")
+                if not mlx_usable:
+                    routing_notes.append("mlx_unavailable_strict")
+            else:
+                routing_notes.append("engine_strict=llama")
+                if not llama_usable:
+                    routing_notes.append("llama_unavailable_strict")
+            return effective_engine, normalized_mlx, normalized_llama, ";".join(routing_notes)
 
         if engine == LocalEngine.MLX:
             if normalized_mlx and self._looks_llama_model_reference(normalized_mlx):
@@ -459,6 +489,7 @@ class LocalInferenceEngine:
         max_tokens: int | None = None,
         session_summary: str | None = None,
         allow_static_fallback: bool = True,
+        message_state: list[dict[str, str]] | None = None,
     ) -> InferenceResult:
         guard_ok, guard_detail = self._memory_guard_check()
         if not guard_ok:
@@ -493,16 +524,18 @@ class LocalInferenceEngine:
             llama_model_path=llama_model_path,
             max_tokens=token_budget,
             allow_repair_fallbacks=allow_static_fallback,
+            message_state=message_state,
         )
         if cand.answer:
             self._touch_resident(primary)
+            clean_answer = self._strip_leading_noise_prefix(cand.answer)
             detail = f"conversational_primary={primary.value}"
             if routing_detail:
                 detail = f"{detail}; route={routing_detail}"
             detail = f"{detail}; {guard_detail}; {residency_detail}"
             if cand.quality_repair_reason:
                 detail = f"{detail}; quality_issues={cand.quality_repair_reason}"
-            return InferenceResult(answer=cand.answer, engine_used=primary, detail=detail)
+            return InferenceResult(answer=clean_answer, engine_used=primary, detail=detail)
 
         primary_error = self._last_engine_error.get(primary, f"{primary.value} engine failed")
         detail_parts = [
@@ -517,7 +550,10 @@ class LocalInferenceEngine:
         if cand.leak_blocked:
             detail_parts.append("leak_blocked=1")
 
-        if allow_static_fallback:
+        disable_template_fallbacks = str(
+            os.getenv("LOCAL_AI_DISABLE_TEMPLATE_FALLBACKS", "0") or "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if allow_static_fallback and (not disable_template_fallbacks):
             if self._is_brief_chat_query(query):
                 detail_parts.append("static_fallback_suppressed=1")
                 return InferenceResult(
@@ -769,3 +805,10 @@ class LocalInferenceEngine:
             return ("INSUFFICIENT", "answer_not_grounded_in_context")
 
         return ("SUPPORTED", f"context_overlap={overlap}")
+    @staticmethod
+    def _strip_leading_noise_prefix(text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        value = re.sub(r"(?i)^\s*amente[\s,:\-\.]+\s*", "", value).strip()
+        return value

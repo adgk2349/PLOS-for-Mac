@@ -27,6 +27,8 @@ class _StubInferenceEngine(LocalInferenceEngine):
         llama_model_path: str | None,
         max_tokens: int,
         style: str = "grounded",
+        message_state: list[dict[str, str]] | None = None,
+        response_language: str | None = None,
     ) -> str | None:
         output = self._outputs.get(engine)
         if output is None:
@@ -53,6 +55,8 @@ class _SequentialStubInferenceEngine(LocalInferenceEngine):
         llama_model_path: str | None,
         max_tokens: int,
         style: str = "grounded",
+        message_state: list[dict[str, str]] | None = None,
+        response_language: str | None = None,
     ) -> str | None:
         values = self._outputs_by_engine.get(engine) or []
         if not values:
@@ -294,8 +298,15 @@ def test_conversation_sampling_preset_uses_stronger_repeat_penalty():
         style="conversation",
         engine=LocalEngine.MLX,
     )
-    assert llama_sampling["repeat_penalty"] == 1.14
-    assert mlx_sampling["repeat_penalty"] == 1.14
+    # Ollama-benchmarked: temperature 0.78~0.80, repeat_penalty 1.10, top_k 40, min_p 0.05
+    assert llama_sampling["repeat_penalty"] == 1.10
+    assert mlx_sampling["repeat_penalty"] == 1.10
+    assert llama_sampling["temperature"] >= 0.75
+    assert mlx_sampling["temperature"] >= 0.75
+    assert llama_sampling.get("top_k", 0) == 40
+    assert mlx_sampling.get("top_k", 0) == 40
+    assert llama_sampling.get("min_p", 0.0) == 0.05
+    assert mlx_sampling.get("min_p", 0.0) == 0.05
 
 def test_split_conversation_prompt_for_chat_extracts_system_and_user():
     prompt = (

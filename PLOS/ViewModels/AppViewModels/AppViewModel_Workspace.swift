@@ -25,10 +25,14 @@ extension AppViewModel {
 
         do {
             let secretChanged = persistSecretAPIKeys()
+            let visionSettingsChanged = sidecarVisionSettingsChangedFromPersisted()
+            persistSidecarVisionPreferences()
+            applySidecarVisionRuntimeConfiguration()
             persistLocalModelPreferenceSnapshot()
             persistAppLanguagePreference()
-            if secretChanged {
-                sidecar.stop()
+            if secretChanged || visionSettingsChanged {
+                isSidecarReadyForChat = false
+                await sidecar.stop()
                 _ = try await ensureSidecarClient()
             }
             try await syncWorkspaceAndSettings()
@@ -263,18 +267,31 @@ extension AppViewModel {
     func ensureSidecarClient() async throws -> SidecarAPIClient {
         if let client = sidecar.apiClient {
             do {
-                try await client.health()
+                _ = try await client.health()
                 _ = try await client.getSettings()
+                isSidecarReadyForChat = true
                 syncStorageDirectoryResolutionFromSidecar()
                 return client
             } catch {
-                sidecar.stop()
+                isSidecarReadyForChat = false
+                await sidecar.stop()
             }
         }
+        isSidecarReadyForChat = false
         try await sidecar.start()
-        syncStorageDirectoryResolutionFromSidecar()
         guard let client = sidecar.apiClient else {
+            isSidecarReadyForChat = false
             throw APIError(message: "Sidecar client unavailable: sidecar 시작 후에도 API 클라이언트가 생성되지 않았습니다.")
+        }
+        do {
+            _ = try await client.health()
+            _ = try await client.getSettings()
+            isSidecarReadyForChat = true
+            syncStorageDirectoryResolutionFromSidecar()
+        } catch {
+            isSidecarReadyForChat = false
+            await sidecar.stop()
+            throw APIError(message: "로컬 서버 준비 중입니다. health 확인 후 다시 시도해 주세요.")
         }
         return client
     }
@@ -392,12 +409,21 @@ extension AppViewModel {
     func recoverSessionFromInvalidToken() async {
         defer { isRecoveringSession = false }
         do {
-            sidecar.stop()
+            isSidecarReadyForChat = false
+            await sidecar.stop()
             try await sidecar.start()
+            if let client = sidecar.apiClient {
+                _ = try await client.health()
+                _ = try await client.getSettings()
+                isSidecarReadyForChat = true
+            } else {
+                isSidecarReadyForChat = false
+            }
             syncStorageDirectoryResolutionFromSidecar()
             try await refreshRemoteState()
             lastError = nil
         } catch {
+            isSidecarReadyForChat = false
             lastError = "세션 재연결 실패: \(error.localizedDescription)"
         }
     }
@@ -419,6 +445,58 @@ extension AppViewModel {
         return lower.contains("http 401") && lower.contains("invalid session token")
     }
 
+    func engineRecoveryMaxAttempts() -> Int {
+        let raw = ProcessInfo.processInfo.environment["LOCAL_AI_ENGINE_RECOVERY_MAX_ATTEMPTS"] ?? "2"
+        return min(5, max(1, Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 2))
+    }
+
+    func engineRecoveryWindowSeconds() -> TimeInterval {
+        let raw = ProcessInfo.processInfo.environment["LOCAL_AI_ENGINE_RECOVERY_WINDOW_SECONDS"] ?? "180"
+        let parsed = Double(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 180
+        return min(1800, max(30, parsed))
+    }
+
+    func pruneRecoveryAttempts(now: Date) {
+        let window = engineRecoveryWindowSeconds()
+        sidecarRecoveryAttemptTimestamps = sidecarRecoveryAttemptTimestamps.filter { now.timeIntervalSince($0) <= window }
+    }
+
+    func canAttemptEngineRecovery(now: Date) -> Bool {
+        pruneRecoveryAttempts(now: now)
+        return sidecarRecoveryAttemptTimestamps.count < engineRecoveryMaxAttempts()
+    }
+
+    func markEngineRecoveryAttempt(now: Date) {
+        sidecarRecoveryAttemptTimestamps.append(now)
+        sidecarRecoveryAttempt = sidecarRecoveryAttemptTimestamps.count
+    }
+
+    func isNativeCrashTerminationContext() -> Bool {
+        let ctx = (sidecar.lastTerminationContext ?? "").lowercased()
+        return ctx.contains("reason=uncaught_signal")
+    }
+
+    func isLikelyTransportFailure(_ error: Error) -> Bool {
+        if error is URLError {
+            return true
+        }
+        if let apiError = error as? APIError {
+            let lower = apiError.message.lowercased()
+            if lower.contains("http 504") || lower.contains("http 502") || lower.contains("http 503") {
+                return true
+            }
+            if lower.contains("connection refused")
+                || lower.contains("connection reset")
+                || lower.contains("broken pipe")
+                || lower.contains("remote end closed")
+                || lower.contains("network connection was lost")
+            {
+                return true
+            }
+        }
+        return false
+    }
+
 
     func performWithSidecarRetry<T>(_ operation: (SidecarAPIClient) async throws -> T) async throws -> T {
         let client = try await ensureSidecarClient()
@@ -428,15 +506,53 @@ extension AppViewModel {
             return value
         } catch {
             guard isInvalidSessionTokenError(error) else {
-                throw error
+                guard isLikelyTransportFailure(error), isNativeCrashTerminationContext() else {
+                    throw error
+                }
+                let now = Date()
+                guard canAttemptEngineRecovery(now: now) else {
+                    nativeCrashDetected = true
+                    sidecarRecoveryState = "failed"
+                    print("recovery:exhausted")
+                    throw APIError(message: "Sidecar 복구 시도 한도를 초과했습니다. 앱에서 sidecar 재시작을 권장합니다.")
+                }
+                markEngineRecoveryAttempt(now: now)
+                nativeCrashDetected = true
+                sidecarRecoveryState = "recovering"
+                localRuntimeDetail = "Sidecar recovering (attempt \(sidecarRecoveryAttempt)/\(engineRecoveryMaxAttempts()))..."
+                print("recovery:same_engine_restart")
+                isSidecarReadyForChat = false
+                await sidecar.stop()
+                try await sidecar.start()
+                syncStorageDirectoryResolutionFromSidecar()
+                guard let recovered = sidecar.apiClient else {
+                    sidecarRecoveryState = "failed"
+                    isSidecarReadyForChat = false
+                    throw APIError(message: "Sidecar 복구 후 API client를 다시 가져오지 못했습니다.")
+                }
+                _ = try await recovered.health()
+                _ = try await recovered.getSettings()
+                isSidecarReadyForChat = true
+                let recoveredValue = try await operation(recovered)
+                sidecarRecoveryState = "idle"
+                localRuntimeDetail = "Sidecar recovery completed (same engine retry)."
+                isSidecarReadyForChat = true
+                clearResolvedErrorIfNeeded()
+                return recoveredValue
             }
-            sidecar.stop()
+            isSidecarReadyForChat = false
+            await sidecar.stop()
             try await sidecar.start()
             syncStorageDirectoryResolutionFromSidecar()
             guard let refreshed = sidecar.apiClient else {
+                isSidecarReadyForChat = false
                 throw APIError(message: "세션 토큰을 갱신했지만 sidecar client를 다시 가져오지 못했습니다.")
             }
+            _ = try await refreshed.health()
+            _ = try await refreshed.getSettings()
+            isSidecarReadyForChat = true
             let value = try await operation(refreshed)
+            isSidecarReadyForChat = true
             clearResolvedErrorIfNeeded()
             return value
         }

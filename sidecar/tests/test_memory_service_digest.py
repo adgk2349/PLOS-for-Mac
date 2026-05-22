@@ -24,12 +24,41 @@ def test_session_digest_caps_and_merge(tmp_path: Path):
     digest = memory.get_session_digest(session_id)
     assert digest is not None
     assert digest["turn_count"] == 12
-    assert len(digest["recent_turns"]) <= 8
+    # New architecture: DIGEST_RECENT_TURNS_CAP=20 (was 8).
+    # Assistant messages ending in questions are dropped by quality filter,
+    # so only 12 user messages are stored. 12 < WINDOW_VERBATIM*2=20, no compression yet.
+    assert len(digest["recent_turns"]) <= memory._DIGEST_RECENT_TURNS_CAP
     assert len(digest["active_topics"]) <= 8
     assert len(digest["stable_facts"]) <= 10
     assert len(digest["open_loops"]) <= 6
+    # rolling_summary starts empty at 12 turns (compression triggers at > WINDOW_VERBATIM*2).
+    assert isinstance(digest.get("rolling_summary"), str)
     # Assistant question-like turns are dropped from digest to prevent open-loop pollution.
     assert digest["recent_turns"][-1]["role"] == "user"
+
+
+def test_session_digest_rolling_summary_compresses_old_turns(tmp_path: Path):
+    """Verify that turns beyond WINDOW_VERBATIM get compressed into rolling_summary."""
+    memory = _new_service(tmp_path)
+    session_id = "session-rolling-summary"
+
+    # Use factual (non-question) assistant responses so they don't get dropped.
+    for idx in range(12):
+        user = f"후쿠오카 {idx}번째 질문이야. 숙소 추천해줘."
+        assistant = f"하카타 역 근처 호텔{idx}이 좋아요. 예산은 {idx+1}만원 내외입니다."
+        memory.update_session_digest(session_id, user, assistant, mode="rule")
+
+    digest = memory.get_session_digest(session_id)
+    assert digest is not None
+    assert digest["turn_count"] == 12
+    # 12 turns × 2 (user+assistant) = 24 messages > WINDOW_VERBATIM*2=20 → compression triggers.
+    assert len(digest["recent_turns"]) <= memory._DIGEST_WINDOW_VERBATIM * 2
+    assert isinstance(digest.get("rolling_summary"), str)
+    assert len(digest["rolling_summary"]) > 0
+    # rolling_summary should contain extracted entities from archived turns.
+    assert "대화 중 언급된" in digest["rolling_summary"] or len(digest["rolling_summary"]) > 5
+
+    assert digest["recent_turns"][-1]["role"] == "assistant"
 
 
 def test_session_digest_refresh_happens_every_six_turns(tmp_path: Path):
@@ -115,7 +144,7 @@ def test_session_digest_uses_existing_retention_policy(tmp_path: Path):
         )
 
     items = memory.get_relevant_session_memory(session_id=session_id)
-    assert len(items) <= 40
+    assert len(items) <= 120
     digest_item = next((item for item in items if item.key == "conversation_digest_v1"), None)
     assert digest_item is not None
     assert digest_item.expires_at is not None
@@ -283,6 +312,74 @@ def test_web_memory_prune_deletes_stale_vector_entries(tmp_path: Path):
     # keep_recent=6 -> two stale vector ids must be deleted
     assert len(vector_stub.deleted) >= 2
     assert all(item.startswith("webmem:") for item in vector_stub.deleted)
+
+
+def test_session_fact_memory_upsert_and_replace(tmp_path: Path):
+    memory = _new_service(tmp_path)
+    session_id = "session-fact-upsert"
+
+    first = memory.upsert_session_fact_memory(
+        session_id=session_id,
+        user_query="내 이름은 민수야. 기억해줘.",
+    )
+    assert len(first["items"]) == 1
+    assert first["overwrite_blocked"] == 0
+    assert first["items"][0]["subject"] == "user_name"
+    assert first["items"][0]["value"] == "민수"
+
+    second = memory.upsert_session_fact_memory(
+        session_id=session_id,
+        user_query="내 이름은 지훈이야.",
+    )
+    assert len(second["items"]) == 1
+    assert second["overwrite_blocked"] == 0
+    items = memory.get_relevant_session_memory(session_id=session_id)
+    fact_items = [item for item in items if item.key == "fact:user_name"]
+    assert len(fact_items) == 1
+    assert str(fact_items[0].value_json.get("value") or "") == "지훈"
+
+    no_write = memory.upsert_session_fact_memory(
+        session_id=session_id,
+        user_query="내 이름 뭐야?",
+    )
+    assert no_write["items"] == []
+    assert no_write["overwrite_blocked"] == 1
+    items_after = memory.get_relevant_session_memory(session_id=session_id)
+    fact_items_after = [item for item in items_after if item.key == "fact:user_name"]
+    assert len(fact_items_after) == 1
+    assert str(fact_items_after[0].value_json.get("value") or "") == "지훈"
+
+
+def test_session_fact_memory_ignores_greeting_as_name(tmp_path: Path):
+    memory = _new_service(tmp_path)
+    session_id = "session-fact-greeting"
+    result = memory.upsert_session_fact_memory(
+        session_id=session_id,
+        user_query="내 이름은 안녕하세요",
+    )
+    assert result["items"] == []
+    items = memory.get_relevant_session_memory(session_id=session_id)
+    assert not any(item.key == "fact:user_name" for item in items)
+
+
+def test_session_fact_memory_blocks_question_like_and_low_confidence_values(tmp_path: Path):
+    memory = _new_service(tmp_path)
+    session_id = "session-fact-question-block"
+
+    blocked = memory.upsert_session_fact_memory(
+        session_id=session_id,
+        user_query="내 이름 뭐였지? 기억해?",
+    )
+    assert blocked["items"] == []
+    assert blocked["overwrite_blocked"] == 1
+
+    low_quality = memory.upsert_session_fact_memory(
+        session_id=session_id,
+        user_query="내 이름은 amente",
+    )
+    assert low_quality["items"] == []
+    items = memory.get_relevant_session_memory(session_id=session_id)
+    assert not any(item.key == "fact:user_name" for item in items)
 
 
 def test_web_memory_ranking_survives_without_vector_signal(tmp_path: Path):

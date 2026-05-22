@@ -9,6 +9,7 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 _ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
+_HAN_RE = re.compile(r"[\u4e00-\u9fff]")
 
 
 def normalize_language_code(value: str | None) -> str | None:
@@ -56,31 +57,36 @@ def detect_query_language(query: str) -> str:
     text = (query or "").strip()
     if not text:
         return "en"
-    if _HANGUL_RE.search(text):
-        return "ko"
-    if _HIRAGANA_KATAKANA_RE.search(text):
-        return "ja"
-    if _CJK_RE.search(text):
-        return "zh"
-    if _CYRILLIC_RE.search(text):
-        return "ru"
-    if _ARABIC_RE.search(text):
-        return "ar"
-    if _LATIN_RE.search(text):
+    hangul_count = len(_HANGUL_RE.findall(text))
+    hira_kata_count = len(_HIRAGANA_KATAKANA_RE.findall(text))
+    han_count = len(_HAN_RE.findall(text))
+    cyr_count = len(_CYRILLIC_RE.findall(text))
+    arabic_count = len(_ARABIC_RE.findall(text))
+    latin_count = len(_LATIN_RE.findall(text))
+
+    # Treat Han as Japanese support when Hiragana/Katakana appears together.
+    ja_count = hira_kata_count + (han_count if hira_kata_count > 0 else 0)
+    zh_count = han_count if hira_kata_count == 0 else 0
+
+    counts = {
+        "ko": hangul_count,
+        "ja": ja_count,
+        "zh": zh_count,
+        "ru": cyr_count,
+        "ar": arabic_count,
+        "en": latin_count,
+    }
+    lang, score = max(counts.items(), key=lambda item: item[1])
+    if score <= 0:
         return "en"
-    return "en"
+    return lang
 
 
 def resolve_response_language(query: str, language_preference: str | None) -> str:
     forced = normalize_language_code(language_preference)
-    if forced in {"ko", "en", "ja"}:
-        return forced
     if forced:
-        return "ko"
-    detected = detect_query_language(query)
-    if detected in {"ko", "en", "ja"}:
-        return detected
-    return "ko"
+        return forced
+    return detect_query_language(query)
 
 
 def response_language_instruction(language_code: str) -> str:

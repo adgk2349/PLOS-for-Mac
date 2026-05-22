@@ -24,4 +24,24 @@ final class ExtensionServiceAdapter {
     func deletePlugin(client: SidecarAPIClient, pluginID: String) async throws -> Bool {
         try await client.deleteExtensionPlugin(pluginID: pluginID)
     }
+
+    func openPanel(client: SidecarAPIClient, request: PluginPanelOpenRequest) async throws -> PluginPanelOpenResponse {
+        try await client.openExtensionPanel(request)
+    }
+
+    func submitPanelAction(client: SidecarAPIClient, request: PluginPanelActionRequest) async throws -> PluginPanelActionResponse {
+        try await client.submitExtensionPanelAction(request)
+    }
+
+    func panelStatus(client: SidecarAPIClient, jobID: String) async throws -> PluginPanelStatusResponse {
+        try await client.getExtensionPanelStatus(jobID: jobID)
+    }
+
+    func streamPanelStatus(client: SidecarAPIClient, jobID: String) async throws -> AsyncThrowingStream<PluginPanelStatusResponse, Error> {
+        try await client.streamExtensionPanelStatus(jobID: jobID)
+    }
+
+    func generateImage(client: SidecarAPIClient, request: ExtensionImageGenerateRequest) async throws -> ExtensionImageGenerateResponse {
+        try await client.generateExtensionImage(request)
+    }
 }

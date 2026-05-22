@@ -233,6 +233,10 @@ def _is_explicit_freshness_web_request(query: str) -> bool:
         return False
     if has_personal and not has_web_token:
         return False
+    # Guard: conversational utterances like "지금 ... 알려줘" should NOT trigger web.
+    # Require an explicit web/info target when freshness wording appears.
+    if not (has_web_token or has_info_target):
+        return False
     return has_request or has_info_target or has_web_token
 
 def _is_memory_recall_query(query: str) -> bool:
@@ -250,7 +254,10 @@ def _is_memory_recall_query(query: str) -> bool:
 
     slot_tokens = (
         "이름", "성함", "별명", "닉네임", "코드네임", "코드명", "선호", "취향",
-        "name", "nickname", "codename", "preference", "preferences",
+        "음료", "커피", "고양이", "반려묘", "반려견", "반려동물",
+        "도착", "도착 시간", "숙소", "후보", "예산", "일정", "여행 성향",
+        "name", "nickname", "codename", "preference", "preferences", "drink", "pet", "cat",
+        "arrival", "arrival time", "lodging", "hotel", "budget", "itinerary", "travel style",
     )
     recall_verbs = (
         "기억", "떠올", "상기", "recall", "remember", "remind",
@@ -273,6 +280,8 @@ def _is_memory_recall_query(query: str) -> bool:
     explicit_recall_patterns = (
         r"(아까|이전|전에|지난번).*뭐라고",
         r"(아까|이전|전에|지난번).*(말해|얘기|대화|질문|답변)",
+        r"(뭐였지|얼마였지|어떻게\s*말했지|기억해\s*나|기억나지)",
+        r"(what was it|how did i say|what did i say|what was my)",
         r"(what|which).*(did i|was i|we).*(say|tell|mention|ask)",
         r"(do you remember|can you recall|remember what)",
     )
@@ -281,6 +290,8 @@ def _is_memory_recall_query(query: str) -> bool:
     # High-precision trigger: require either explicit recall phrasing
     # or recall verb + (slot or temporal) in a question form.
     if is_explicit_recall and is_question:
+        return True
+    if is_question and has_slot_token and any(token in lowered for token in ("얼마", "몇", "뭐였", "였어", "what", "how much", "how many")):
         return True
     if is_question and has_slot_token and has_personal_reference:
         if not any(token in lowered for token in ("정해", "만들어", "지어", "create", "make")):
@@ -346,14 +357,47 @@ def _should_auto_web_search(*, query: str, parsed_intent, last_context: dict | N
 
 def _web_search_query_for_turn(*, query: str, last_context: dict | None, is_followup_web_search: bool) -> str:
     cleaned = str(query or "").strip()
-    if not cleaned or not is_followup_web_search or not isinstance(last_context, dict):
+    print(f"\n[DEBUG_WEB_TURN] query: {query}, is_followup_web_search: {is_followup_web_search}")
+    print(f"[DEBUG_WEB_TURN] last_context: {last_context}")
+    if not cleaned or not isinstance(last_context, dict):
+        print(f"[DEBUG_WEB_TURN] Early exit: cleaned={cleaned}, last_context_type={type(last_context)}")
         return cleaned
+    if not is_followup_web_search:
+        is_contextless_web_directive = (
+            _is_explicit_web_search_request(cleaned)
+            and not _has_significant_new_topic(cleaned)
+        )
+        prev_path = str(last_context.get("conversation_path") or "").strip().lower()
+        prev_was_local = prev_path.startswith("local_conversation") or prev_path == ""
+        print(f"[DEBUG_WEB_TURN] not is_followup: is_directive={is_contextless_web_directive}, prev_path={prev_path}, prev_was_local={prev_was_local}")
+        if not (is_contextless_web_directive and prev_was_local):
+            print(f"[DEBUG_WEB_TURN] Exit due to directive or path condition failure")
+            return cleaned
     anchor = str(last_context.get("last_user_query") or "").strip()
     if not anchor:
         anchor = str(last_context.get("result_summary") or "").strip()
+    print(f"[DEBUG_WEB_TURN] anchor: {anchor}")
     if not anchor:
+        print(f"[DEBUG_WEB_TURN] Exit: anchor is empty")
         return cleaned
-    return f"{anchor}\n\n후속 질문: {cleaned}"
+    res = f"{anchor}\n\n후속 질문: {cleaned}"
+    print(f"[DEBUG_WEB_TURN] returning query: {res}")
+    return res
+
+
+def _has_significant_new_topic(query: str) -> bool:
+    """Return True if the query contains a meaningful new topic beyond a bare web-search directive."""
+    lowered = _normalized_match_text(query)
+    # Remove known web-action words and check what remains
+    action_tokens = ("인터넷", "웹", "web", "online", "검색", "search", "찾아", "look up", "크롤", "crawl",
+                     "해봐", "해줘", "해 줘", "해주", "해주세요", "부탁", "부탁해", "please")
+    remaining = lowered
+    for token in action_tokens:
+        remaining = remaining.replace(token, " ")
+    remaining = re.sub(r"\s+", " ", remaining).strip()
+    # If there is substantial content remaining (3+ chars), there is a new topic
+    return len(remaining) >= 3
+
 
 def _is_freshness_sensitive_query(query: str) -> bool:
     lowered = _normalized_match_text(query)

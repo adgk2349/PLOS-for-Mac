@@ -6,6 +6,7 @@
   "is_default": true,
   "strings": {
     "settings.title": "Settings",
+    "chat.empty_response_fallback": "The response ended with empty output. Please try once more.",
     "settings.language.option.auto": "Auto",
     "privacy_mode.local_only": "Local only",
     "privacy_mode.hybrid": "Hybrid",

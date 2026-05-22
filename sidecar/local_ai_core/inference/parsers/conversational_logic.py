@@ -15,6 +15,72 @@ if TYPE_CHECKING:
 
 # Component: conversational_logic.py
 class ConversationalLogic(BaseDelegate):
+    @staticmethod
+    def _is_action_request_query(query: str) -> bool:
+        lowered = str(query or "").strip().lower()
+        if not lowered:
+            return False
+        cues = (
+            "해줘", "해 줘", "해봐", "나눠줘", "뽑아줘", "남겨줘", "정리해줘", "만들어줘",
+            "해주세요", "please", "give me", "do this",
+        )
+        return any(token in lowered for token in cues)
+    @staticmethod
+    def _looks_truncated_conversation_answer(text: str) -> bool:
+        value = str(text or "").strip()
+        if not value:
+            return True
+        token_count = len(re.findall(r"\S+", value))
+        if token_count <= 2:
+            return True
+        if token_count <= 5 and re.search(r"(까요\?|게요\.?|습니다\.?|요\.?)$", value):
+            return True
+        if re.search(r"[:;,(\[{`\-]\s*$", value):
+            return True
+        return False
+
+    def _continue_conversation_once(
+        self,
+        *,
+        engine: LocalEngine,
+        query: str,
+        draft_answer: str,
+        response_language: str,
+        profile: str,
+        mlx_model_path: str | None,
+        llama_model_path: str | None,
+        max_tokens: int,
+    ) -> str | None:
+        prompt = (
+            "Continue only the unfinished tail.\n"
+            "Do not restart and do not repeat previous text.\n"
+            f"Language: {response_language}\n"
+            f"User query: {query}\n"
+            f"Current answer: {draft_answer}\n"
+            "Continuation:"
+        )
+        raw = self._generate_with_engine(
+            engine=engine,
+            prompt=prompt,
+            profile=profile,
+            mlx_model_path=mlx_model_path,
+            llama_model_path=llama_model_path,
+            max_tokens=min(96, max(24, int(max_tokens * 0.4))),
+            style="rewrite",
+        )
+        if not raw:
+            return None
+        tail = self._postprocess_conversational_answer(
+            raw,
+            query=query,
+            response_language=response_language,
+        ).strip()
+        if not tail:
+            return None
+        merged = f"{str(draft_answer or '').rstrip()} {tail}".strip()
+        merged = re.sub(r"\s{2,}", " ", merged).strip()
+        return merged
+
     def _generate_conversation_candidate(
         self,
         *,
@@ -27,17 +93,35 @@ class ConversationalLogic(BaseDelegate):
         llama_model_path: str | None,
         max_tokens: int,
         allow_repair_fallbacks: bool = True,
+        message_state: list[dict[str, str]] | None = None,
     ) -> _ConversationCandidateResult:
         is_recommendation_query = self._is_recommendation_chat_query(query)
-        raw = self._generate_with_engine(
-            engine=engine,
-            prompt=prompt,
-            profile=profile,
-            mlx_model_path=mlx_model_path,
-            llama_model_path=llama_model_path,
-            max_tokens=max_tokens,
-            style="conversation",
-        )
+        try:
+            raw = self._generate_with_engine(
+                engine=engine,
+                prompt=prompt,
+                profile=profile,
+                mlx_model_path=mlx_model_path,
+                llama_model_path=llama_model_path,
+                max_tokens=max_tokens,
+                style="conversation",
+                message_state=message_state,
+                response_language=response_language,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument" in str(exc) and "message_state" in str(exc):
+                raw = self._generate_with_engine(
+                    engine=engine,
+                    prompt=prompt,
+                    profile=profile,
+                    mlx_model_path=mlx_model_path,
+                    llama_model_path=llama_model_path,
+                    max_tokens=max_tokens,
+                    style="conversation",
+                    response_language=response_language,
+                )
+            else:
+                raise
         if not raw:
             err = self._last_engine_error.get(engine, f"{engine.value} engine failed")
             self._set_engine_error(
@@ -46,24 +130,64 @@ class ConversationalLogic(BaseDelegate):
             )
             return _ConversationCandidateResult(answer=None)
 
+        previous_user_text = ""
+        if message_state:
+            user_seen = 0
+            for item in reversed(message_state):
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").strip().lower()
+                if role == "user":
+                    user_seen += 1
+                    if user_seen < 2:
+                        continue
+                    content = str(item.get("content") or "").strip()
+                    if content:
+                        previous_user_text = content
+                        break
+
         answer = self._postprocess_conversational_answer(
             raw,
             query=query,
             response_language=response_language,
         )
+        raw_preview = re.sub(r"\s+", " ", str(raw or "")).strip()[:140]
         quality_issues = self._conversation_quality_issues(
             query=query,
             answer=answer,
             response_language=response_language,
         ) if answer else ["empty_after_sanitize"]
+        if (
+            answer
+            and previous_user_text
+            and previous_user_text.strip() != str(query or "").strip()
+        ):
+            sim_prev = self._text_similarity(answer, previous_user_text)
+            sim_curr = self._text_similarity(answer, query)
+            if sim_prev >= 0.86 and sim_curr <= 0.48:
+                quality_issues.append("stale_user_echo")
         
         hard_issues = self._conversation_hard_issues(quality_issues)
         # Accept model output unless it hits hard safety/style failures.
         # Soft quality issues are tracked but should not hard-fail generation.
         is_valid_answer = bool(answer and not hard_issues)
         streaming_active = self._is_streaming_active()
-        if is_valid_answer and not quality_issues:
-            return _ConversationCandidateResult(answer=answer)
+        # Model-native first: if there is no hard issue, keep the answer as-is.
+        if is_valid_answer:
+            return _ConversationCandidateResult(
+                answer=answer,
+                rewrite_used=False,
+                repair_triggered=False,
+                repair_success=False,
+                leak_blocked=False,
+                direct_first_applied=True,
+                question_count_after_postprocess=self._question_sentence_count(answer),
+                recommendation_shape=(
+                    "three_options"
+                    if is_recommendation_query and self._looks_three_option_shape(answer)
+                    else None
+                ),
+            )
 
         leak_blocked = bool(
             any(issue in {"meta_leak", "context_leak"} for issue in hard_issues)
@@ -79,7 +203,14 @@ class ConversationalLogic(BaseDelegate):
         # Even when static fallbacks are disabled, allow a model-based rewrite
         # if the primary output is invalid (empty/hard issues). This avoids
         # failing fast into repeated runtime-error fallback text.
-        allow_model_rewrite = bool((allow_repair_fallbacks or not is_valid_answer) and not streaming_active)
+        rewrite_enabled = str(os.getenv("LOCAL_AI_CONVERSATION_REWRITE_ENABLED", "0") or "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        allow_model_rewrite = bool(
+            rewrite_enabled
+            and (allow_repair_fallbacks or not is_valid_answer)
+            and (not streaming_active or bool(hard_issues))
+        )
         if allow_model_rewrite:
             if response_language == "ko":
                 repaired_answer = self._rewrite_korean_conversation_answer(
@@ -111,6 +242,36 @@ class ConversationalLogic(BaseDelegate):
                 response_language=response_language,
             )
             repaired_valid = bool(repaired_answer and not self._conversation_hard_issues(repaired_issues))
+        if response_language == "ko":
+            ko_rewrite_triggers = {"language_mismatch", "english_meta_mix", "korean_spacing_degraded"}
+            should_force_strict_ko = bool(
+                ko_rewrite_triggers.intersection(set(quality_issues))
+                or ko_rewrite_triggers.intersection(set(repaired_issues or []))
+                or ko_rewrite_triggers.intersection(set(hard_issues))
+            )
+        else:
+            should_force_strict_ko = False
+        if should_force_strict_ko:
+            strict_ko = self._rewrite_korean_conversation_answer(
+                engine=engine,
+                query=query,
+                draft_answer=repaired_answer or answer or raw,
+                profile=profile,
+                mlx_model_path=mlx_model_path,
+                llama_model_path=llama_model_path,
+                max_tokens=max_tokens,
+            )
+            if strict_ko:
+                strict_issues = self._conversation_quality_issues(
+                    query=query,
+                    answer=strict_ko,
+                    response_language=response_language,
+                )
+                if not self._conversation_hard_issues(strict_issues):
+                    repaired_answer = strict_ko
+                    repaired_issues = strict_issues
+                    repaired_valid = True
+                    rewrite_used = True
 
         selected_answer, selected_issues = self._pick_best_conversation_answer(
             primary_answer=answer,
@@ -125,12 +286,9 @@ class ConversationalLogic(BaseDelegate):
         
         if selected_answer:
             final_answer = selected_answer
-            if is_recommendation_query:
-                final_answer = self._normalize_three_option_recommendation(
-                    final_answer,
-                    response_language=response_language,
-                )
-            final_answer = self._limit_question_sentences(final_answer, max_questions=1)
+            # Preserve model-native output without continuation/direct-rewrite overrides.
+            # Keep model-native conversational shape; avoid template normalization.
+            # Keep model-native conversational shape; do not hard-cap question count.
             question_count = self._question_sentence_count(final_answer)
             recommendation_shape = (
                 "three_options"
@@ -149,43 +307,69 @@ class ConversationalLogic(BaseDelegate):
                 recommendation_shape=recommendation_shape,
             )
 
-        if allow_repair_fallbacks and not streaming_active:
-            last_resort = self._generate_last_resort_direct_answer(
-                engine=engine,
-                query=query,
-                response_language=response_language,
-                profile=profile,
-                mlx_model_path=mlx_model_path,
-                llama_model_path=llama_model_path,
-                max_tokens=max_tokens,
-            )
-            if last_resort and self._looks_conversational_answer(
-                last_resort,
-                response_language=response_language,
-                query=query,
-            ):
-                final_answer = self._limit_question_sentences(last_resort, max_questions=1)
-                question_count = self._question_sentence_count(final_answer)
-                recommendation_shape = (
+        # Model-native fallback: if we have a non-empty primary answer and no critical leak,
+        # prefer returning it over forcing quality-guard retry loops.
+        if answer and not leak_blocked:
+            return _ConversationCandidateResult(
+                answer=answer,
+                rewrite_used=rewrite_used,
+                quality_repair_reason=repair_reason or None,
+                repair_triggered=bool(rewrite_used),
+                repair_success=False,
+                leak_blocked=False,
+                direct_first_applied=True,
+                question_count_after_postprocess=self._question_sentence_count(answer),
+                recommendation_shape=(
                     "three_options"
-                    if is_recommendation_query and self._looks_three_option_shape(final_answer)
+                    if is_recommendation_query and self._looks_three_option_shape(answer)
                     else None
-                )
-                return _ConversationCandidateResult(
-                    answer=final_answer,
-                    rewrite_used=rewrite_used,
-                    quality_repair_reason="|".join(
-                        [item for item in [repair_reason, "last_resort_direct"] if item][:2]
-                    ),
-                    repair_triggered=True,
-                    repair_success=True,
-                    leak_blocked=leak_blocked,
-                    direct_first_applied=True,
-                    question_count_after_postprocess=question_count,
-                    recommendation_shape=recommendation_shape,
-                )
+                ),
+            )
 
-        if allow_repair_fallbacks and not streaming_active:
+        last_resort = self._generate_last_resort_direct_answer(
+            engine=engine,
+            query=query,
+            response_language=response_language,
+            profile=profile,
+            mlx_model_path=mlx_model_path,
+            llama_model_path=llama_model_path,
+            max_tokens=max_tokens,
+        )
+        if last_resort and self._looks_conversational_answer(
+            last_resort,
+            response_language=response_language,
+            query=query,
+        ):
+            final_answer = last_resort
+            question_count = self._question_sentence_count(final_answer)
+            recommendation_shape = (
+                "three_options"
+                if is_recommendation_query and self._looks_three_option_shape(final_answer)
+                else None
+            )
+            return _ConversationCandidateResult(
+                answer=final_answer,
+                rewrite_used=rewrite_used,
+                quality_repair_reason="|".join(
+                    [item for item in [repair_reason, "last_resort_direct"] if item][:2]
+                ),
+                repair_triggered=True,
+                repair_success=True,
+                leak_blocked=leak_blocked,
+                direct_first_applied=True,
+                question_count_after_postprocess=question_count,
+                recommendation_shape=recommendation_shape,
+            )
+
+        clarification_enabled = str(
+            os.getenv("LOCAL_AI_CONVERSATION_CLARIFICATION_FALLBACK_ENABLED", "0") or "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        disable_template_fallbacks = str(
+            os.getenv("LOCAL_AI_DISABLE_TEMPLATE_FALLBACKS", "0") or "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if disable_template_fallbacks:
+            clarification_enabled = False
+        if allow_repair_fallbacks and clarification_enabled:
             clarification = self._minimal_conversation_clarification(
                 query=query,
                 response_language=response_language,
@@ -195,7 +379,7 @@ class ConversationalLogic(BaseDelegate):
                 response_language=response_language,
                 query=query,
             ):
-                final_answer = self._limit_question_sentences(clarification, max_questions=1)
+                final_answer = clarification
                 return _ConversationCandidateResult(
                     answer=final_answer,
                     rewrite_used=rewrite_used,
@@ -212,8 +396,10 @@ class ConversationalLogic(BaseDelegate):
 
         self._set_engine_error(
             engine,
-            f"{engine.value} conversational response invalid (attempt1:quality_guard_blocked)",
+            f"{engine.value} conversational response invalid (attempt1:quality_guard_blocked;raw_preview={raw_preview})",
         )
+        # If quality guard rejects output, do not return raw preview fragments.
+        # Let upper recovery loop retry generation to preserve conversational quality.
         return _ConversationCandidateResult(
             answer=None,
             rewrite_used=rewrite_used,
@@ -224,7 +410,14 @@ class ConversationalLogic(BaseDelegate):
         )
 
     def _conversation_hard_issues(self, issues: list[str]) -> list[str]:
-        hard = {"meta_leak", "context_leak", "pathological_repetition"}
+        hard = {
+            "meta_leak",
+            "context_leak",
+            "pathological_repetition",
+            "query_echo_hard",
+            "stale_user_echo",
+            "language_mismatch",
+        }
         return [item for item in issues if item in hard]
 
     def _pick_best_conversation_answer(
@@ -412,17 +605,60 @@ class ConversationalLogic(BaseDelegate):
             issues.append("duplicate_sentence")
         if self._has_pathological_repetition(cleaned):
             issues.append("pathological_repetition")
-        if self._text_similarity(cleaned, query) >= 0.86 and len(cleaned) <= 220:
-            issues.append("query_echo")
+        if len(re.sub(r"\s+", "", query or "")) >= 10:
+            if self._text_similarity(cleaned, query) >= 0.86 and len(cleaned) <= 220:
+                issues.append("query_echo")
+            if self._is_hard_query_echo(cleaned, query):
+                issues.append("query_echo_hard")
+        if self._looks_leading_fragment(cleaned):
+            issues.append("leading_fragment")
+        if self._looks_clarification_template_leak(cleaned):
+            issues.append("clarification_template_leak")
         
         if response_language == "ko":
             ko_chars = len(re.findall(r"[가-힣]", cleaned))
             en_words = len(re.findall(r"[A-Za-z]{3,}", cleaned))
+            ja_chars = len(re.findall(r"[\u3040-\u30ff]", cleaned))
             if en_words >= 8 and ko_chars <= (en_words * 2):
                 issues.append("english_meta_mix")
+            if ja_chars >= 6 and ko_chars <= ja_chars:
+                issues.append("language_mismatch")
+            # Long Korean text with almost no spaces usually indicates degraded decode.
+            if ko_chars >= 24 and len(re.findall(r"\s+", cleaned)) <= 1 and len(cleaned) >= 40:
+                issues.append("korean_spacing_degraded")
             if self._is_informal_korean_tone(cleaned):
                 issues.append("informal_tone")
         return issues
+
+    @staticmethod
+    def _looks_leading_fragment(text: str) -> bool:
+        value = str(text or "").strip()
+        if not value:
+            return False
+        return bool(
+            re.match(
+                r"^(?:께(?:서는|요)?|을|를|이|가|은|는|도)\s*(?:붙여드리겠습니다|도와드리겠습니다|안내해드리겠습니다|질문하신|오늘|집중)",
+                value,
+            )
+        )
+
+    @staticmethod
+    def _looks_clarification_template_leak(text: str) -> bool:
+        value = str(text or "").strip()
+        if not value:
+            return False
+        lowered = value.lower()
+        has_lack_of_info = ("정보가 부족" in value) or ("구체적인 추천을 드리기 어렵" in value)
+        has_numbered_questions = bool(re.search(r"(?:^|\s)1\.\s*\*\*.*2\.\s*\*\*.*3\.\s*\*\*", value))
+        has_example_block = ("예시" in value) and ("라고 말씀해주시면" in value or "알려주세요" in value)
+        has_meta_request = ("원하시는 답변을 얻으시려면" in value) or ("아래 정보" in value)
+        if has_lack_of_info and (has_numbered_questions or has_meta_request):
+            return True
+        if has_numbered_questions and has_example_block:
+            return True
+        if "please provide" in lowered and "1." in lowered and "2." in lowered:
+            return True
+        return False
 
     def _korean_quality_issues(self, *, query: str, answer: str, response_language: str) -> list[str]:
         if response_language != "ko":

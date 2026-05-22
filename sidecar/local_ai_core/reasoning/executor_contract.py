@@ -5,16 +5,6 @@ import inspect
 from typing import Any
 
 
-def _normalize_timeout(timeout_seconds: float | None) -> float | None:
-    if timeout_seconds is None:
-        return None
-    try:
-        parsed = float(timeout_seconds)
-    except (TypeError, ValueError):
-        return None
-    return max(0.1, parsed) if parsed > 0 else None
-
-
 def bind_async_executor_contract(executor: Any) -> Any:
     """
     Ensure executor exposes async entrypoints used by strategies.
@@ -30,11 +20,8 @@ def bind_async_executor_contract(executor: Any) -> Any:
     if callable(execute_sync) and (not callable(execute_async) or not inspect.iscoroutinefunction(execute_async)):
 
         async def _execute_conversation_async(*, timeout_seconds: float | None = None, **kwargs):
-            offloaded = asyncio.to_thread(execute_sync, **kwargs)
-            timeout = _normalize_timeout(timeout_seconds)
-            if timeout is None:
-                return await offloaded
-            return await asyncio.wait_for(offloaded, timeout=timeout)
+            del timeout_seconds
+            return await asyncio.to_thread(execute_sync, **kwargs)
 
         setattr(executor, "execute_conversation_async", _execute_conversation_async)
 
@@ -46,11 +33,8 @@ def bind_async_executor_contract(executor: Any) -> Any:
     if callable(step_sync) and (not callable(step_async) or not inspect.iscoroutinefunction(step_async)):
 
         async def _generate_agentic_step_async(*, timeout_seconds: float | None = None, **kwargs):
-            offloaded = asyncio.to_thread(step_sync, **kwargs)
-            timeout = _normalize_timeout(timeout_seconds)
-            if timeout is None:
-                return await offloaded
-            return await asyncio.wait_for(offloaded, timeout=timeout)
+            del timeout_seconds
+            return await asyncio.to_thread(step_sync, **kwargs)
 
         setattr(executor, "generate_agentic_step_async", _generate_agentic_step_async)
 

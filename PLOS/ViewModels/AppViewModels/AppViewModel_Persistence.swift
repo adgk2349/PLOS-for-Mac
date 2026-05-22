@@ -89,13 +89,16 @@ extension AppViewModel {
             return
         }
         do {
-            sidecar.stop()
+            isSidecarReadyForChat = false
+            await sidecar.stop()
             try await sidecar.start()
+            isSidecarReadyForChat = sidecar.apiClient != nil
             syncStorageDirectoryResolutionFromSidecar()
             try await refreshRemoteState()
             lastSettingsSavedAt = Date()
             lastError = nil
         } catch {
+            isSidecarReadyForChat = false
             handleViewModelError(error)
         }
     }
@@ -150,6 +153,159 @@ extension AppViewModel {
     func persistSearXNGPreference() {
         UserDefaults.standard.set(searxngURL, forKey: UDKey.searxngURL)
         UserDefaults.standard.set(autoStartSearXNG, forKey: UDKey.autoStartSearXNG)
+    }
+
+    func loadSidecarVisionPreferences() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: UDKey.sidecarVisionEnabled) != nil {
+            sidecarVisionEnabled = defaults.bool(forKey: UDKey.sidecarVisionEnabled)
+        } else {
+            sidecarVisionEnabled = true
+        }
+        sidecarVisionCaptionModel = defaults.string(forKey: UDKey.sidecarVisionCaptionModel) ?? "microsoft/git-base-coco"
+        sidecarVisionClassifyModel = defaults.string(forKey: UDKey.sidecarVisionClassifyModel) ?? "google/vit-base-patch16-224"
+        if defaults.object(forKey: UDKey.sidecarMlxKVQEnabled) != nil {
+            sidecarMlxKVQEnabled = defaults.bool(forKey: UDKey.sidecarMlxKVQEnabled)
+        } else {
+            sidecarMlxKVQEnabled = false
+        }
+        if let rawMode = defaults.string(forKey: UDKey.sidecarMlxKVQMode),
+           let parsed = SidecarMlxKVQMode(rawValue: rawMode)
+        {
+            sidecarMlxKVQMode = parsed
+        } else {
+            sidecarMlxKVQMode = .turbo3
+        }
+        if defaults.object(forKey: UDKey.sidecarMlxKVQBits) != nil {
+            sidecarMlxKVQBits = min(8, max(2, defaults.integer(forKey: UDKey.sidecarMlxKVQBits)))
+        } else {
+            sidecarMlxKVQBits = 3
+        }
+        if defaults.object(forKey: UDKey.sidecarConversationTurboEnabled) != nil {
+            sidecarConversationTurboEnabled = defaults.bool(forKey: UDKey.sidecarConversationTurboEnabled)
+        } else {
+            sidecarConversationTurboEnabled = false
+        }
+        if defaults.object(forKey: UDKey.sidecarInferenceTimeoutDisabled) != nil {
+            sidecarInferenceTimeoutDisabled = defaults.bool(forKey: UDKey.sidecarInferenceTimeoutDisabled)
+        } else {
+            sidecarInferenceTimeoutDisabled = false
+        }
+        if defaults.object(forKey: UDKey.sidecarMainResponseTimeoutSeconds) != nil {
+            sidecarMainResponseTimeoutSeconds = min(3600, max(30, defaults.integer(forKey: UDKey.sidecarMainResponseTimeoutSeconds)))
+        } else {
+            sidecarMainResponseTimeoutSeconds = 240
+        }
+        if defaults.object(forKey: UDKey.sidecarAuxiliaryTimeoutSeconds) != nil {
+            sidecarAuxiliaryTimeoutSeconds = min(120, max(4, defaults.integer(forKey: UDKey.sidecarAuxiliaryTimeoutSeconds)))
+        } else {
+            sidecarAuxiliaryTimeoutSeconds = 12
+        }
+        if defaults.object(forKey: UDKey.showThinkingProcessInChat) != nil {
+            showThinkingProcessInChat = defaults.bool(forKey: UDKey.showThinkingProcessInChat)
+        } else {
+            showThinkingProcessInChat = true
+        }
+        applySidecarVisionRuntimeConfiguration()
+    }
+
+    func persistSidecarVisionPreferences() {
+        let defaults = UserDefaults.standard
+        defaults.set(sidecarVisionEnabled, forKey: UDKey.sidecarVisionEnabled)
+        defaults.set(sidecarVisionCaptionModel, forKey: UDKey.sidecarVisionCaptionModel)
+        defaults.set(sidecarVisionClassifyModel, forKey: UDKey.sidecarVisionClassifyModel)
+        defaults.set(sidecarMlxKVQEnabled, forKey: UDKey.sidecarMlxKVQEnabled)
+        defaults.set(sidecarMlxKVQMode.rawValue, forKey: UDKey.sidecarMlxKVQMode)
+        defaults.set(min(8, max(2, sidecarMlxKVQBits)), forKey: UDKey.sidecarMlxKVQBits)
+        defaults.set(sidecarConversationTurboEnabled, forKey: UDKey.sidecarConversationTurboEnabled)
+        defaults.set(sidecarInferenceTimeoutDisabled, forKey: UDKey.sidecarInferenceTimeoutDisabled)
+        defaults.set(
+            min(3600, max(30, sidecarMainResponseTimeoutSeconds)),
+            forKey: UDKey.sidecarMainResponseTimeoutSeconds
+        )
+        defaults.set(
+            min(120, max(4, sidecarAuxiliaryTimeoutSeconds)),
+            forKey: UDKey.sidecarAuxiliaryTimeoutSeconds
+        )
+        defaults.set(showThinkingProcessInChat, forKey: UDKey.showThinkingProcessInChat)
+    }
+
+    func applySidecarVisionRuntimeConfiguration() {
+        sidecar.configureVisionRuntime(
+            enabled: sidecarVisionEnabled,
+            captionModel: sidecarVisionCaptionModel,
+            classifyModel: sidecarVisionClassifyModel
+        )
+        sidecar.configureMlxKVQRuntime(
+            enabled: sidecarMlxKVQEnabled,
+            mode: sidecarMlxKVQMode,
+            bits: sidecarMlxKVQBits
+        )
+        sidecar.configureConversationTurboRuntime(enabled: sidecarConversationTurboEnabled)
+        sidecar.configureInferenceTimeoutRuntime(
+            disabled: sidecarInferenceTimeoutDisabled,
+            mainResponseTimeoutSeconds: sidecarMainResponseTimeoutSeconds,
+            auxiliaryTimeoutSeconds: sidecarAuxiliaryTimeoutSeconds
+        )
+    }
+
+    func sidecarVisionSettingsChangedFromPersisted() -> Bool {
+        let defaults = UserDefaults.standard
+        let persistedEnabled: Bool
+        if defaults.object(forKey: UDKey.sidecarVisionEnabled) != nil {
+            persistedEnabled = defaults.bool(forKey: UDKey.sidecarVisionEnabled)
+        } else {
+            persistedEnabled = true
+        }
+        let persistedCaption = defaults.string(forKey: UDKey.sidecarVisionCaptionModel) ?? "microsoft/git-base-coco"
+        let persistedClassify = defaults.string(forKey: UDKey.sidecarVisionClassifyModel) ?? "google/vit-base-patch16-224"
+        let persistedKVQEnabled: Bool
+        if defaults.object(forKey: UDKey.sidecarMlxKVQEnabled) != nil {
+            persistedKVQEnabled = defaults.bool(forKey: UDKey.sidecarMlxKVQEnabled)
+        } else {
+            persistedKVQEnabled = false
+        }
+        let persistedKVQMode = SidecarMlxKVQMode(rawValue: defaults.string(forKey: UDKey.sidecarMlxKVQMode) ?? "") ?? .turbo3
+        let persistedKVQBits: Int
+        if defaults.object(forKey: UDKey.sidecarMlxKVQBits) != nil {
+            persistedKVQBits = min(8, max(2, defaults.integer(forKey: UDKey.sidecarMlxKVQBits)))
+        } else {
+            persistedKVQBits = 3
+        }
+        let persistedConversationTurboEnabled: Bool
+        if defaults.object(forKey: UDKey.sidecarConversationTurboEnabled) != nil {
+            persistedConversationTurboEnabled = defaults.bool(forKey: UDKey.sidecarConversationTurboEnabled)
+        } else {
+            persistedConversationTurboEnabled = false
+        }
+        let persistedInferenceTimeoutDisabled: Bool
+        if defaults.object(forKey: UDKey.sidecarInferenceTimeoutDisabled) != nil {
+            persistedInferenceTimeoutDisabled = defaults.bool(forKey: UDKey.sidecarInferenceTimeoutDisabled)
+        } else {
+            persistedInferenceTimeoutDisabled = false
+        }
+        let persistedMainResponseTimeoutSeconds: Int
+        if defaults.object(forKey: UDKey.sidecarMainResponseTimeoutSeconds) != nil {
+            persistedMainResponseTimeoutSeconds = min(3600, max(30, defaults.integer(forKey: UDKey.sidecarMainResponseTimeoutSeconds)))
+        } else {
+            persistedMainResponseTimeoutSeconds = 240
+        }
+        let persistedAuxiliaryTimeoutSeconds: Int
+        if defaults.object(forKey: UDKey.sidecarAuxiliaryTimeoutSeconds) != nil {
+            persistedAuxiliaryTimeoutSeconds = min(120, max(4, defaults.integer(forKey: UDKey.sidecarAuxiliaryTimeoutSeconds)))
+        } else {
+            persistedAuxiliaryTimeoutSeconds = 12
+        }
+        return persistedEnabled != sidecarVisionEnabled ||
+            persistedCaption != sidecarVisionCaptionModel ||
+            persistedClassify != sidecarVisionClassifyModel ||
+            persistedKVQEnabled != sidecarMlxKVQEnabled ||
+            persistedKVQMode != sidecarMlxKVQMode ||
+            persistedKVQBits != min(8, max(2, sidecarMlxKVQBits)) ||
+            persistedConversationTurboEnabled != sidecarConversationTurboEnabled ||
+            persistedInferenceTimeoutDisabled != sidecarInferenceTimeoutDisabled ||
+            persistedMainResponseTimeoutSeconds != min(3600, max(30, sidecarMainResponseTimeoutSeconds)) ||
+            persistedAuxiliaryTimeoutSeconds != min(120, max(4, sidecarAuxiliaryTimeoutSeconds))
     }
 
     func addFolder() {
@@ -217,6 +373,19 @@ extension AppViewModel {
                 privacyMode = .hybrid
             }
         }
+    }
+
+    func loadRoleplayPreference() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: UDKey.roleplayModeEnabled) != nil {
+            roleplayModeEnabled = defaults.bool(forKey: UDKey.roleplayModeEnabled)
+        } else {
+            roleplayModeEnabled = false
+        }
+    }
+
+    func persistRoleplayPreference() {
+        UserDefaults.standard.set(roleplayModeEnabled, forKey: UDKey.roleplayModeEnabled)
     }
 
 

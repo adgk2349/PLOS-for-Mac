@@ -3,6 +3,8 @@ from typing import Any
 import json
 import asyncio
 import os
+from pathlib import Path
+from datetime import datetime, timezone
 
 import logging
 import time
@@ -75,6 +77,26 @@ class ReasoningPipeline(PipelineCompatDelegates):
         self._context_loader._intent_parser = self.intent_parser
         self._context_loader._followup_resolver = self.followup_resolver
 
+    @staticmethod
+    def _chat_log_path() -> Path:
+        raw = str(os.getenv("LOCAL_AI_CHAT_LOG_PATH", "") or "").strip()
+        if raw:
+            return Path(raw).expanduser()
+        return Path.cwd() / "tmp" / "chat_stream_live.jsonl"
+
+    def _append_chat_log(self, payload: dict[str, Any]) -> None:
+        if str(os.getenv("LOCAL_AI_CHAT_LOG_ENABLED", "1") or "1").strip().lower() in {"0", "false", "no", "off"}:
+            return
+        try:
+            path = self._chat_log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            row = dict(payload)
+            row["ts"] = datetime.now(timezone.utc).isoformat()
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            return
+
     def _repair_repetitive_conversation_response(
         self,
         *,
@@ -139,7 +161,6 @@ class ReasoningPipeline(PipelineCompatDelegates):
             lines.append("open_loops: " + " | ".join(loops[:3]))
 
         recent_user_turns: list[str] = []
-        recent_assistant_turns: list[str] = []
         for row in payload.get("recent_turns") or []:
             if not isinstance(row, dict):
                 continue
@@ -149,20 +170,15 @@ class ReasoningPipeline(PipelineCompatDelegates):
                 continue
             if role == "user":
                 recent_user_turns.append(text[:140])
-            elif role == "assistant":
-                recent_assistant_turns.append(text[:180])
         if recent_user_turns:
             lines.append("recent_user: " + " / ".join(recent_user_turns[-3:]))
-        if recent_assistant_turns:
-            lines.append("recent_assistant: " + " / ".join(recent_assistant_turns[-2:]))
 
         if isinstance(last_context, dict):
             last_query = " ".join(str(last_context.get("last_user_query") or "").split()).strip()
             if last_query:
                 lines.append("last_query: " + last_query[:160])
-            last_summary = " ".join(str(last_context.get("result_summary") or "").split()).strip()
-            if last_summary:
-                lines.append("last_answer: " + last_summary[:220])
+            # Avoid feeding previous assistant phrasing back into next-turn prompt.
+            # This reduces style drift, echo loops, and multilingual contamination.
 
         summary = "\n".join(line for line in lines if line).strip()
         if not summary:
@@ -230,11 +246,27 @@ class ReasoningPipeline(PipelineCompatDelegates):
 
     async def run_stream(self, req: LocalChatRequestV2):
         self._sync_orchestrator_dependencies()
+        live_token_streaming = str(os.getenv("LOCAL_AI_STREAM_LIVE_TOKENS", "1") or "1").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        conversation_id = str(getattr(req, "conversation_id", "") or getattr(req, "session_id", "") or "").strip()
+        session_id = str(getattr(req, "session_id", "") or conversation_id).strip()
+        query = str(getattr(req, "query", "") or "")
+        self._append_chat_log(
+            {
+                "event": "request_start",
+                "conversation_id": conversation_id,
+                "session_id": session_id,
+                "query": query,
+                "mode": str(getattr(getattr(req, "mode", None), "value", getattr(req, "mode", ""))),
+            }
+        )
         inference_engine = self.dependencies.get("local_inference")
         token_queue: asyncio.Queue[str] = asyncio.Queue()
         loop = asyncio.get_running_loop()
         queue_wait_timeout = max(0.01, float(os.getenv("LOCAL_AI_STREAM_QUEUE_TIMEOUT_SEC", "0.05")))
         batch_char_limit = max(120, int(os.getenv("LOCAL_AI_STREAM_BATCH_CHARS", "420")))
+        stream_prefix_cleaned = False
 
         def _on_token(piece: str) -> None:
             value = str(piece or "")
@@ -252,26 +284,42 @@ class ReasoningPipeline(PipelineCompatDelegates):
             except (AttributeError, RuntimeError, ValueError):
                 callback_token = None
 
+        run_task: asyncio.Task | None = None
         try:
             run_task = asyncio.create_task(self.run(req))
             streamed_any = False
             composed: ComposedChatResponseV2 | None = None
+            last_progress_at = asyncio.get_running_loop().time()
+            status_interval_sec = max(3.0, float(os.getenv("LOCAL_AI_STREAM_STATUS_INTERVAL_SEC", "8")))
 
             while True:
                 if run_task.done():
                     try:
                         while True:
                             piece = self._drain_token_queue(token_queue, initial_piece=token_queue.get_nowait(), char_limit=batch_char_limit)
+                            piece, stream_prefix_cleaned = self._sanitize_stream_piece(
+                                piece,
+                                prefix_cleaned=stream_prefix_cleaned,
+                            )
                             if not piece:
                                 continue
-                            streamed_any = True
-                            yield json.dumps(
-                                {
-                                    "type": "chunk",
-                                    "text": piece,
-                                },
-                                ensure_ascii=False,
-                            ) + "\n"
+                            if live_token_streaming:
+                                streamed_any = True
+                                self._append_chat_log(
+                                    {
+                                        "event": "chunk",
+                                        "conversation_id": conversation_id,
+                                        "session_id": session_id,
+                                        "text": piece,
+                                    }
+                                )
+                                yield json.dumps(
+                                    {
+                                        "type": "chunk",
+                                        "text": piece,
+                                    },
+                                    ensure_ascii=False,
+                                ) + "\n"
                     except asyncio.QueueEmpty:
                         pass
                     composed = await run_task
@@ -279,18 +327,56 @@ class ReasoningPipeline(PipelineCompatDelegates):
                 try:
                     initial_piece = await asyncio.wait_for(token_queue.get(), timeout=queue_wait_timeout)
                 except asyncio.TimeoutError:
+                    now = asyncio.get_running_loop().time()
+                    status_enabled = str(os.getenv("LOCAL_AI_STREAM_STATUS_ENABLED", "1") or "1").strip().lower() in {
+                        "1", "true", "yes", "on"
+                    }
+                    if not run_task.done() and status_enabled and (now - last_progress_at) >= status_interval_sec:
+                        last_progress_at = now
+                        status_message = "로컬 모델이 생성 중입니다..."
+                        if str(getattr(req, "lang", "") or "").lower().startswith("en"):
+                            status_message = "local model is still generating..."
+                        yield json.dumps(
+                            {
+                                "type": "status",
+                                "message": status_message,
+                            },
+                            ensure_ascii=False,
+                        ) + "\n"
+                        self._append_chat_log(
+                            {
+                                "event": "status",
+                                "conversation_id": conversation_id,
+                                "session_id": session_id,
+                                "message": status_message,
+                            }
+                        )
                     continue
                 piece = self._drain_token_queue(token_queue, initial_piece=initial_piece, char_limit=batch_char_limit)
+                piece, stream_prefix_cleaned = self._sanitize_stream_piece(
+                    piece,
+                    prefix_cleaned=stream_prefix_cleaned,
+                )
                 if not piece:
                     continue
-                streamed_any = True
-                yield json.dumps(
-                    {
-                        "type": "chunk",
-                        "text": piece,
-                    },
-                    ensure_ascii=False,
-                ) + "\n"
+                last_progress_at = asyncio.get_running_loop().time()
+                if live_token_streaming:
+                    streamed_any = True
+                    self._append_chat_log(
+                        {
+                            "event": "chunk",
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "text": piece,
+                        }
+                    )
+                    yield json.dumps(
+                        {
+                            "type": "chunk",
+                            "text": piece,
+                        },
+                        ensure_ascii=False,
+                    ) + "\n"
 
             if composed is None:
                 composed = await run_task
@@ -333,6 +419,23 @@ class ReasoningPipeline(PipelineCompatDelegates):
                 },
                 ensure_ascii=False,
             ) + "\n"
+            self._append_chat_log(
+                {
+                    "event": "done",
+                    "conversation_id": conversation_id,
+                    "session_id": session_id,
+                    "generated_text": str(getattr(composed, "generated_text", "") or ""),
+                    "runtime_detail": str(getattr(composed, "runtime_detail", "") or ""),
+                }
+            )
+        except asyncio.CancelledError:
+            if run_task is not None and not run_task.done():
+                run_task.cancel()
+                try:
+                    await asyncio.wait_for(run_task, timeout=1.0)
+                except BaseException:
+                    pass
+            raise
         except Exception as exc:
             logger.exception("[Orchestrator] Stream execution failed: %s", exc)
             yield json.dumps(
@@ -342,7 +445,21 @@ class ReasoningPipeline(PipelineCompatDelegates):
                 },
                 ensure_ascii=False,
             ) + "\n"
+            self._append_chat_log(
+                {
+                    "event": "error",
+                    "conversation_id": conversation_id,
+                    "session_id": session_id,
+                    "message": str(exc) or "stream execution failed",
+                }
+            )
         finally:
+            if run_task is not None and not run_task.done():
+                run_task.cancel()
+                try:
+                    await asyncio.wait_for(run_task, timeout=1.0)
+                except BaseException:
+                    pass
             if inference_engine is not None and callback_token is not None and hasattr(inference_engine, "reset_stream_token_callback"):
                 try:
                     inference_engine.reset_stream_token_callback(callback_token)
@@ -386,4 +503,43 @@ class ReasoningPipeline(PipelineCompatDelegates):
             chunks.append(raw[start:end])
             start = end
         return chunks
+
+    @staticmethod
+    def _sanitize_stream_piece(piece: str, *, prefix_cleaned: bool) -> tuple[str, bool]:
+        text = str(piece or "")
+        if not text:
+            return "", prefix_cleaned
+        text = re.sub(r"(?im)^\s*continuation\s*:\s*", "", text)
+        text = re.sub(r"(?im)^:?\s*please\s*provide\s*the\s*text\s*you\s*would\s*like\s*me\s*to\s*continue\.?\s*$", "", text)
+        text = re.sub(r"(?i)pleaseprovidethetextyouwouldlikemetocontinue\.?", "", text)
+        # Remove leaking control/header tokens everywhere in stream chunks.
+        text = re.sub(r"(?is)<\|channel\|?>\s*(?:thought|analysis|final)?\s*", "", text)
+        text = re.sub(r"(?is)<\|start_header_id\|>.*?<\|end_header_id\|>\s*", "", text)
+        text = re.sub(r"(?is)<\|eot_id\|>", "", text)
+        # Strip leading role/answer prefixes only once at stream start.
+        cleaned_flag = prefix_cleaned
+        if not cleaned_flag:
+            text = re.sub(r"(?im)^\s*(?:answer|response|final answer|답변|최종 답변)\s*[:：]\s*", "", text)
+            text = re.sub(r"(?im)^\s*(?:assistant|user|you|a|q)\s*[:：]?\s*", "", text)
+            cleaned_flag = True
+        stripped = text.strip().lower()
+        if stripped in {
+            "answer",
+            "answer:",
+            "response",
+            "response:",
+            "final",
+            "final:",
+            "final answer",
+            "final answer:",
+            "thought",
+            "analysis",
+            "assistant",
+            "user",
+            ":",
+        }:
+            return "", cleaned_flag
+        if not text.strip():
+            return "", cleaned_flag
+        return text, cleaned_flag
  

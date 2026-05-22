@@ -12,6 +12,7 @@ enum ExtensionCapability: String, Codable, CaseIterable, Identifiable, Hashable 
     case finetuneJobSubmit = "finetune.job_submit"
     case finetuneJobStatus = "finetune.job_status"
     case finetuneModelPublish = "finetune.model_publish"
+    case imageGenerate = "image.generate"
 
     var id: String { rawValue }
 
@@ -39,6 +40,8 @@ enum ExtensionCapability: String, Codable, CaseIterable, Identifiable, Hashable 
             return L10n.tr("extension_capability.finetune_job_status", language: language, fallbackKo: "파인튜닝 상태 조회", fallbackEn: "Finetune Status", fallbackJa: "微調整ステータス")
         case .finetuneModelPublish:
             return L10n.tr("extension_capability.finetune_model_publish", language: language, fallbackKo: "파인튜닝 모델 배포", fallbackEn: "Finetune Publish", fallbackJa: "微調整モデル公開")
+        case .imageGenerate:
+            return L10n.tr("extension_capability.image_generate", language: language, fallbackKo: "이미지 생성", fallbackEn: "Image Generate", fallbackJa: "画像生成")
         }
     }
 
@@ -111,6 +114,133 @@ enum PluginPrivacyMode: String, Codable, CaseIterable, Identifiable, Hashable {
     }
 }
 
+enum PluginUIToggleLocation: String, Codable, Hashable {
+    case composerModelControls = "composer.model_controls"
+}
+
+struct PluginUIToggleSpec: Codable, Identifiable, Hashable {
+    var id: String
+    var location: PluginUIToggleLocation
+    var default_enabled: Bool = false
+    var title_ko: String?
+    var title_en: String?
+    var title_ja: String?
+    var help_ko: String?
+    var help_en: String?
+    var help_ja: String?
+
+    func title(language: AppLanguage) -> String {
+        switch language {
+        case .kor:
+            return title_ko ?? title_en ?? title_ja ?? id
+        case .jpn:
+            return title_ja ?? title_en ?? title_ko ?? id
+        case .eng:
+            return title_en ?? title_ko ?? title_ja ?? id
+        case .auto:
+            return title_ko ?? title_en ?? title_ja ?? id
+        default:
+            return title_en ?? title_ko ?? title_ja ?? id
+        }
+    }
+
+    func help(language: AppLanguage) -> String? {
+        switch language {
+        case .kor:
+            return help_ko ?? help_en ?? help_ja
+        case .jpn:
+            return help_ja ?? help_en ?? help_ko
+        case .eng:
+            return help_en ?? help_ko ?? help_ja
+        case .auto:
+            return help_ko ?? help_en ?? help_ja
+        default:
+            return help_en ?? help_ko ?? help_ja
+        }
+    }
+}
+
+struct PluginUIManifest: Codable, Hashable {
+    var toggles: [PluginUIToggleSpec] = []
+    var views: [PluginUIViewSpec] = []
+}
+
+enum PluginUIViewLocation: String, Codable, Hashable {
+    case mainPanel = "main.panel"
+}
+
+enum PluginUIViewType: String, Codable, Hashable {
+    case imageStudio = "image_studio"
+    case customForm = "custom_form"
+}
+
+struct PluginUIViewSpec: Codable, Identifiable, Hashable {
+    var id: String
+    var location: PluginUIViewLocation
+    var view_type: PluginUIViewType
+    var title_ko: String?
+    var title_en: String?
+    var title_ja: String?
+    var help_ko: String?
+    var help_en: String?
+    var help_ja: String?
+    var schema: [String: JSONValue]
+
+    init(
+        id: String,
+        location: PluginUIViewLocation,
+        view_type: PluginUIViewType,
+        title_ko: String? = nil,
+        title_en: String? = nil,
+        title_ja: String? = nil,
+        help_ko: String? = nil,
+        help_en: String? = nil,
+        help_ja: String? = nil,
+        schema: [String: JSONValue] = [:]
+    ) {
+        self.id = id
+        self.location = location
+        self.view_type = view_type
+        self.title_ko = title_ko
+        self.title_en = title_en
+        self.title_ja = title_ja
+        self.help_ko = help_ko
+        self.help_en = help_en
+        self.help_ja = help_ja
+        self.schema = schema
+    }
+
+    func title(language: AppLanguage) -> String {
+        switch language {
+        case .kor:
+            return title_ko ?? title_en ?? title_ja ?? id
+        case .jpn:
+            return title_ja ?? title_en ?? title_ko ?? id
+        case .eng:
+            return title_en ?? title_ko ?? title_ja ?? id
+        case .auto:
+            return title_ko ?? title_en ?? title_ja ?? id
+        default:
+            return title_en ?? title_ko ?? title_ja ?? id
+        }
+    }
+
+    func help(language: AppLanguage) -> String? {
+        switch language {
+        case .kor:
+            return help_ko ?? help_en ?? help_ja
+        case .jpn:
+            return help_ja ?? help_en ?? help_ko
+        case .eng:
+            return help_en ?? help_ko ?? help_ja
+        case .auto:
+            return help_ko ?? help_en ?? help_ja
+        default:
+            return help_en ?? help_ko ?? help_ja
+        }
+    }
+}
+
 struct PluginManifestV1: Codable, Hashable {
     var plugin_id: String
     var version: String
@@ -121,6 +251,7 @@ struct PluginManifestV1: Codable, Hashable {
     var entrypoint: String
     var signature: String?
     var build_target: PluginBuildTarget
+    var ui: PluginUIManifest?
 }
 
 struct ExtensionCapabilityState: Codable, Identifiable, Hashable {
@@ -165,4 +296,63 @@ struct PluginRegisterRequest: Codable {
 struct PluginEnableResponse: Codable {
     var plugin: PluginRegistryEntry
     var capabilities: [ExtensionCapabilityState]
+}
+
+struct PluginPanelOpenRequest: Codable {
+    var plugin_id: String
+    var panel_id: String?
+}
+
+struct PluginPanelOpenResponse: Codable {
+    var plugin_id: String
+    var panel_id: String
+    var view_type: PluginUIViewType
+    var title: String
+    var help: String?
+    var schema: [String: JSONValue]
+    var defaults: [String: JSONValue]
+}
+
+struct PluginPanelActionRequest: Codable {
+    var plugin_id: String
+    var panel_id: String
+    var action: String
+    var payload: [String: JSONValue]
+}
+
+struct PluginPanelActionResponse: Codable {
+    var plugin_id: String
+    var panel_id: String
+    var job_id: String
+    var status: String
+    var result: [String: JSONValue]
+    var error: String?
+}
+
+struct PluginPanelStatusResponse: Codable {
+    var plugin_id: String
+    var panel_id: String
+    var job_id: String
+    var status: String
+    var result: [String: JSONValue]
+    var error: String?
+}
+
+struct ExtensionImageGenerateRequest: Codable {
+    var plugin_id: String
+    var prompt: String
+    var negative_prompt: String?
+    var width: Int
+    var height: Int
+    var steps: Int
+    var seed: Int?
+    var batch: Int
+}
+
+struct ExtensionImageGenerateResponse: Codable {
+    var plugin_id: String
+    var job_id: String
+    var status: String
+    var result: [String: JSONValue]
+    var error: String?
 }

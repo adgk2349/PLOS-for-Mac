@@ -201,31 +201,48 @@ class SettingsSysHelpers:
         return merged
 
     @classmethod
-    def conversation_max_tokens(cls, response_length: str, model_profile: str = "recommended", query: str = "") -> int:
-        """Map response_length preference to a max_tokens cap for conversation turns, scaled by model profile and query depth."""
+    def conversation_max_tokens(
+        cls,
+        response_length: str,
+        model_profile: str = "recommended",
+        query: str = "",
+        adaptive_scale_override: float | None = None,
+    ) -> int:
+        """Map response_length preference to a conversation max_tokens cap tuned for interactive chat latency."""
         profile = str(model_profile or "recommended").lower()
-        # Base mapping for 'recommended' profile scaled up for Turbo
+        query_text = str(query or "").strip()
+        lowered = query_text.lower()
+
+        # Conversation-first defaults: keep outputs responsive on local hardware.
         mapping = {
-            "short": 320,
-            "medium": 640,
-            "long": 1280,
+            "short": 256,
+            "medium": 512,
+            "long": 1024,
         }
-        base = mapping.get(str(response_length).lower(), 1280)
-        
-        # Scaling factors for different profiles
+        base = mapping.get(str(response_length).lower(), 512)
+
+        # Scale by profile but avoid runaway default budgets.
         if profile == "deep" or profile == "advanced":
-            # Deep/High Quality: Scale 'long' to 4096
-            multiplier = 3.2
+            multiplier = 1.5
         elif profile == "fast":
-            # Fast: Scale 'long' to 1024
             multiplier = 0.8
         else:
-            # Recommended/Balanced: Scale 'long' to 2048
-            multiplier = 1.6
-            
-        # Boost for explicit "detailed" requests (up to 25% extra within RAM caps)
-        if query and cls.is_detailed_explanation_requested(query):
+            multiplier = 1.0
+
+        # Casual / phatic chat should stay concise regardless of preferred length.
+        casual_tokens = ("안녕", "hi", "hello", "ㅎㅇ", "뭐해", "how are you", "날씨 어때", "점심 뭐", "저녁 뭐")
+        if query_text and any(token in lowered for token in casual_tokens):
+            base = min(base, 256)
+
+        # Explicit detail request may increase budget moderately.
+        if query_text and cls.is_detailed_explanation_requested(query_text):
             multiplier *= 1.25
+
+        if adaptive_scale_override is not None:
+            try:
+                multiplier *= max(0.5, min(1.5, float(adaptive_scale_override)))
+            except Exception:
+                pass
 
         scaled = int(base * multiplier)
         capped = min(scaled, cls.memory_capped_conversation_max_tokens())

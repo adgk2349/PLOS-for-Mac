@@ -46,6 +46,18 @@ from ...answer_contract import (
 class GeneralChatUtilityMixin:
 
     @staticmethod
+    def _looks_leading_fragment(text: str) -> bool:
+        value = str(text or "").strip()
+        if not value:
+            return False
+        return bool(
+            re.match(
+                r"^(?:께(?:서는|요)?|을|를|이|가|은|는|도)\s*(?:붙여드리겠습니다|도와드리겠습니다|안내해드리겠습니다|질문하신|오늘|집중)",
+                value,
+            )
+        )
+
+    @staticmethod
     def _wait_for_port(host: str, port: int, *, timeout_seconds: float = 6.0) -> bool:
         return GeneralChatWebExecutionHelpers.wait_for_port(host, port, timeout_seconds=timeout_seconds)
 
@@ -103,11 +115,8 @@ class GeneralChatUtilityMixin:
 
     @staticmethod
     def _default_last_resort_direct_message(*, response_language: str) -> str:
-        if response_language == "ko":
-            return "지금 로컬 추론이 지연되어 답변 생성에 실패했습니다. 잠시 후 같은 질문을 다시 시도해 주세요."
-        if response_language == "ja":
-            return "現在ローカル推論が遅延しており、回答生成に失敗しました。少し後でもう一度お試しください。"
-        return "Local inference is currently delayed and failed to produce an answer. Please retry shortly."
+        # Keep empty to avoid fixed-template fallback replies.
+        return ""
 
     @staticmethod
     def _split_answer_tokens_cap() -> int:
@@ -144,19 +153,19 @@ class GeneralChatUtilityMixin:
             return {"temperature": 0.64, "top_p": 0.93, "top_k": 56, "repeat_penalty": 1.07}
         if normalized_profile == "coding":
             if attempt_index <= 0:
-                return {"temperature": 0.30, "top_p": 0.88, "top_k": 28, "repeat_penalty": 1.12}
-            return {"temperature": 0.26, "top_p": 0.86, "top_k": 24, "repeat_penalty": 1.10}
+                return {"temperature": 0.38, "top_p": 0.90, "top_k": 32, "repeat_penalty": 1.15}
+            return {"temperature": 0.34, "top_p": 0.88, "top_k": 28, "repeat_penalty": 1.14}
         if normalized_profile == "concise":
             if attempt_index <= 0:
-                return {"temperature": 0.52, "top_p": 0.92, "top_k": 44, "repeat_penalty": 1.10}
-            return {"temperature": 0.44, "top_p": 0.90, "top_k": 36, "repeat_penalty": 1.10}
+                return {"temperature": 0.52, "top_p": 0.90, "top_k": 36, "repeat_penalty": 1.16}
+            return {"temperature": 0.48, "top_p": 0.88, "top_k": 32, "repeat_penalty": 1.15}
         if normalized_profile == "analytic":
             if attempt_index <= 0:
-                return {"temperature": 0.42, "top_p": 0.90, "top_k": 34, "repeat_penalty": 1.12}
-            return {"temperature": 0.36, "top_p": 0.88, "top_k": 30, "repeat_penalty": 1.11}
+                return {"temperature": 0.50, "top_p": 0.92, "top_k": 38, "repeat_penalty": 1.16}
+            return {"temperature": 0.46, "top_p": 0.90, "top_k": 34, "repeat_penalty": 1.15}
         if attempt_index <= 0:
-            return {"temperature": 0.46, "top_p": 0.91, "top_k": 38, "repeat_penalty": 1.11}
-        return {"temperature": 0.38, "top_p": 0.89, "top_k": 32, "repeat_penalty": 1.10}
+            return {"temperature": 0.55, "top_p": 0.92, "top_k": 40, "repeat_penalty": 1.16}
+        return {"temperature": 0.50, "top_p": 0.90, "top_k": 36, "repeat_penalty": 1.15}
 
     @staticmethod
     def _looks_incomplete_answer(text: str) -> bool:
@@ -417,11 +426,96 @@ class GeneralChatUtilityMixin:
         )
         if tone_pref:
             identity.append(f"- 선호하는 대화 스타일: {tone_pref}")
+
+        session_items = list(getattr(memory_bundle, "session_items", []) or [])
+        fact_lines: list[str] = []
+        for item in session_items:
+            key = str(getattr(item, "key", "") or "").strip()
+            if not key.startswith("fact:"):
+                continue
+            value_json = getattr(item, "value_json", None)
+            if not isinstance(value_json, dict):
+                continue
+            subject = str(value_json.get("subject") or key.split(":", 1)[1]).strip()
+            value = str(value_json.get("value") or "").strip()
+            if not value:
+                continue
+            fact_lines.append(f"- {subject}: {value}")
+            if len(fact_lines) >= 8:
+                break
+        if fact_lines:
+            identity.append("[기억된 사용자 사실]")
+            identity.extend(fact_lines)
+
+        pinned_items = list(getattr(memory_bundle, "pinned_items", []) or [])
+        pinned_lines: list[str] = []
+        for item in pinned_items:
+            scope = str(getattr(item, "scope", "") or "").strip().lower()
+            if scope != "global":
+                continue
+            title = str(getattr(item, "title", "") or "").strip()
+            content = str(getattr(item, "content", "") or "").strip()
+            merged = " - ".join(part for part in [title, content] if part).strip(" -")
+            if not merged:
+                continue
+            pinned_lines.append(f"- {merged}")
+            if len(pinned_lines) >= 5:
+                break
+        if pinned_lines:
+            identity.append("[직접 저장한 전역 메모]")
+            identity.extend(pinned_lines)
             
         if not identity:
             return ""
             
         return "\n[사용자 개인화 정보]\n" + "\n".join(identity) + "\n"
+
+    def _build_conversation_memory_context(self, memory_bundle: Optional[Any], *, response_language: str) -> str:
+        if not memory_bundle:
+            return ""
+        session_items = list(getattr(memory_bundle, "session_items", []) or [])
+        fact_lines: list[str] = []
+        scene_lines: list[str] = []
+        for item in session_items:
+            key = str(getattr(item, "key", "") or "").strip()
+            value_json = getattr(item, "value_json", None)
+            if not isinstance(value_json, dict):
+                continue
+            if key.startswith("fact:"):
+                summary = str(value_json.get("summary") or "").strip()
+                if summary:
+                    fact_lines.append(summary)
+                if len(fact_lines) >= 6:
+                    continue
+            if key.startswith("scene:"):
+                scene_q = str(value_json.get("query") or "").strip()
+                if scene_q:
+                    scene_lines.append(scene_q)
+                if len(scene_lines) >= 4:
+                    continue
+        if not fact_lines and not scene_lines:
+            return ""
+        if response_language == "ko":
+            fact_blob = "; ".join(fact_lines[:4]).strip()
+            scene_blob = "; ".join(scene_lines[:2]).strip()
+            context_blob = " | ".join([chunk for chunk in (fact_blob, scene_blob) if chunk]).strip()
+            if not context_blob:
+                return ""
+            return (
+                "내부 참고 메모리: "
+                f"{context_blob}\n"
+                "지시: 위 메모리는 내부 참고용이며, 그대로 복사하지 말고 현재 질문에 맞게 자연스럽게 반영해서 답하세요.\n"
+            )
+        fact_blob = "; ".join(fact_lines[:4]).strip()
+        scene_blob = "; ".join(scene_lines[:2]).strip()
+        context_blob = " | ".join([chunk for chunk in (fact_blob, scene_blob) if chunk]).strip()
+        if not context_blob:
+            return ""
+        return (
+            "Internal memory reference: "
+            f"{context_blob}\n"
+            "Instruction: use this only as hidden context and respond naturally to the current user request.\n"
+        )
 
     @classmethod
     def _trim_redundant_opening_from_last_context(
@@ -448,14 +542,18 @@ class GeneralChatUtilityMixin:
             if len(first_sentence) >= 18:
                 previous_head = first_sentence
 
-        if normalized_answer.startswith(previous):
-            stripped = normalized_answer[len(previous):].lstrip(" \n\t:;,-")
-            if len(stripped) >= 12:
-                return stripped
-        if previous_head and normalized_answer.startswith(previous_head):
-            stripped = normalized_answer[len(previous_head):].lstrip(" \n\t:;,-")
-            if len(stripped) >= 12:
-                return stripped
+        # Safety-first trim policy:
+        # trim only when the opening sentence is an exact duplicate of previous summary head,
+        # and never trim partial-token overlaps such as "당신의" -> "의".
+        ans_sentences = [cls._normalize_space(s) for s in re.split(r"(?<=[.!?。！？])\s+|\n+", normalized_answer) if cls._normalize_space(s)]
+        if not ans_sentences:
+            return candidate
+        first_sentence = ans_sentences[0]
+        prev_sentence = cls._normalize_space(previous_head)
+        if len(first_sentence) >= 18 and first_sentence == prev_sentence:
+            remainder = normalized_answer[len(first_sentence):].lstrip(" \n\t:;,-")
+            if len(remainder) >= 12:
+                return remainder
         return candidate
 
     @staticmethod
@@ -568,6 +666,11 @@ class GeneralChatUtilityMixin:
         followup_resolution: FollowUpResolution | None,
         last_context: dict[str, Any] | None,
     ) -> str:
+        enabled = str(os.getenv("LOCAL_AI_CONVERSATION_FOLLOWUP_HINT_ENABLED", "0") or "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if not enabled:
+            return ""
         if not isinstance(last_context, dict):
             return ""
         text = str(query or "").strip()
@@ -585,8 +688,7 @@ class GeneralChatUtilityMixin:
             return ""
 
         previous_query = str(last_context.get("last_user_query") or "").strip()[:180]
-        previous_summary = str(last_context.get("result_summary") or "").strip()[:280]
-        if not previous_query and not previous_summary:
+        if not previous_query:
             return ""
 
         if response_language == "ko":
@@ -594,14 +696,12 @@ class GeneralChatUtilityMixin:
                 "<followup_hint>\n"
                 "후속 질문이면 같은 맥락으로 이어서 답하고, 새 주제가 명확하면 전환하세요.\n"
                 f"- 이전 질문: {previous_query}\n"
-                f"- 이전 요약: {previous_summary}\n"
                 "</followup_hint>"
             )
         return (
             "<followup_hint>\n"
             "If this is a follow-up, continue the same context. Switch topics only when explicitly requested.\n"
             f"- Previous question: {previous_query}\n"
-            f"- Previous summary: {previous_summary}\n"
             "</followup_hint>"
         )
 

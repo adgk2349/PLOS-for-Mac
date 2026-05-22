@@ -110,7 +110,7 @@ def _patch_direct_web_search(monkeypatch, fake_direct_web_search):
         return rows[:3], logs, meta
 
     monkeypatch.setattr(
-        "local_ai_core.reasoning.strategies.general_chat.GeneralChatStrategy._run_web_reasoning_loop",
+        "local_ai_core.reasoning.strategies.general_chat_sections.general_chat_web_mixin.GeneralChatWebMixin._run_web_reasoning_loop",
         _fake_loop,
     )
 

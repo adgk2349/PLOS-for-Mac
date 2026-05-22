@@ -112,7 +112,7 @@ def _patch_direct_web_search(monkeypatch, fake_direct_web_search):
         return rows[:3], logs, meta
 
     monkeypatch.setattr(
-        "local_ai_core.reasoning.strategies.general_chat.GeneralChatStrategy._run_web_reasoning_loop",
+        "local_ai_core.reasoning.strategies.general_chat_sections.general_chat_web_mixin.GeneralChatWebMixin._run_web_reasoning_loop",
         _fake_loop,
     )
 
@@ -188,15 +188,8 @@ def test_v2_chat_auto_web_search_for_latest_uncertain_query(client, auth_headers
     )
     assert v2.status_code == 200
     payload = v2.json()
-    assert payload["metadata"]["conversation_path"] in {
-        "external_web_search_direct",
-        "external_web_search_unavailable",
-        "local_conversation",
-    }
-    if payload["metadata"]["conversation_path"] == "external_web_search_direct":
-        assert payload["metadata"]["web_path"] == "direct"
-    elif payload["metadata"]["conversation_path"] == "external_web_search_unavailable":
-        assert payload["metadata"]["web_path"] == "unavailable"
+    assert payload["metadata"]["conversation_path"] == "external_web_search_direct"
+    assert payload["metadata"]["web_path"] == "direct"
     assert payload["metadata"]["web_auto_triggered"] is True
     assert payload["structured_result"]["summary"]
 
@@ -326,10 +319,7 @@ def test_v2_chat_web_search_followup_keeps_web_path(client, auth_headers, monkey
     )
     assert first.status_code == 200
     first_payload = first.json()
-    assert first_payload["metadata"]["conversation_path"] in {
-        "external_web_search_direct",
-        "external_web_search_unavailable",
-    }
+    assert first_payload["metadata"]["conversation_path"] == "external_web_search_direct"
 
     second = client.post(
         "/v2/chat/local",
@@ -346,13 +336,10 @@ def test_v2_chat_web_search_followup_keeps_web_path(client, auth_headers, monkey
     second_payload = second.json()
     assert second_payload["metadata"]["conversation_path"] in {
         "external_web_search_direct",
-        "external_web_search_unavailable",
         "local_conversation",
     }
     if second_payload["metadata"]["conversation_path"] == "external_web_search_direct":
         assert second_payload["metadata"]["web_path"] == "direct"
-    elif second_payload["metadata"]["conversation_path"] == "external_web_search_unavailable":
-        assert second_payload["metadata"]["web_path"] == "unavailable"
     assert isinstance(second_payload["citations"], list)
     assert calls["count"] >= 1
     if second_payload["metadata"]["conversation_path"] == "external_web_search_direct":
@@ -498,17 +485,22 @@ def test_v2_chat_contextless_web_search_directive_inherits_previous_local_questi
     pipeline = main.app_state.chat._pipeline
     web_queries: list[str] = []
 
-    def _fake_execute_conversation(*, query, mode, startup_profile, engine, mlx_model_path, llama_model_path, language_preference, session_summary, max_tokens):
+    def _fake_execute_conversation(*, query, mode, startup_profile, engine, mlx_model_path, llama_model_path, language_preference, session_summary, max_tokens, **kwargs):
+        text = "파이썬은 프로그래밍 언어입니다." if "파이썬" in query else f"로컬 답변: {query}"
         return ExecutionResult(
             result_type="conversation",
             structured_payload={"style": "general_chat", "source": "local_model", "ungrounded_allowed": True},
             citations=[],
             tool_logs=["router:intent=general_chat"],
-            generated_text=f"로컬 답변: {query}",
+            generated_text=text,
             engine_used=LocalEngine.LLAMA_CPP,
             used_fallback=False,
             runtime_detail="local_only=1",
         )
+
+    async def _fake_execute_conversation_async(**kwargs):
+        kwargs.pop("timeout_seconds", None)
+        return _fake_execute_conversation(**kwargs)
 
     def _fake_direct_web_search(*, query, mode, response_language, workspace, settings, response_length):
         web_queries.append(query)
@@ -529,6 +521,7 @@ def test_v2_chat_contextless_web_search_directive_inherits_previous_local_questi
         )
 
     monkeypatch.setattr(pipeline._executor, "execute_conversation", _fake_execute_conversation)
+    monkeypatch.setattr(pipeline._executor, "execute_conversation_async", _fake_execute_conversation_async)
     _patch_direct_web_search(monkeypatch, _fake_direct_web_search)
 
     first = client.post(

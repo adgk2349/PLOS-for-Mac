@@ -33,6 +33,7 @@ struct MainWorkspaceView: View {
     @State private var showStatusPanel = false
     @State private var isSidebarCollapsed = false
     @State private var selectedSidebarFolder: SidebarFolder = .chats
+    @State private var isPluginAccordionExpanded = true
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
@@ -45,8 +46,14 @@ struct MainWorkspaceView: View {
                             .frame(width: sidebarWidth)
                     }
 
-                    ChatPanelView(viewModel: viewModel, isSidebarCollapsed: $isSidebarCollapsed)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    Group {
+                        if viewModel.selectedMainPanel == .plugin {
+                            PluginPanelHostView(viewModel: viewModel)
+                        } else {
+                            ChatPanelView(viewModel: viewModel, isSidebarCollapsed: $isSidebarCollapsed)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
 
                 if showSettingsPanel {
@@ -102,6 +109,7 @@ struct MainWorkspaceView: View {
         .onChange(of: selectedSidebarFolder) { _, newValue in
             if newValue == .chats {
                 viewModel.selectFirstInboxRoomIfNeeded()
+                viewModel.switchToChatPanel()
             }
         }
     }
@@ -129,6 +137,8 @@ struct MainWorkspaceView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
                 .plosGlassCapsule(tint: Color.white.opacity(0.02))
+
+            pluginAccordion
 
             HStack(spacing: 8) {
                 folderButton(.chats, count: viewModel.inboxChatRooms.count)
@@ -322,6 +332,7 @@ struct MainWorkspaceView: View {
             selectedSidebarFolder = folder
             if folder == .chats {
                 viewModel.selectFirstInboxRoomIfNeeded()
+                viewModel.switchToChatPanel()
             }
         } label: {
             HStack(spacing: 6) {
@@ -342,6 +353,46 @@ struct MainWorkspaceView: View {
         .buttonStyle(.plain)
     }
 
+    @ViewBuilder
+    private var pluginAccordion: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    isPluginAccordionExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "puzzlepiece.extension")
+                        .font(.caption.weight(.semibold))
+                    Text(L10n.tr("workspace.sidebar.folder.plugins", language: viewModel.appLanguage, fallbackKo: "플러그인", fallbackEn: "Plugins", fallbackJa: "プラグイン"))
+                        .font(.caption.weight(.semibold))
+                    Text("\(viewModel.sidebarPluginPanels.count)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    Image(systemName: isPluginAccordionExpanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .plosGlassInputFrame(radius: 10)
+            }
+            .buttonStyle(.plain)
+
+            if isPluginAccordionExpanded {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        pluginRows
+                    }
+                }
+                .frame(maxHeight: 188)
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
     private func roomPreview(_ room: ChatRoom) -> String {
         guard let last = room.messages.last else {
             return L10n.tr("workspace.sidebar.start_conversation", language: viewModel.appLanguage, fallbackKo: "대화를 시작해보세요", fallbackEn: "Start a conversation", fallbackJa: "会話を始めましょう")
@@ -359,6 +410,52 @@ struct MainWorkspaceView: View {
             return last.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                 ? (last.text ?? "").precomposedStringWithCanonicalMapping
                 : L10n.tr("workspace.sidebar.preview.external_response", language: viewModel.appLanguage, fallbackKo: "외부 분석 응답", fallbackEn: "External analysis response", fallbackJa: "外部分析応答")
+        }
+    }
+
+    @ViewBuilder
+    private var pluginRows: some View {
+        let panels = filteredPluginPanels
+        if panels.isEmpty {
+            Text(L10n.tr("workspace.sidebar.no_plugins", language: viewModel.appLanguage, fallbackKo: "표시할 플러그인 패널이 없습니다", fallbackEn: "No plugin panels available", fallbackJa: "表示できるプラグインパネルがありません"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+        } else {
+            ForEach(panels) { panel in
+                Button {
+                    viewModel.selectPluginPanel(pluginID: panel.pluginID, panelID: panel.panelID)
+                } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(panel.title)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                        Text(panel.subtitle ?? panel.pluginID)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(panel.id == viewModel.selectedPluginPanelCompositeID && viewModel.selectedMainPanel == .plugin ? Color.white.opacity(0.08) : Color.clear)
+                    .plosGlassInputFrame(radius: 12)
+                }
+                .buttonStyle(.plain)
+                .disabled(!panel.pluginEnabled)
+            }
+        }
+    }
+
+    private var filteredPluginPanels: [AppViewModel.SidebarPluginPanelItem] {
+        let needle = sidebarSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let panels = viewModel.sidebarPluginPanels
+        guard !needle.isEmpty else { return panels }
+        return panels.filter { panel in
+            panel.title.precomposedStringWithCanonicalMapping.lowercased().contains(needle) ||
+            (panel.subtitle ?? "").precomposedStringWithCanonicalMapping.lowercased().contains(needle) ||
+            panel.pluginID.lowercased().contains(needle)
         }
     }
 

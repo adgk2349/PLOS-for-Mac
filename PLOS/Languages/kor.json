@@ -6,6 +6,7 @@
   "is_default": true,
   "strings": {
     "settings.title": "설정",
+    "chat.empty_response_fallback": "응답이 중간에 비어 종료되었습니다. 한 번 더 시도해 주세요.",
     "settings.language.option.auto": "자동",
     "privacy_mode.local_only": "완전 로컬",
     "privacy_mode.hybrid": "하이브리드",

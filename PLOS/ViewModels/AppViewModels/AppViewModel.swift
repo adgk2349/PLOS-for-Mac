@@ -138,6 +138,19 @@ struct LiveThinkingTraceEvent: Identifiable, Equatable {
     let at: String?
 }
 
+struct ComposerAttachment: Identifiable, Hashable {
+    let id: String
+    let kind: ChatAttachmentKind
+    let filePath: String
+    let fileName: String
+    let mimeType: String?
+}
+
+enum MainPanelSelection: String, Codable {
+    case chat
+    case plugin
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     static let fixedCategories = ["학습자료", "프로젝트문서", "회의록", "아이디어", "개인메모", "참고자료", "코드관련"]
@@ -161,6 +174,7 @@ final class AppViewModel: ObservableObject {
     @Published var selectedMode: WorkMode = .general
     @Published var selectedProvider = "openai"
     @Published var inputQuery = ""
+    @Published var composerAttachments: [ComposerAttachment] = []
     @Published var openAIAPIKey = ""
     @Published var anthropicAPIKey = ""
     @Published var localEngine: LocalEngine = .mlx
@@ -182,6 +196,38 @@ final class AppViewModel: ObservableObject {
     @Published var catalogInstallProgress: [String: Double] = [:]
     @Published var modelDownloadProgressPercent: Double?
     @Published var showAdvancedModelDetails = false
+    @Published var sidecarVisionEnabled = true
+    @Published var sidecarVisionCaptionModel = "microsoft/git-base-coco"
+    @Published var sidecarVisionClassifyModel = "google/vit-base-patch16-224"
+    @Published var sidecarMlxKVQEnabled = false
+    @Published var sidecarMlxKVQMode: SidecarMlxKVQMode = .turbo3
+    @Published var sidecarMlxKVQBits = 3
+    @Published var sidecarConversationTurboEnabled = false
+    @Published var sidecarInferenceTimeoutDisabled = false
+    @Published var sidecarMainResponseTimeoutSeconds = 240
+    @Published var sidecarAuxiliaryTimeoutSeconds = 12
+    @Published var showThinkingProcessInChat = true
+    @Published var pluginUIToggleStates: [String: Bool] = [:]
+    @Published var selectedMainPanel: MainPanelSelection = .chat
+    @Published var selectedPluginPanelID = ""
+    @Published var selectedPluginPanelViewID = ""
+    @Published var activePluginPanel: PluginPanelOpenResponse?
+    @Published var pluginPanelPrompt = ""
+    @Published var pluginPanelNegativePrompt = ""
+    @Published var pluginPanelWidth = 1024
+    @Published var pluginPanelHeight = 1024
+    @Published var pluginPanelSteps = 6
+    @Published var pluginPanelSeedText = ""
+    @Published var pluginPanelBatch = 1
+    @Published var pluginPanelModelID = "sdxl-lightning"
+    @Published var pluginPanelRepoID = "ByteDance/SDXL-Lightning"
+    @Published var pluginPanelFilename = ""
+    @Published var pluginPanelDownloadMessage = ""
+    @Published var pluginPanelInstalledModels: [String] = []
+    @Published var pluginPanelActiveModelID = ""
+    @Published var pluginPanelImages: [String] = []
+    @Published var pluginPanelIsBusy = false
+    @Published var pluginPanelLastJobID: String?
     @Published var extensionCapabilities: [ExtensionCapabilityState] = []
     @Published var pluginEntries: [PluginRegistryEntry] = []
     @Published var isPluginBusy = false
@@ -251,6 +297,11 @@ final class AppViewModel: ObservableObject {
     @Published var needsExternalConfirmation = false
     @Published var chatResponseRoute: ChatResponseRoute = .hybrid
     @Published var quickInferencePreset: QuickInferencePreset = .quality
+    @Published var roleplayModeEnabled = false
+    @Published var sidecarRecoveryState: String = "idle"
+    @Published var sidecarRecoveryAttempt: Int = 0
+    @Published var nativeCrashDetected = false
+    @Published var isSidecarReadyForChat = false
 
     // MARK: - UserDefaults Keys
     enum UDKey {
@@ -260,11 +311,23 @@ final class AppViewModel: ObservableObject {
         static let activeChatRoom       = "local_ai_active_chat_room_id_v1"
         static let chatResponseRoute    = "local_ai_chat_response_route_v1"
         static let quickInferencePreset = "local_ai_quick_inference_preset_v1"
+        static let roleplayModeEnabled  = "local_ai_roleplay_mode_enabled_v1"
         static let localEngine          = "local_ai_local_engine_v1"
         static let mlxModelPath         = "local_ai_mlx_model_path_v1"
         static let llamaModelPath       = "local_ai_llama_model_path_v1"
         static let modelsStorageDir     = "local_ai_models_storage_dir_v1"
         static let runtimeStorageDir    = "local_ai_runtime_storage_dir_v1"
+        static let sidecarVisionEnabled = "local_ai_sidecar_vision_enabled_v1"
+        static let sidecarVisionCaptionModel = "local_ai_sidecar_vision_caption_model_v1"
+        static let sidecarVisionClassifyModel = "local_ai_sidecar_vision_classify_model_v1"
+        static let sidecarMlxKVQEnabled = "local_ai_sidecar_mlx_kvq_enabled_v1"
+        static let sidecarMlxKVQMode = "local_ai_sidecar_mlx_kvq_mode_v1"
+        static let sidecarMlxKVQBits = "local_ai_sidecar_mlx_kvq_bits_v1"
+        static let sidecarConversationTurboEnabled = "local_ai_sidecar_conversation_turbo_enabled_v1"
+        static let sidecarInferenceTimeoutDisabled = "local_ai_sidecar_inference_timeout_disabled_v1"
+        static let sidecarMainResponseTimeoutSeconds = "local_ai_sidecar_main_response_timeout_seconds_v1"
+        static let sidecarAuxiliaryTimeoutSeconds = "local_ai_sidecar_auxiliary_timeout_seconds_v1"
+        static let showThinkingProcessInChat = "local_ai_show_thinking_process_in_chat_v1"
         static let appLanguage          = L10n.userDefaultsKey
         static let searxngURL          = "local_ai_searxng_url_v1"
         static let autoStartSearXNG     = "local_ai_auto_start_searxng_v1"
@@ -283,7 +346,13 @@ final class AppViewModel: ObservableObject {
     var isRecoveringSession = false
     var lastPostChatStateRefreshAt = Date.distantPast
     let postChatStateRefreshInterval: TimeInterval = 8
+    var activeLocalChatTask: Task<Void, Never>?
+    var isStreamingRoomStateDirty = false
+    var streamingDirtyRoomID: String?
     var roomIndexPollingTasks: [String: Task<Void, Never>] = [:]
+    var pluginPanelStatusStreamTask: Task<Void, Never>?
+    var sidecarRecoveryAttemptTimestamps: [Date] = []
+    var roleplayPersonaHintByRoomID: [String: String] = [:]
 
     func clearResolvedErrorIfNeeded() {
         guard let current = lastError?.trimmingCharacters(in: .whitespacesAndNewlines), !current.isEmpty else {

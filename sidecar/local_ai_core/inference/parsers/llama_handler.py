@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal, TYPE_CHECKING
 from ..base import BaseDelegate
 from ..types import InferenceResult, _ConversationCandidateResult
+from ..utils import inject_system_instruction_if_needed
 from ...models import LocalEngine, WorkMode, AgentAction, Citation, RuntimePrepareResponse
 
 if TYPE_CHECKING:
@@ -17,6 +18,12 @@ if TYPE_CHECKING:
 
 # Component: llama_handler.py
 class LlamaHandler(BaseDelegate):
+    def _inject_system_instruction_if_needed(
+        self, message_state: list[dict[str, str]], response_language: str | None = None
+    ) -> list[dict[str, str]]:
+        return inject_system_instruction_if_needed(message_state, response_language)
+
+
     def _generate_with_llama(
         self,
         prompt: str,
@@ -24,28 +31,82 @@ class LlamaHandler(BaseDelegate):
         *,
         max_tokens: int,
         style: Literal["grounded", "conversation", "rewrite"] = "grounded",
+        message_state: list[dict[str, str]] | None = None,
+        response_language: str | None = None,
     ) -> str | None:
         with self._llama_lock:
             if not self._ensure_llama_loaded(explicit_model_path, allow_runtime_install=False):
                 return None
 
             try:
-                sampling = self._sampling_preset(style=style, engine=LocalEngine.LLAMA_CPP)
-                kwargs = {
-                    "prompt": prompt,
-                    "max_tokens": max_tokens,
-                    "temperature": sampling["temperature"],
-                    "top_p": sampling["top_p"],
-                    "repeat_penalty": sampling["repeat_penalty"],
-                    "top_k": sampling["top_k"],
-                }
+                model_ref = self._resolve_llama_model_path(explicit_model_path)
+                sampling = self._sampling_preset_for_model(
+                    style=style,
+                    engine=LocalEngine.LLAMA_CPP,
+                    model_path=model_ref,
+                )
+                stop_seqs = self._stop_sequences_for_model(
+                    style=style,
+                    model_path=model_ref,
+                    default_sequences=["User:", "Assistant:", "<|end_of_turn|>", "<|eot_id|>", "<|endoftext|>"],
+                )
 
                 text: str = ""
                 stream_cb = self._current_stream_token_callback()
-                if stream_cb is not None:
+
+                # Native Chat Template handling via create_chat_completion
+                if message_state and hasattr(self._llama_model, "create_chat_completion"):
+                    chat_kwargs = {
+                        "messages": self._inject_system_instruction_if_needed(message_state, response_language),
+                        "max_tokens": max_tokens,
+                        "temperature": sampling["temperature"],
+                        "top_p": sampling["top_p"],
+                        "repeat_penalty": sampling["repeat_penalty"],
+                        "top_k": int(sampling.get("top_k", 40)),
+                        "min_p": float(sampling.get("min_p", 0.0)),
+                        "stop": stop_seqs,
+                    }
                     try:
+                        if stream_cb is not None:
+                            token_stream = self._llama_model.create_chat_completion(**chat_kwargs, stream=True)
+                            raw_parts: list[str] = []
+                            for item in token_stream:
+                                if not isinstance(item, dict):
+                                    continue
+                                choices = item.get("choices") or []
+                                if not choices:
+                                    continue
+                                delta = choices[0].get("delta") or {}
+                                piece = str(delta.get("content") or "")
+                                if piece:
+                                    raw_parts.append(piece)
+                                    self._emit_stream_token(piece)
+                            text = "".join(raw_parts)
+                        else:
+                            result = self._llama_model.create_chat_completion(**chat_kwargs)
+                            choices = result.get("choices") or []
+                            if choices:
+                                msg = choices[0].get("message") or {}
+                                text = str(msg.get("content") or "")
+                    except Exception as chat_exc:
+                        # Fallback to standard prompt completion if chat completion fails
+                        text = ""
+
+                # Fallback to legacy completion if no message_state, or if create_chat_completion failed
+                if not text:
+                    kwargs = {
+                        "prompt": prompt,
+                        "max_tokens": max_tokens,
+                        "temperature": sampling["temperature"],
+                        "top_p": sampling["top_p"],
+                        "repeat_penalty": sampling["repeat_penalty"],
+                        "top_k": int(sampling.get("top_k", 40)),
+                        "min_p": float(sampling.get("min_p", 0.0)),
+                        "stop": stop_seqs,
+                    }
+                    if stream_cb is not None:
                         token_stream = self._llama_model.create_completion(**kwargs, stream=True)
-                        raw_parts: list[str] = []
+                        raw_parts = []
                         for item in token_stream:
                             if not isinstance(item, dict):
                                 continue
@@ -53,28 +114,23 @@ class LlamaHandler(BaseDelegate):
                             if not choices:
                                 continue
                             piece = str(choices[0].get("text") or "")
-                            if not piece:
-                                continue
-                            raw_parts.append(piece)
-                            self._emit_stream_token(piece)
+                            if piece:
+                                raw_parts.append(piece)
+                                self._emit_stream_token(piece)
                         text = "".join(raw_parts)
-                    except Exception:
-                        text = ""
-
-                if not text:
-                    result = self._llama_model.create_completion(**kwargs)
-                    choices = result.get("choices") or []
-                    if not choices:
-                        self._set_engine_error(LocalEngine.LLAMA_CPP, "llama.cpp 응답이 비어 있습니다.")
-                        return None
-                    text = str(choices[0].get("text") or "")
+                    else:
+                        result = self._llama_model.create_completion(**kwargs)
+                        choices = result.get("choices") or []
+                        if choices:
+                            text = str(choices[0].get("text") or "")
 
                 if style == "conversation":
                     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-                    if prompt and text.startswith(prompt):
+                    if not message_state and prompt and text.startswith(prompt):
                         text = text[len(prompt):].strip()
                 else:
                     text = self._sanitize_generated_answer(text, prompt=prompt)
+                
                 if text:
                     self._clear_engine_error(LocalEngine.LLAMA_CPP)
                     return text

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any, Callable
 
 from ...language_utils import resolve_response_language
 from ...models import LocalChatRequestV2, ReasoningIntent, WorkspaceIdentity, WorkspaceResponse
 from .. import utils
 from ..context import ReasoningContext, RelevantMemoryBundle
+from ..helpers.web.general_chat_web_gate_helpers import GeneralChatWebGateHelpers
 
 
 @dataclass(slots=True)
@@ -77,6 +79,36 @@ class ContextLoader:
         )
 
     @staticmethod
+    def _room_memory_isolation_enabled() -> bool:
+        raw = str(os.getenv("LOCAL_AI_ROOM_MEMORY_ISOLATION", "1") or "1").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _session_only_bundle(cls, *, memory_bundle: RelevantMemoryBundle, session_id: str) -> RelevantMemoryBundle:
+        semantic_rows: list[dict[str, Any]] = []
+        for row in list(getattr(memory_bundle, "semantic_memories", []) or []):
+            if not isinstance(row, dict):
+                continue
+            scope = str(row.get("scope") or "").strip().lower()
+            row_session = str(row.get("session_id") or "").strip()
+            if scope == "session" or (row_session and row_session == session_id):
+                semantic_rows.append(dict(row))
+        pinned_rows = []
+        for row in list(getattr(memory_bundle, "pinned_items", []) or []):
+            scope = str(getattr(row, "scope", "") or "").strip().lower()
+            if scope == "global":
+                pinned_rows.append(row)
+        return RelevantMemoryBundle(
+            workspace_identity=memory_bundle.workspace_identity,
+            session_items=list(getattr(memory_bundle, "session_items", []) or []),
+            workspace_items=[],
+            preference_items=[],
+            episodic_items=[],
+            pinned_items=pinned_rows,
+            semantic_memories=semantic_rows,
+        )
+
+    @staticmethod
     def _is_conversational_path(path: str) -> bool:
         normalized = str(path or "").strip().lower()
         if not normalized:
@@ -141,7 +173,7 @@ class ContextLoader:
 
         session_id = str(req.session_id or req.conversation_id or "default-session")
         parsed_intent = self._intent_parser.parse(query=req.query, mode=req.mode, workspace=workspace)
-        if utils._is_explicit_web_search_request(req.query):
+        if GeneralChatWebGateHelpers.is_explicit_web_search_request(req.query):
             parsed_intent = parsed_intent.model_copy(
                 update={
                     "intent": ReasoningIntent.GENERAL_CHAT,
@@ -196,6 +228,11 @@ class ContextLoader:
                     related_file_ids=[],
                     query=req.query,
                 )
+                if (
+                    self._room_memory_isolation_enabled()
+                    and getattr(parsed_intent, "intent", None) == ReasoningIntent.GENERAL_CHAT
+                ):
+                    memory_bundle = self._session_only_bundle(memory_bundle=memory_bundle, session_id=session_id)
                 memory_prefs = memory.resolve_preferences(memory_bundle)
             except (AttributeError, TypeError, ValueError, RuntimeError):
                 memory_bundle = self._empty_memory_bundle(workspace_identity)
@@ -224,14 +261,19 @@ class ContextLoader:
             session_digest=session_digest_text or None,
             effective_query=req.query,
             force_web_search=False,
+            session_digest_payload=session_digest_payload,
         )
 
         force_general_chat = False
         web_auto_triggered = False
-        if utils._is_explicit_web_search_request(req.query):
+        if GeneralChatWebGateHelpers.is_explicit_web_search_request(req.query):
             context.force_web_search = True
             force_general_chat = True
-        elif utils._should_auto_web_search(query=req.query, parsed_intent=parsed_intent, last_context=last_context_data):
+        elif GeneralChatWebGateHelpers.should_auto_web_search(
+            query=req.query,
+            parsed_intent=parsed_intent,
+            last_context=last_context_data,
+        ):
             context.force_web_search = True
             force_general_chat = True
             web_auto_triggered = True

@@ -9,8 +9,11 @@ struct SettingsPanelView: View {
     @State var showMemoryViewer = false
     @State var expandedPluginIDs: Set<String> = []
     @State var showAdvancedPluginRegistration = false
+    @State var showAdvancedMultimodalRuntime = false
+    @State var showAdvancedSettingsAccordion = false
     @State var isPluginDropTargeted = false
     @State var showModelCatalogList = true
+    @State var showInstalledModelsList = true
     @State var collapsedCatalogTierKeys: Set<String> = []
     @State private var baselineFingerprint = ""
     private let topPreferenceCardHeight: CGFloat = 280
@@ -23,10 +26,7 @@ struct SettingsPanelView: View {
                 topPreferenceRow
                 runtimeSection
                 modelCatalogSection
-                pluginSection
-                webSearchSection
-                apiKeySection
-                foldersSection
+                advancedSettingsSection
             }
             .padding(14)
         }
@@ -122,6 +122,14 @@ struct SettingsPanelView: View {
             viewModel.workspaceMemoryMode.rawValue,
             viewModel.searxngURL,
             "\(viewModel.autoStartSearXNG)",
+            "\(viewModel.sidecarVisionEnabled)",
+            viewModel.sidecarVisionCaptionModel,
+            viewModel.sidecarVisionClassifyModel,
+            "\(viewModel.sidecarMlxKVQEnabled)",
+            viewModel.sidecarMlxKVQMode.rawValue,
+            "\(viewModel.sidecarMlxKVQBits)",
+            "\(viewModel.sidecarConversationTurboEnabled)",
+            "\(viewModel.sidecarInferenceTimeoutDisabled)",
             included,
             excluded,
         ].joined(separator: "\n")

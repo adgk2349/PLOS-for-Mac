@@ -2,14 +2,53 @@ import AppKit
 import Combine
 import CryptoKit
 import Foundation
+import UniformTypeIdentifiers
 
 @MainActor
 extension AppViewModel {
+    func submitOrStopLocalChatFromComposer() {
+        if isGeneratingChatResponse {
+            stopActiveLocalChatGeneration()
+            return
+        }
+        guard isChatComposerEnabled else {
+            lastError = "로컬 서버 준비 중입니다. 연결 완료 후 다시 시도해 주세요."
+            return
+        }
+        guard !isBusy else { return }
+        activeLocalChatTask?.cancel()
+        activeLocalChatTask = Task { [weak self] in
+            guard let self else { return }
+            await self.askLocal()
+            await MainActor.run {
+                self.activeLocalChatTask = nil
+            }
+        }
+    }
+
+    func stopActiveLocalChatGeneration() {
+        guard activeLocalChatTask != nil || activeGeneratingMessageID != nil || isGeneratingChatResponse else {
+            return
+        }
+        activeLocalChatTask?.cancel()
+        activeLocalChatTask = nil
+        if let activeID = activeGeneratingMessageID {
+            _ = finalizeStreamingLocalMessage(messageID: activeID, response: nil, finalText: nil)
+        }
+        flushStreamingRoomState(updateTimestamp: true, reorder: true, persist: true)
+        activeGeneratingMessageID = nil
+        liveThinkingTraceEvents = []
+        isGeneratingChatResponse = false
+        isBusy = false
+    }
+
     func askLocal() async {
         let query = chatFlowService.normalizeQuery(inputQuery)
-        guard !query.isEmpty else { return }
+        let attachments = composerAttachments
+        guard !query.isEmpty || !attachments.isEmpty else { return }
         inputQuery = ""
-        await askLocal(query: query, appendUserMessage: true)
+        composerAttachments = []
+        await askLocal(query: query, attachments: attachments, appendUserMessage: true)
     }
 
 
@@ -73,6 +112,14 @@ extension AppViewModel {
         Task { await saveSettingsAndWorkspace() }
     }
 
+    func setRoleplayMode(_ enabled: Bool) {
+        roleplayModeEnabled = enabled
+        persistRoleplayPreference()
+        if !enabled {
+            roleplayPersonaHintByRoomID.removeValue(forKey: activeConversationID)
+        }
+    }
+
     var currentChatTranscript: String {
         chatMessages
             .map { message in
@@ -107,17 +154,125 @@ extension AppViewModel {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = true
         panel.prompt = "첨부"
-        guard panel.runModal() == .OK, let url = panel.url else {
+        guard panel.runModal() == .OK else {
             return
         }
-        let token = "첨부 파일: \(url.path)"
-        if inputQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            inputQuery = token
-        } else {
-            inputQuery += "\n\(token)"
+        var existingPaths = Set(composerAttachments.map(\.filePath))
+        var updates = composerAttachments
+        for url in panel.urls {
+            let filePath = url.standardizedFileURL.path
+            guard !existingPaths.contains(filePath) else { continue }
+            existingPaths.insert(filePath)
+            let kind = attachmentKind(for: url)
+            let mimeType = mimeTypeForAttachment(url)
+            updates.append(
+                ComposerAttachment(
+                    id: UUID().uuidString,
+                    kind: kind,
+                    filePath: filePath,
+                    fileName: url.lastPathComponent,
+                    mimeType: mimeType
+                )
+            )
         }
+        composerAttachments = updates
+    }
+
+    func removeComposerAttachment(_ id: String) {
+        composerAttachments.removeAll { $0.id == id }
+    }
+
+    var canSubmitChatInput: Bool {
+        !inputQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !composerAttachments.isEmpty
+    }
+
+    var isChatComposerEnabled: Bool {
+        isSidecarReadyForChat && sidecarRecoveryState != "recovering"
+    }
+
+    private func extractRoleplayPersonaHint(from query: String) -> String? {
+        let normalized = query.precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        let patterns = [
+            #"(?:넌|너는|당신은|넌 이제|너는 이제)\s*(?:지금부터\s*)?(.{1,40}?)(?:이야|야|로\s*행동해|처럼\s*말해|역할극|코스프레)"#,
+            #"(?:you are|act as|roleplay as)\s+(.{1,40}?)(?:[.!?]|$)"#,
+            #"(?:\bI want you to be\b)\s+(.{1,40}?)(?:[.!?]|$)"#
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+                continue
+            }
+            let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+            guard let match = regex.firstMatch(in: normalized, options: [], range: range), match.numberOfRanges > 1 else {
+                continue
+            }
+            guard let personaRange = Range(match.range(at: 1), in: normalized) else {
+                continue
+            }
+            let persona = normalized[personaRange]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”‘’.,!?"))
+            if !persona.isEmpty {
+                return String(persona.prefix(40))
+            }
+        }
+        return nil
+    }
+
+    private func attachmentKind(for url: URL) -> ChatAttachmentKind {
+        if let type = UTType(filenameExtension: url.pathExtension.lowercased()) {
+            if type.conforms(to: .image) {
+                return .image
+            }
+            if type.conforms(to: .audio) {
+                return .audio
+            }
+        }
+        return .file
+    }
+
+    private func mimeTypeForAttachment(_ url: URL) -> String? {
+        guard let type = UTType(filenameExtension: url.pathExtension.lowercased()) else {
+            return nil
+        }
+        return type.preferredMIMEType
+    }
+
+    private func buildChatAttachments(_ attachments: [ComposerAttachment]) -> [ChatAttachmentV2] {
+        attachments.map { item in
+            ChatAttachmentV2(
+                id: item.id,
+                kind: item.kind,
+                file_path: item.filePath,
+                file_name: item.fileName,
+                mime_type: item.mimeType
+            )
+        }
+    }
+
+    private func userDisplayText(query: String, attachments: [ComposerAttachment]) -> String {
+        let base = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if attachments.isEmpty {
+            return base
+        }
+        let lines = attachments.map { item in
+            let label: String
+            switch item.kind {
+            case .file:
+                label = "file"
+            case .image:
+                label = "image"
+            case .audio:
+                label = "audio"
+            }
+            return "첨부[\(label)]: \(item.fileName)"
+        }
+        if base.isEmpty {
+            return lines.joined(separator: "\n")
+        }
+        return ([base] + lines).joined(separator: "\n")
     }
 
 
@@ -194,14 +349,26 @@ extension AppViewModel {
             appendChatMessage(ChatMessage(source: .external, text: response.answer, timestamp: Date()))
             try await refreshRemoteState()
         } catch {
+            if error is CancellationError {
+                lastError = nil
+                return
+            }
             handleViewModelError(error)
         }
     }
 
 
     func askLocal(query: String, appendUserMessage: Bool) async {
+        await askLocal(query: query, attachments: [], appendUserMessage: appendUserMessage)
+    }
+
+    func askLocal(query: String, attachments: [ComposerAttachment], appendUserMessage: Bool) async {
+        guard isChatComposerEnabled else {
+            lastError = "로컬 서버 준비 중입니다. 연결 완료 후 다시 시도해 주세요."
+            return
+        }
         let trimmed = chatFlowService.normalizeQuery(query)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty || !attachments.isEmpty else { return }
 
         isBusy = true
         isGeneratingChatResponse = true
@@ -215,7 +382,8 @@ extension AppViewModel {
         }
 
         if appendUserMessage {
-            appendChatMessage(ChatMessage(source: .user, text: trimmed, timestamp: Date()))
+            let displayText = userDisplayText(query: trimmed, attachments: attachments)
+            appendChatMessage(ChatMessage(source: .user, text: displayText, timestamp: Date()))
         }
         citations = []
         highlightedCitationPath = nil
@@ -230,28 +398,44 @@ extension AppViewModel {
             var handled = false
             try await performWithSidecarRetry { client in
                 _ = try await prepareSelectedRuntime(using: client)
-                let workspaceScope = requestScopeForRoom(activeConversationID)
+                let conversationID = activeConversationID
+                let workspaceScope = requestScopeForRoom(conversationID)
                 rememberRequestScopeForRoom(
-                    activeConversationID,
+                    conversationID,
                     includedPaths: workspaceScope.includedPaths,
                     excludedPaths: workspaceScope.excludedPaths
                 )
+                var roleplayPersona: String?
+                if roleplayModeEnabled {
+                    if let extracted = extractRoleplayPersonaHint(from: trimmed) {
+                        roleplayPersonaHintByRoomID[conversationID] = extracted
+                    }
+                    let savedPersona = roleplayPersonaHintByRoomID[conversationID]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    roleplayPersona = savedPersona.isEmpty ? nil : String(savedPersona.prefix(40))
+                }
                 let requestV2 = LocalChatRequestV2(
                     query: trimmed,
                     mode: selectedMode,
-                    conversation_id: activeConversationID,
-                    session_id: activeConversationID,
+                    conversation_id: conversationID,
+                    session_id: conversationID,
                     top_k: nil,
                     filters: currentChatFilters(),
                     included_paths: workspaceScope.includedPaths,
                     excluded_paths: workspaceScope.excludedPaths,
-                    behavior_overrides: nil
+                    behavior_overrides: nil,
+                    attachments: attachments.isEmpty ? nil : buildChatAttachments(attachments),
+                    roleplay_mode: roleplayModeEnabled ? true : nil,
+                    roleplay_persona: roleplayPersona
                 )
                 do {
                     let stream = try await client.localChatV2Stream(requestV2)
                     var streamedTextBuffer = ""
                     var didReceiveDone = false
                     var streamingMessageID: UUID?
+                    var streamSanitizer = StreamReasoningSanitizer()
+                    var capturedReasoningNotes: [String] = []
+                    let reasoningAnchorID = UUID()
+                    activeGeneratingMessageID = reasoningAnchorID
 
                     for try await event in stream {
                         if event.type == "status" {
@@ -259,39 +443,78 @@ extension AppViewModel {
                             continue
                         } else if event.type == "chunk" {
                             guard let chunk = event.text, !chunk.isEmpty else { continue }
-                            let mergedChunk = mergedStreamingChunk(buffer: streamedTextBuffer, incomingChunk: chunk)
-                            streamedTextBuffer += mergedChunk
-                            streamingMessageID = upsertStreamingLocalMessage(
-                                messageID: streamingMessageID,
-                                delta: mergedChunk
-                            )
-                            activeGeneratingMessageID = streamingMessageID
+                            let routed = routeStreamChunk(chunk, sanitizer: &streamSanitizer)
+                            if !routed.reasoningNotes.isEmpty {
+                                capturedReasoningNotes.append(contentsOf: routed.reasoningNotes)
+                                for note in routed.reasoningNotes {
+                                    appendLiveThinkingTraceStatus(note)
+                                }
+                            }
+                            if !routed.answerText.isEmpty {
+                                streamedTextBuffer += routed.answerText
+                                streamingMessageID = upsertStreamingLocalMessage(
+                                    messageID: streamingMessageID,
+                                    delta: routed.answerText
+                                )
+                                activeGeneratingMessageID = streamingMessageID
+                            }
                         } else if event.type == "done", let result = event.result {
                             didReceiveDone = true
-                            citations = result.citations
-                            rememberRoomRoutingMetadata(activeConversationID, metadata: result.metadata)
-                            let bufferedRaw = streamedTextBuffer
-                            let generatedText = (result.generated_text ?? "").precomposedStringWithCanonicalMapping
+                            let generatedSplit = splitReasoningAndAnswer(from: result.generated_text ?? "")
+                            let bufferedSplit = splitReasoningAndAnswer(from: streamedTextBuffer)
+                            let mergedNotes = dedupeReasoningNotes(capturedReasoningNotes + generatedSplit.reasoningNotes + bufferedSplit.reasoningNotes)
+                            var finalizedResult = result
+                            if !mergedNotes.isEmpty {
+                                finalizedResult.metadata = mergeReasoningTraceEvents(
+                                    metadata: finalizedResult.metadata,
+                                    reasoningNotes: mergedNotes
+                                )
+                            }
+                            var metadata = finalizedResult.metadata ?? [:]
+                            metadata["engine_recovery_attempt"] = .number(Double(sidecarRecoveryAttempt))
+                            metadata["native_crash_detected"] = .bool(nativeCrashDetected)
+                            finalizedResult.metadata = metadata
+
+                            citations = finalizedResult.citations
+                            rememberRoomRoutingMetadata(activeConversationID, metadata: finalizedResult.metadata)
+                            let bufferedRaw = sanitizeFinalGeneratedText(bufferedSplit.answerText)
+                            let generatedText = sanitizeFinalGeneratedText(generatedSplit.answerText)
+                            let directGeneratedText = sanitizeFinalGeneratedText(result.generated_text ?? "")
                             let streamSelection = selectFinalStreamText(
                                 bufferedRaw: bufferedRaw,
                                 generatedText: generatedText
                             )
-                            let finalText = streamSelection.text
+                            var finalText = preferredDisplayText(
+                                primary: streamSelection.text,
+                                fallbackLead: finalizedResult.lead,
+                                fallbackSummary: finalizedResult.structured_result.summary
+                            )
+                            if !isMeaningfulAssistantText(finalText ?? "") {
+                                if isMeaningfulAssistantText(directGeneratedText) {
+                                    finalText = directGeneratedText
+                                } else if isMeaningfulAssistantText(generatedText) {
+                                    finalText = generatedText
+                                } else if isMeaningfulAssistantText(bufferedRaw) {
+                                    finalText = bufferedRaw
+                                } else {
+                                    finalText = emptyAssistantResponseFallbackText()
+                                }
+                            }
                             localRuntimeDetail = composeStreamRuntimeDetail(
-                                baseDetail: result.runtime_detail,
+                                baseDetail: finalizedResult.runtime_detail,
                                 finalTextSource: streamSelection.source,
                                 bufferedCount: bufferedRaw.count,
                                 generatedCount: generatedText.count
                             )
                             if let finalizedID = finalizeStreamingLocalMessage(
                                 messageID: streamingMessageID,
-                                response: result,
+                                response: finalizedResult,
                                 finalText: finalText
                             ) {
                                 activeGeneratingMessageID = finalizedID
                             } else {
-                                var finalMsg = ChatMessage(localV2: result, timestamp: Date())
-                                if !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                var finalMsg = ChatMessage(localV2: finalizedResult, timestamp: Date())
+                                if let finalText, !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                     finalMsg.text = finalText.precomposedStringWithCanonicalMapping
                                     finalMsg.lead = nil
                                     finalMsg.resultSummary = nil
@@ -303,7 +526,8 @@ extension AppViewModel {
                         } else if event.type == "error" {
                             let reason = (event.message ?? "알 수 없음").trimmingCharacters(in: .whitespacesAndNewlines)
                             appendLiveThinkingTraceStatus("오류: \(reason)")
-                            let bufferedRaw = streamedTextBuffer
+                            let bufferedSplit = splitReasoningAndAnswer(from: streamedTextBuffer)
+                            let bufferedRaw = sanitizeFinalGeneratedText(bufferedSplit.answerText)
                             let buffered = bufferedRaw.trimmingCharacters(in: .whitespacesAndNewlines)
                             let composed = buffered.isEmpty
                                 ? "[오류 발생: \(reason)]"
@@ -323,20 +547,20 @@ extension AppViewModel {
                     }
 
                     if !didReceiveDone {
-                        let bufferedRaw = streamedTextBuffer
+                        let bufferedSplit = splitReasoningAndAnswer(from: streamedTextBuffer)
+                        let bufferedRaw = sanitizeFinalGeneratedText(bufferedSplit.answerText)
                         let buffered = bufferedRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !buffered.isEmpty {
-                            if let finalizedID = finalizeStreamingLocalMessage(
-                                messageID: streamingMessageID,
-                                response: nil,
-                                finalText: bufferedRaw
-                            ) {
-                                activeGeneratingMessageID = finalizedID
-                            } else {
-                                let partialMsg = ChatMessage(source: .local, text: bufferedRaw, timestamp: Date())
-                                appendChatMessage(partialMsg)
-                                activeGeneratingMessageID = partialMsg.id
-                            }
+                        let fallbackText = buffered.isEmpty ? emptyAssistantResponseFallbackText() : bufferedRaw
+                        if let finalizedID = finalizeStreamingLocalMessage(
+                            messageID: streamingMessageID,
+                            response: nil,
+                            finalText: fallbackText
+                        ) {
+                            activeGeneratingMessageID = finalizedID
+                        } else {
+                            let partialMsg = ChatMessage(source: .local, text: fallbackText, timestamp: Date())
+                            appendChatMessage(partialMsg)
+                            activeGeneratingMessageID = partialMsg.id
                         }
                     }
 
@@ -344,7 +568,11 @@ extension AppViewModel {
                     handled = true
                 } catch {
                     #if DEBUG
-                        let responseV2 = try await client.localChatV2(requestV2)
+                        var responseV2 = try await client.localChatV2(requestV2)
+                        var metadata = responseV2.metadata ?? [:]
+                        metadata["engine_recovery_attempt"] = .number(Double(sidecarRecoveryAttempt))
+                        metadata["native_crash_detected"] = .bool(nativeCrashDetected)
+                        responseV2.metadata = metadata
                         citations = responseV2.citations
                         rememberRoomRoutingMetadata(activeConversationID, metadata: responseV2.metadata)
                         if let runtimeDetail = responseV2.runtime_detail, !runtimeDetail.isEmpty {
@@ -363,6 +591,9 @@ extension AppViewModel {
                 throw APIError(message: "로컬 채팅 응답을 처리하지 못했습니다.")
             }
             await refreshPostChatStateIfNeeded()
+        } catch is CancellationError {
+            flushStreamingRoomState(updateTimestamp: true, reorder: true, persist: true)
+            lastError = nil
         } catch {
             handleViewModelError(error)
         }
@@ -371,45 +602,289 @@ extension AppViewModel {
     private func selectFinalStreamText(bufferedRaw: String, generatedText: String) -> (text: String, source: String) {
         let bufferedTrimmed = bufferedRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         let generatedTrimmed = generatedText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if bufferedTrimmed.isEmpty {
-            return (generatedText, "generated_empty_buffer")
-        }
         if generatedTrimmed.isEmpty {
             return (bufferedRaw, "buffered_generated_empty")
         }
-        if generatedText.count > bufferedRaw.count, generatedText.hasPrefix(bufferedRaw) {
-            return (generatedText, "generated_superstring")
+        if bufferedTrimmed.isEmpty {
+            return (generatedText, "generated_empty_buffer")
         }
-        let normalizedBuffered = bufferedTrimmed.replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
-        let normalizedGenerated = generatedTrimmed.replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
-        if !normalizedGenerated.isEmpty,
-           normalizedGenerated.count >= normalizedBuffered.count,
-           normalizedGenerated.hasPrefix(normalizedBuffered)
+        let bufferedIncomplete = looksIncompleteAssistantText(bufferedTrimmed)
+        let generatedIncomplete = looksIncompleteAssistantText(generatedTrimmed)
+        if bufferedIncomplete && !generatedIncomplete {
+            return (generatedText, "generated_preferred_buffer_incomplete")
+        }
+        if generatedIncomplete && !bufferedIncomplete {
+            return (bufferedRaw, "buffered_preferred_generated_incomplete")
+        }
+        // When finalized payload is unexpectedly short, keep streamed buffer to avoid end-of-stream overwrite regressions.
+        if shouldPreferBufferedStreamText(bufferedTrimmed: bufferedTrimmed, generatedTrimmed: generatedTrimmed) {
+            return (bufferedRaw, "buffered_preferred_short_final")
+        }
+        return (generatedText, "generated_preferred")
+    }
+
+    private func shouldPreferBufferedStreamText(bufferedTrimmed: String, generatedTrimmed: String) -> Bool {
+        let bufferedHasLeakMarkers = containsInternalLeakMarkers(bufferedTrimmed)
+        let generatedHasLeakMarkers = containsInternalLeakMarkers(generatedTrimmed)
+        if bufferedHasLeakMarkers && !generatedHasLeakMarkers {
+            return false
+        }
+        if generatedHasLeakMarkers && !bufferedHasLeakMarkers {
+            return true
+        }
+        if generatedTrimmed.count < 64 && bufferedTrimmed.count >= max(180, generatedTrimmed.count * 3) {
+            return true
+        }
+        if bufferedTrimmed.contains("```"), !generatedTrimmed.contains("```"), bufferedTrimmed.count > generatedTrimmed.count + 80 {
+            return true
+        }
+        let bufferedSentenceCount = bufferedTrimmed.split(whereSeparator: { ".!?。！？\n".contains($0) }).count
+        let generatedSentenceCount = generatedTrimmed.split(whereSeparator: { ".!?。！？\n".contains($0) }).count
+        if generatedSentenceCount <= 1 && bufferedSentenceCount >= 3 && bufferedTrimmed.count > generatedTrimmed.count + 120 {
+            return true
+        }
+        return false
+    }
+
+    private func looksIncompleteAssistantText(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.range(of: #"(?im)(?:^|\n)\s*\d{1,2}[.)]\s*$"#, options: .regularExpression) != nil {
+            return true
+        }
+        if trimmed.contains("```"), trimmed.components(separatedBy: "```").count % 2 == 0 {
+            return true
+        }
+        if trimmed.range(of: #"[:;,(\[{`-]\s*$"#, options: .regularExpression) != nil {
+            return true
+        }
+        if trimmed.count >= 120,
+           trimmed.range(of: #"[.!?。！？]\s*$"#, options: .regularExpression) == nil
         {
-            return (generatedText, "generated_superstring_ws")
+            return true
         }
-        return (bufferedRaw, "buffered")
+        return false
     }
 
-    private func mergedStreamingChunk(buffer: String, incomingChunk: String) -> String {
-        guard !buffer.isEmpty else { return incomingChunk }
-        guard let first = incomingChunk.first else { return incomingChunk }
-        if isWhitespaceLike(first) || isPunctuationLike(first) {
-            return incomingChunk
+    private func containsInternalLeakMarkers(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        if lowered.contains("\"hypotheses\"") || lowered.contains("input message:") {
+            return true
         }
-        guard let last = buffer.last else { return incomingChunk }
-        if isWhitespaceLike(last) || isPunctuationLike(last) {
-            return incomingChunk
+        if lowered.contains("&lt;channel&gt;") || lowered.contains("&lt;/channel&gt;") {
+            return true
         }
-        return " " + incomingChunk
+        if lowered.contains("&lt;analysis&gt;") || lowered.contains("&lt;/analysis&gt;") {
+            return true
+        }
+        if lowered.contains("&lt;final&gt;") || lowered.contains("&lt;/final&gt;") {
+            return true
+        }
+        if lowered.contains("<tool_code>") || lowered.contains("</tool_code>") {
+            return true
+        }
+        if lowered.contains("<searching>") || lowered.contains("<tool_running>") {
+            return true
+        }
+        if lowered.contains("<action>") || lowered.contains("<final_answer>") {
+            return true
+        }
+        if lowered.contains("<channel>") || lowered.contains("</channel>") {
+            return true
+        }
+        if lowered.contains("<analysis>") || lowered.contains("</analysis>") {
+            return true
+        }
+        if lowered.contains("<final>") || lowered.contains("</final>") {
+            return true
+        }
+        if lowered.contains("return strict json only") {
+            return true
+        }
+        if lowered.range(of: #"^\s*(?:&lt;/?[a-z_]+&gt;|</?[a-z_]+>)\.?\s*$"#, options: .regularExpression) != nil {
+            return true
+        }
+        if lowered.contains("answer:") {
+            let hasFileHint = lowered.contains(".txt)") || lowered.contains(".md)") || lowered.contains(".pdf)")
+            if hasFileHint {
+                return true
+            }
+        }
+        return false
     }
 
-    private func isWhitespaceLike(_ ch: Character) -> Bool {
-        ch.unicodeScalars.allSatisfy { CharacterSet.whitespacesAndNewlines.contains($0) }
+    private func preferredDisplayText(primary: String, fallbackLead: String, fallbackSummary: String) -> String? {
+        let sanitizedPrimary = sanitizeFinalGeneratedText(primary)
+        if isMeaningfulAssistantText(sanitizedPrimary) {
+            return sanitizedPrimary
+        }
+        let summary = sanitizeFinalGeneratedText(fallbackSummary)
+        if isMeaningfulAssistantText(summary) {
+            return nil
+        }
+        let lead = sanitizeFinalGeneratedText(fallbackLead)
+        if isMeaningfulAssistantText(lead) {
+            return nil
+        }
+        return sanitizedPrimary.isEmpty ? nil : sanitizedPrimary
     }
 
-    private func isPunctuationLike(_ ch: Character) -> Bool {
-        ch.unicodeScalars.allSatisfy { CharacterSet.punctuationCharacters.contains($0) }
+    private func isMeaningfulAssistantText(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if containsInternalLeakMarkers(trimmed) {
+            return false
+        }
+        let hasReadableLetter = trimmed.range(
+            of: #"[A-Za-z0-9가-힣ぁ-ゖァ-ヺ一-龥]"#,
+            options: .regularExpression
+        ) != nil
+        if !hasReadableLetter {
+            return false
+        }
+        let compact = trimmed.lowercased().replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
+        let placeholders: Set<String> = [
+            "(이미지없음)",
+            "[이미지없음]",
+            "이미지없음",
+            "(noimage)",
+            "[noimage]",
+            "noimage",
+            "imagenotavailable",
+            "(imagenotavailable)",
+            "[imagenotavailable]",
+            "imageunavailable",
+            "(imageunavailable)",
+            "[imageunavailable]",
+        ]
+        if placeholders.contains(compact) {
+            return false
+        }
+        return true
+    }
+
+    private func emptyAssistantResponseFallbackText() -> String {
+        L10n.tr(
+            "chat.empty_response_fallback",
+            language: appLanguage,
+            fallbackKo: "응답이 중간에 비어 종료되었습니다. 한 번 더 시도해 주세요.",
+            fallbackEn: "The response ended with empty output. Please try once more.",
+            fallbackJa: "応答が途中で空のまま終了しました。もう一度お試しください。"
+        )
+    }
+
+    private struct StreamReasoningSanitizer {
+        var isInsideReasoningTag = false
+        var isInsideToolCodeTag = false
+        var pendingTagFragment = ""
+        var answerStarted = false
+    }
+
+    private struct StreamChunkRoute {
+        var answerText: String
+        var reasoningNotes: [String]
+    }
+
+    private func routeStreamChunk(_ incoming: String, sanitizer: inout StreamReasoningSanitizer) -> StreamChunkRoute {
+        let cleaned = sanitizeStreamChunk(incoming, sanitizer: &sanitizer)
+        if cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return StreamChunkRoute(answerText: "", reasoningNotes: [])
+        }
+        if sanitizer.answerStarted {
+            return StreamChunkRoute(answerText: cleaned, reasoningNotes: [])
+        }
+        let split = splitReasoningAndAnswer(from: cleaned)
+        let hasAnswer = !split.answerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if hasAnswer {
+            sanitizer.answerStarted = true
+        }
+        return StreamChunkRoute(answerText: split.answerText, reasoningNotes: split.reasoningNotes)
+    }
+
+    private func sanitizeStreamChunk(_ incoming: String, sanitizer: inout StreamReasoningSanitizer) -> String {
+        StreamTagParser.sanitizeStreamChunk(
+            incoming,
+            isInsideReasoningTag: &sanitizer.isInsideReasoningTag,
+            isInsideToolCodeTag: &sanitizer.isInsideToolCodeTag,
+            pendingTagFragment: &sanitizer.pendingTagFragment
+        )
+    }
+
+    private func splitReasoningAndAnswer(from raw: String) -> (reasoningNotes: [String], answerText: String) {
+        StreamTagParser.splitReasoningAndAnswer(from: raw)
+    }
+
+    private func dedupeReasoningNotes(_ notes: [String]) -> [String] {
+        StreamTagParser.dedupeReasoningNotes(notes)
+    }
+
+    private func mergeReasoningTraceEvents(
+        metadata: [String: JSONValue]?,
+        reasoningNotes: [String]
+    ) -> [String: JSONValue]? {
+        let notes = dedupeReasoningNotes(reasoningNotes)
+        guard !notes.isEmpty else { return metadata }
+
+        var merged = metadata ?? [:]
+        var events: [JSONValue] = []
+        if let existing = merged["trace_events"]?.arrayValue {
+            events = existing
+        }
+        let now = ISO8601DateFormatter().string(from: Date())
+        for note in notes.prefix(12) {
+            events.append(
+                .object([
+                    "status": .string("done"),
+                    "message": .string(note),
+                    "source": .string("model_reasoning"),
+                    "at": .string(now),
+                ])
+            )
+        }
+        merged["trace_events"] = .array(events)
+        return merged
+    }
+
+    private func sanitizeFinalGeneratedText(_ raw: String) -> String {
+        var value = raw.precomposedStringWithCanonicalMapping
+        value = value.replacingOccurrences(
+            of: #"(?is)<tool_code\b[^>]*>\s*([\s\S]*?)\s*</tool_code>"#,
+            with: "\n```\n$1\n```\n",
+            options: .regularExpression
+        )
+        value = value.replacingOccurrences(
+            of: #"(?is)<(final_answer|assistant_response)\b[^>]*>(.*?)</\1>"#,
+            with: "$2",
+            options: .regularExpression
+        )
+        let patterns = [
+            #"(?is)<(thought|think|thinking|analysis|reasoning|cot|searching|tool_running)\b[^>]*>.*?</\1>"#,
+            #"(?is)</?(thought|think|thinking|analysis|reasoning|cot|searching|tool_running)\b[^>]*>"#,
+            #"(?is)</?(tool_code|tool_result|action|final_answer|assistant_response|tool_[a-z0-9_]+)\b[^>]*>"#,
+            #"(?is)</?(channel|analysis|final|assistant|system|user|message|observation|plan|reflection)\b[^>]*>"#,
+            #"(?is)&lt;/?(?:thought|think|thinking|analysis|reasoning|cot|searching|tool_running|tool_code|tool_result|action|final_answer|assistant_response|channel|final|assistant|system|user|message|observation|plan|reflection)\b[^&]*&gt;"#,
+            #"(?im)^\s*(?:thinking|thinking process|reasoning|reasoning process|chain of thought|internal monologue)\s*[:：].*$"#,
+            #"(?im)^\s*(?:let(?:'|’)s think(?: step by step)?|we need to think)\s*[:：]?\s*$"#,
+            #"(?is)```(?:json)?\s*\{[\s\S]{0,5000}?"hypotheses"\s*:\s*\[[\s\S]*?\}\s*```"#,
+            #"(?im)^\s*\{[^\n]*"hypotheses"\s*:\s*\[[^\n]*\}\s*$"#,
+            #"(?is)\bInput message:\s*.+?\n\s*Answer:\s*"#,
+            #"(?im)^\s*[-•*]?\s*\([^)\n]+\.(?:txt|md|markdown|pdf|docx|py|swift|json|ya?ml)\)\s*.*\bAnswer\s*:\s*"#,
+            #"(?im)^\s*json\s*$"#,
+            #"(?im)^\s*<\s*/?\s*(?:channel|analysis|final|assistant|system|user|message|observation|plan|reflection)\s*>\s*[.:：-]?\s*$"#,
+            #"(?im)^\s*&lt;\s*/?\s*(?:channel|analysis|final|assistant|system|user|message|observation|plan|reflection)\s*&gt;\s*[.:：-]?\s*$"#,
+            #"(?im)^\s*(?:<\s*/?\s*[a-z_]+\s*>|&lt;\s*/?\s*[a-z_]+\s*&gt;)\s*[.:：-]?\s*$"#,
+            #"(?im)^\s*[.:：-]+\s*$"#,
+        ]
+        for pattern in patterns {
+            value = value.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+        }
+        value = value.replacingOccurrences(
+            of: #"(?im)^\s*amente(?:[.!?~,:;\-\s]+)"#,
+            with: "",
+            options: .regularExpression
+        )
+        value = value.replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func composeStreamRuntimeDetail(
@@ -430,8 +905,12 @@ extension AppViewModel {
     }
 
     private func appendLiveThinkingTraceStatus(_ rawStatus: String?) {
+        guard showThinkingProcessInChat else { return }
         let message = (rawStatus ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { return }
+        if isGenericThinkingPlaceholder(message) {
+            return
+        }
         let lowered = message.lowercased()
         if lowered == "room routing: room_scope_missing" ||
             lowered == "room routing: room_registry_missing" ||
@@ -468,6 +947,23 @@ extension AppViewModel {
         )
         if liveThinkingTraceEvents.count > 24 {
             liveThinkingTraceEvents.removeFirst(liveThinkingTraceEvents.count - 24)
+        }
+    }
+
+    private func isGenericThinkingPlaceholder(_ message: String) -> Bool {
+        let normalized = message
+            .precomposedStringWithCanonicalMapping
+            .lowercased()
+            .replacingOccurrences(of: "…", with: "...")
+            .replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
+        let patterns = [
+            #"^(?:생각중|thinking|思考中)[.!?…。！？]*$"#,
+            #"^(?:생각중)\.\.\.$"#,
+            #"^(?:thinking)\.\.\.$"#,
+            #"^(?:思考中)\.\.\.$"#,
+        ]
+        return patterns.contains { pattern in
+            normalized.range(of: pattern, options: .regularExpression) != nil
         }
     }
 

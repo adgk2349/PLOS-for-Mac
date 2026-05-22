@@ -568,11 +568,28 @@ class RetrievalHelpers:
         citations: list[Citation],
         reason: str,
     ) -> ExecutionResult:
-        text = (
-            "검색 결과가 명확하지 않습니다. 다음 옵션 중 선택해주세요."
-            if response_language == "ko"
-            else "Results are unclear. Please choose an option."
-        )
+        options: list[str] = []
+        for citation in list(citations or [])[:3]:
+            title = str(getattr(citation, "source", "") or "").strip()
+            if not title:
+                title = str(getattr(citation, "snippet", "") or "").strip()[:42]
+            title = re.sub(r"\s+", " ", title).strip()
+            if title and title not in options:
+                options.append(title)
+        if response_language == "ko":
+            if options:
+                text = "\n".join(
+                    f"{idx}. {item}" for idx, item in enumerate(options, start=1)
+                )
+            else:
+                text = ""
+        else:
+            if options:
+                text = "\n".join(
+                    f"{idx}. {item}" for idx, item in enumerate(options, start=1)
+                )
+            else:
+                text = ""
         return ExecutionResult(
             generated_text=text,
             result_type="candidate",
@@ -634,7 +651,7 @@ class RetrievalHelpers:
         """
         Delegate to the actual GeneralChatStrategy when workspace RAG needs fallback.
         """
-        logger.warning("[RetrievalHelpers] run_general_chat fallback triggered (force_web_search=%s)", force_web_search)
+        logger.info("[RetrievalHelpers] run_general_chat delegated (force_web_search=%s)", force_web_search)
         context = ReasoningContext(
             req=req,
             workspace=workspace,

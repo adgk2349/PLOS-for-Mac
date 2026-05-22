@@ -19,6 +19,7 @@ struct ChatMessage: Identifiable, Codable {
     var plan: LocalPlan?
     var verification: VerificationResult?
     var reasoningBrief: String?
+    var artifacts: [GeneratedArtifact]?
     var actions: [SuggestedAction]
     let timestamp: Date
     var isStreaming: Bool = false
@@ -40,6 +41,7 @@ struct ChatMessage: Identifiable, Codable {
         plan = nil
         verification = nil
         reasoningBrief = nil
+        artifacts = nil
         actions = []
         self.timestamp = timestamp
     }
@@ -57,6 +59,7 @@ struct ChatMessage: Identifiable, Codable {
         plan = nil
         verification = nil
         reasoningBrief = Self.nfc(response.reasoning_brief)
+        artifacts = nil
         actions = response.actions
         self.timestamp = timestamp
     }
@@ -65,25 +68,35 @@ struct ChatMessage: Identifiable, Codable {
         self.id = id
         source = .local
         let fallbackText = (response.generated_text ?? "").precomposedStringWithCanonicalMapping
+        let normalizedFallback = fallbackText.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedLead = response.lead.precomposedStringWithCanonicalMapping
         let normalizedSummary = response.structured_result.summary.precomposedStringWithCanonicalMapping
-        if normalizedLead.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-            normalizedSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-            !fallbackText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            text = fallbackText
-        } else {
-            text = nil
-        }
+        let isDegraded = response.used_fallback ?? false
+        text = normalizedFallback.isEmpty ? nil : fallbackText
         intent = nil
         lead = normalizedLead
-        resultSummary = normalizedSummary
+        // Prefer rendered generated_text for markdown/code output; avoid duplicate summary body.
+        resultSummary = normalizedFallback.isEmpty ? normalizedSummary : nil
         structuredResult = response.structured_result
-        responseMetadata = response.metadata
+        var mergedMetadata = response.metadata ?? [:]
+        if mergedMetadata["execution_status"] == nil {
+            mergedMetadata["execution_status"] = .string(isDegraded ? "degraded" : "ok")
+        }
+        responseMetadata = mergedMetadata
         parsedIntent = response.parsed_intent
         plan = response.plan
         verification = response.verification
         reasoningBrief = nil
+        artifacts = response.artifacts
         actions = response.actions
+        if isDegraded {
+            let trimmedText = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !trimmedText.isEmpty {
+                lead = "실행 품질 저하"
+                resultSummary = trimmedText
+                text = nil
+            }
+        }
         self.timestamp = timestamp
     }
 }
@@ -123,4 +136,3 @@ struct ChatRoom: Codable, Identifiable {
         )
     }
 }
-

@@ -34,12 +34,14 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
         "recent_action",
     )
     _SESSION_CONTEXT_CLEANUP_MARKER = "__session_context_cleanup_v2"
+    _FACT_KEY_PREFIX = "fact:"
+    _SCENE_KEY_PREFIX = "scene:"
 
     def get_relevant_session_memory(self, *, session_id: str) -> list:
         settings = self._db.get_settings()
         if not settings.session_memory_enabled:
             return []
-        return self._db.get_relevant_session_memory(session_id=session_id, limit=40)
+        return self._db.get_relevant_session_memory(session_id=session_id, limit=120)
 
     def get_last_conversational_context(self, session_id: str) -> dict[str, Any] | None:
         for item in self.get_relevant_session_memory(session_id=session_id):
@@ -459,6 +461,7 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
         digest = self.get_session_digest(session_id) or self._empty_digest()
         user_text = self._sanitize_digest_text(user_query, max_chars=self._DIGEST_RECENT_TURN_MAX_CHARS)
         assistant_text = self._sanitize_digest_text(assistant_summary, max_chars=self._DIGEST_RECENT_TURN_MAX_CHARS)
+        assistant_text = self._strip_leading_noise_token(assistant_text)
         if assistant_text and self._should_drop_assistant_digest_text(
             assistant_text=assistant_text,
             user_query=user_text,
@@ -470,6 +473,22 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
             recent_turns.append({"role": "user", "text": user_text})
         if assistant_text:
             recent_turns.append({"role": "assistant", "text": assistant_text})
+
+        # Rolling summary compression: when recent_turns exceeds the verbatim window,
+        # archive older turns into rolling_summary (L2 memory) so the context window
+        # is not saturated while still preserving the gist of earlier conversation.
+        verbatim_window = getattr(self, "_DIGEST_WINDOW_VERBATIM", 10)
+        summary_max = getattr(self, "_DIGEST_ROLLING_SUMMARY_MAX_CHARS", 600)
+        if len(recent_turns) > verbatim_window * 2:
+            archive = recent_turns[: -(verbatim_window * 2)]
+            recent_turns = recent_turns[-(verbatim_window * 2) :]
+            existing_summary = str(digest.get("rolling_summary") or "").strip()
+            digest["rolling_summary"] = self._compress_turns_to_summary(
+                archive,
+                existing_summary=existing_summary,
+                max_chars=summary_max,
+            )
+
         digest["recent_turns"] = self._normalize_recent_turns(recent_turns)
 
         new_topics = self._extract_topics(user_text)
@@ -546,11 +565,13 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
         context: dict[str, Any],
     ) -> None:
         settings = self._db.get_settings()
+        print(f"\n[DEBUG_MEM] write_conversational_context: session_id={session_id}, session_memory_enabled={settings.session_memory_enabled}")
         if not settings.session_memory_enabled:
+            print("[DEBUG_MEM] write_conversational_context: session_memory_enabled is False, returning early!")
             return
         safe: dict[str, Any] = dict(context)
         safe["updated_at"] = time.time()
-        result_summary = str(safe.get("result_summary") or "").strip()
+        result_summary = self._strip_leading_noise_token(str(safe.get("result_summary") or ""))
         if result_summary:
             cleaned_summary = self._sanitize_digest_text(result_summary, max_chars=260)
             if cleaned_summary and not self._should_drop_assistant_digest_text(
@@ -560,13 +581,283 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
                 safe["result_summary"] = cleaned_summary
             else:
                 safe["result_summary"] = ""
+        print(f"[DEBUG_MEM] write_conversational_context: writing safe context={safe}")
         self._db.write_session_memory(
             session_id=session_id,
             key="last_conversational_context",
             value_json=safe,
             ttl_hours=24,
-            keep_recent=40,
+            keep_recent=120,
         )
+
+    def upsert_session_fact_memory(
+        self,
+        *,
+        session_id: str,
+        user_query: str,
+    ) -> dict[str, Any]:
+        settings = self._db.get_settings()
+        if not settings.session_memory_enabled:
+            return {"items": [], "overwrite_blocked": 0}
+        facts = self._extract_fact_items_from_user_query(str(user_query or ""))
+        if not facts:
+            return {"items": [], "overwrite_blocked": 1}
+        written: list[dict[str, Any]] = []
+        for fact in facts:
+            subject = str(fact.get("subject") or "").strip()
+            if not subject:
+                continue
+            key = f"{self._FACT_KEY_PREFIX}{subject}"
+            try:
+                self._db.clear_session_memory_by_keys(keys=[key], session_id=session_id)
+            except Exception:
+                pass
+            payload = {
+                "memory_type": "fact",
+                "memory_scope": "session",
+                "subject": subject,
+                "predicate": str(fact.get("predicate") or "").strip(),
+                "value": str(fact.get("value") or "").strip(),
+                "summary": str(fact.get("summary") or "").strip(),
+                "confidence": float(fact.get("confidence") or 0.9),
+                "updated_at": self._now_iso(),
+            }
+            self._db.write_session_memory(
+                session_id=session_id,
+                key=key,
+                value_json=payload,
+                ttl_hours=24 * 30,
+                keep_recent=80,
+            )
+            written.append(payload)
+        return {"items": written, "overwrite_blocked": 0}
+
+    def upsert_session_scene_memory(
+        self,
+        *,
+        session_id: str,
+        user_query: str,
+        assistant_summary: str = "",
+    ) -> dict[str, Any]:
+        settings = self._db.get_settings()
+        if not settings.session_memory_enabled:
+            return {"items": []}
+        query = self._sanitize_digest_text(str(user_query or ""), max_chars=220)
+        if not query:
+            return {"items": []}
+        if self._is_fact_query_or_command(query):
+            return {"items": []}
+
+        summary = self._sanitize_digest_text(str(assistant_summary or ""), max_chars=260)
+        tags = self._extract_scene_tags(query)
+        if not tags and not summary:
+            return {"items": []}
+
+        payload = {
+            "memory_type": "scene",
+            "memory_scope": "session",
+            "query": query,
+            "summary": summary,
+            "tags": tags[:8],
+            "confidence": 0.72,
+            "updated_at": self._now_iso(),
+        }
+        scene_key = f"{self._SCENE_KEY_PREFIX}{uuid.uuid4().hex[:12]}"
+        self._db.write_session_memory(
+            session_id=session_id,
+            key=scene_key,
+            value_json=payload,
+            ttl_hours=24 * 14,
+            keep_recent=220,
+        )
+        return {"items": [payload]}
+
+    @staticmethod
+    def _extract_scene_tags(text: str) -> list[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        lowered = raw.lower()
+        tokens = [tok for tok in re.findall(r"[A-Za-z가-힣0-9_]{2,24}", lowered)]
+        stop = {
+            "그냥", "진짜", "지금", "이번", "저번", "요즘", "please",
+            "알려줘", "해줘", "해봐", "정리해줘", "추천해줘", "말해줘",
+            "what", "when", "where", "which", "tell", "remember",
+            "그리고", "근데", "그래서", "그러면", "the", "and",
+        }
+        out: list[str] = []
+        seen: set[str] = set()
+        for tok in tokens:
+            if tok in stop:
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            out.append(tok)
+            if len(out) >= 10:
+                break
+        return out
+
+    def _extract_fact_items_from_user_query(self, query: str) -> list[dict[str, Any]]:
+        text = self._sanitize_digest_text(str(query or ""), max_chars=220)
+        if not text:
+            return []
+        if self._is_fact_query_or_command(text):
+            return []
+        out: list[dict[str, Any]] = []
+
+        def _add(subject: str, predicate: str, value: str, summary: str, confidence: float = 0.92) -> None:
+            clean_value = self._sanitize_digest_text(value, max_chars=80)
+            if not clean_value or not self._is_valid_fact_value(clean_value):
+                return
+            out.append(
+                {
+                    "subject": subject,
+                    "predicate": predicate,
+                    "value": clean_value,
+                    "summary": self._sanitize_digest_text(summary, max_chars=180),
+                    "confidence": max(0.0, min(1.0, float(confidence))),
+                }
+            )
+
+        m_name = re.search(r"(?:내\s*이름(?:은|이야|은요)?\s*)([A-Za-z가-힣0-9]{2,20})", text, flags=re.IGNORECASE)
+        if m_name:
+            value = re.sub(r"(이야|야|입니다|예요|이에요)$", "", m_name.group(1).strip())
+            if self._is_valid_fact_value(value):
+                _add("user_name", "name", value, f"사용자 이름은 {value}입니다.")
+
+        m_drink = re.search(r"(?:좋아하는\s*음료(?:는|가)?\s*)([A-Za-z가-힣0-9 ]{1,24})", text, flags=re.IGNORECASE)
+        if m_drink:
+            value = re.sub(r"(이야|야|입니다|예요|이에요)$", "", m_drink.group(1).strip().rstrip(".!,"))
+            lowered_value = value.lower()
+            if not any(token in lowered_value for token in ("뭐", "기억", "했", "what", "remember", "said")):
+                _add("favorite_drink", "likes", value, f"사용자는 {value}를 좋아합니다.")
+
+        m_pet = re.search(r"(?:반려(?:묘|견|동물)\s*이름(?:은|이야|은요)?\s*)([A-Za-z가-힣0-9]{1,20})", text, flags=re.IGNORECASE)
+        if m_pet:
+            value = re.sub(r"(이야|야|입니다|예요|이에요)$", "", m_pet.group(1).strip())
+            _add("pet_name", "pet_name", value, f"사용자 반려동물 이름은 {value}입니다.")
+        m_pet_habit = re.search(
+            r"(?:고양이|반려묘|반려동물).{0,16}?(?:습관|버릇)(?:은|이|이야|은요)?\s*([A-Za-z가-힣0-9 ,]{2,60})",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m_pet_habit:
+            value = m_pet_habit.group(1).strip().rstrip(".!,")
+            _add("pet_habit", "pet_habit", value, f"사용자 반려동물 습관은 {value}입니다.", confidence=0.88)
+
+        # Generic multi-domain conversational facts (travel/preferences/schedule).
+        # Keep this deterministic and low-risk: only extract declarative patterns.
+        m_destination = re.search(
+            r"(?:로|으로)\s*([A-Za-z가-힣]{2,24})\s*(?:갈까|갈|여행|출장)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m_destination:
+            value = m_destination.group(1).strip()
+            _add("trip_destination", "destination", value, f"여행 목적지는 {value}입니다.", confidence=0.86)
+
+        m_duration = re.search(
+            r"(\d+\s*박\s*\d+\s*일)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m_duration:
+            value = re.sub(r"\s+", "", m_duration.group(1).strip())
+            _add("trip_duration", "duration", value, f"여행 기간은 {value}입니다.", confidence=0.86)
+
+        m_arrival = re.search(
+            r"((?:월|화|수|목|금|토|일)?요일?\s*)?(오전|오후|아침|점심|저녁|밤)?\s*(\d{1,2}\s*시(?:\s*반)?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m_arrival and ("도착" in text or "arriv" in text.lower()):
+            parts = [str(part or "").strip() for part in m_arrival.groups() if str(part or "").strip()]
+            value = " ".join(parts).strip().rstrip(".!,")
+            if value:
+                _add("arrival_time", "arrival_time", value, f"도착 시각/조건은 {value}입니다.", confidence=0.84)
+
+        m_lodging = re.search(
+            r"(?:숙소(?:는|가)?\s*)([^.!\n]{3,60})",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m_lodging:
+            value = m_lodging.group(1).strip().rstrip(".!,")
+            lowered_lodging = value.lower()
+            has_lodging_cue = any(token in value for token in ("근처", "역", "호텔", "숙박", "오호리", "하카타", "후보"))
+            has_budget_like = bool(
+                ("예산" in value)
+                or ("만원" in value)
+                or re.search(r"\d+\s*원", value)
+                or any(token in lowered_lodging for token in ("budget", "cost", "price"))
+            )
+            if has_lodging_cue and not has_budget_like:
+                _add("lodging_candidates", "lodging_candidates", value, f"숙소 후보는 {value}입니다.", confidence=0.84)
+
+        m_budget = re.search(
+            r"(?:예산(?:은|이)?\s*)([^.!\n]{2,40})",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m_budget:
+            value = m_budget.group(1).strip().rstrip(".!,")
+            _add("budget", "budget", value, f"예산은 {value}입니다.", confidence=0.84)
+
+        if "아침형" in text:
+            _add("preference_morning", "preference", "아침형", "사용자는 아침형 성향입니다.", confidence=0.82)
+        if any(token in text for token in ("조용한", "한산한")) and any(token in text for token in ("산책", "카페", "동네")):
+            _add("preference_quiet", "preference", "조용한 동선 선호", "사용자는 조용하고 덜 붐비는 동선을 선호합니다.", confidence=0.82)
+
+        return out
+
+    @staticmethod
+    def _is_fact_query_or_command(text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return True
+        if "?" in lowered:
+            return True
+        blocked_tokens = (
+            "뭐야",
+            "뭐였",
+            "기억나",
+            "알려줘",
+            "what is",
+            "what was",
+            "remember",
+            "tell me",
+            "can you",
+            "please",
+        )
+        return any(token in lowered for token in blocked_tokens)
+
+    @staticmethod
+    def _is_valid_fact_value(value: str) -> bool:
+        raw = str(value or "").strip()
+        if not raw:
+            return False
+        lowered = raw.lower()
+        blocked_exact = {
+            "안녕",
+            "안녕하세요",
+            "hello",
+            "hi",
+            "hey",
+            "amente",
+            "unknown",
+            "none",
+            "null",
+        }
+        if lowered in blocked_exact:
+            return False
+        if len(raw) <= 1:
+            return False
+        if re.search(r"[?？!！]$", raw):
+            return False
+        if re.search(r"(?:뭐|무엇|what|remember|기억|알려)", lowered):
+            return False
+        return True
 
     def _write_digest(self, *, session_id: str, payload: dict[str, Any]) -> None:
         normalized = self._normalize_digest_payload(payload)
@@ -575,7 +866,7 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
             key=self._DIGEST_KEY,
             value_json=normalized,
             ttl_hours=24,
-            keep_recent=40,
+            keep_recent=120,
         )
         # Phase 18: Vectorize memory for long-term retrieval
         self._vectorize_memory(session_id=session_id, payload=normalized)
@@ -648,6 +939,7 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
             "stable_facts": [],
             "open_loops": [],
             "recent_turns": [],
+            "rolling_summary": "",
             "updated_at": self._now_iso(),
         }
 
@@ -668,6 +960,7 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
             cap=self._DIGEST_OPEN_LOOPS_CAP,
         )
         normalized["recent_turns"] = self._normalize_recent_turns(payload.get("recent_turns"))
+        normalized["rolling_summary"] = str(payload.get("rolling_summary") or "").strip()
         updated_at = str(payload.get("updated_at") or "").strip()
         normalized["updated_at"] = updated_at or self._now_iso()
         return normalized
@@ -689,6 +982,118 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
                 continue
             output.append({"role": role, "text": text})
         return output[-self._DIGEST_RECENT_TURNS_CAP :]
+
+    @staticmethod
+    def _compress_turns_to_summary(
+        turns: list[dict[str, Any]],
+        *,
+        existing_summary: str,
+        max_chars: int = 600,
+    ) -> str:
+        """Rule-based compression of archived conversation turns into a rolling summary.
+
+        Extracts key information (named entities, numbers, topics, open questions)
+        from the provided turns and merges them with an existing summary.
+        No LLM is called — this is purely heuristic to avoid latency.
+        """
+        if not isinstance(turns, list):
+            return existing_summary[:max_chars].strip()
+
+        # Collect assistant and user text fragments
+        user_fragments: list[str] = []
+        assistant_fragments: list[str] = []
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role") or "").strip().lower()
+            text = str(turn.get("text") or "").strip()
+            if not text:
+                continue
+            if role == "user":
+                user_fragments.append(text)
+            elif role == "assistant":
+                assistant_fragments.append(text)
+
+        # Extract named entities and numbers (Korean + Latin)
+        def _extract_entities(texts: list[str]) -> list[str]:
+            found: list[str] = []
+            seen: set[str] = set()
+            for text in texts:
+                # Korean proper nouns: 2-6 char sequences
+                for match in re.findall(r"[가-힣]{2,6}", text):
+                    key = match.casefold()
+                    if key not in seen and len(found) < 12:
+                        seen.add(key)
+                        found.append(match)
+                # Numeric facts (e.g. "3박4일", "15만원", "10시")
+                for match in re.findall(r"\d+\s*[박일시원만천백]+", text):
+                    key = re.sub(r"\s+", "", match).casefold()
+                    if key not in seen and len(found) < 16:
+                        seen.add(key)
+                        found.append(match.strip())
+                # Latin proper nouns: capitalized words
+                for match in re.findall(r"\b[A-Z][a-z]{1,15}\b", text):
+                    key = match.casefold()
+                    if key not in seen and len(found) < 16:
+                        seen.add(key)
+                        found.append(match)
+            return found[:14]
+
+        # Extract unresolved questions from user turns
+        def _extract_questions(texts: list[str]) -> list[str]:
+            questions: list[str] = []
+            seen: set[str] = set()
+            for text in texts:
+                sentences = re.split(r"(?<=[.!?。！？])\s+|\n+", text)
+                for sent in sentences:
+                    sent = sent.strip()
+                    if not sent:
+                        continue
+                    is_question = (
+                        "?" in sent
+                        or re.search(r"(까요|나요|인가요|어때요|할까요|될까요)\s*[.!?]?$", sent)
+                    )
+                    if is_question:
+                        key = re.sub(r"[^가-힣A-Za-z0-9]", "", sent).casefold()[:30]
+                        if key and key not in seen:
+                            seen.add(key)
+                            questions.append(sent[:80])
+                    if len(questions) >= 3:
+                        break
+            return questions
+
+        entities = _extract_entities(user_fragments + assistant_fragments)
+        questions = _extract_questions(user_fragments)
+
+        parts: list[str] = []
+        if existing_summary:
+            parts.append(existing_summary.rstrip(".").strip())
+        if entities:
+            parts.append("대화 중 언급된 주요 키워드는 " + ", ".join(entities[:10]) + "입니다")
+        if questions:
+            q_desc = [f"'{q.rstrip('?').strip()}'" for q in questions[:2]]
+            parts.append("사용자가 주로 " + ", ".join(q_desc) + "에 대해 질문하거나 언급했습니다")
+
+        merged = ". ".join(p for p in parts if p)
+        if merged and not merged.endswith("."):
+            merged += "."
+
+        if not merged:
+            return ""
+        # Truncate gracefully at sentence boundary
+        if len(merged) > max_chars:
+            truncated = merged[:max_chars]
+            last_break = max(
+                truncated.rfind(". "),
+                truncated.rfind("。"),
+                truncated.rfind("! "),
+                truncated.rfind("? "),
+            )
+            if last_break > max_chars // 2:
+                merged = truncated[: last_break + 1].strip()
+            else:
+                merged = truncated.rstrip() + "…"
+        return merged.strip()
 
     def _normalize_str_list(self, values: Any, *, cap: int) -> list[str]:
         if not isinstance(values, list):
@@ -912,3 +1317,11 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
         )
         lowered = value.lower()
         return any(cue in lowered for cue in cues)
+    @staticmethod
+    def _strip_leading_noise_token(text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        # Prevent recurrence amplification in long sessions for known stray prefix token.
+        value = re.sub(r"(?i)^\s*amente[\s,:\-\.]+\s*", "", value).strip()
+        return value

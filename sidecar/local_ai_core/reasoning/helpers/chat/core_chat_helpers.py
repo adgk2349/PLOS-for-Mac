@@ -126,6 +126,7 @@ class CoreChatHelpers(CoreChatPostHelpers):
 
     def _build_candidate_execution(*, response_language: str, citations: list[Citation], reason: str) -> ExecutionResult:
         items = []
+        option_lines: list[str] = []
         for citation in citations[:4]:
             items.append(
                 {
@@ -134,10 +135,29 @@ class CoreChatHelpers(CoreChatPostHelpers):
                     "score": round(citation.score, 3),
                 }
             )
+            label = str(citation.file_path or citation.source or citation.doc_id or "").strip()
+            if label:
+                option_lines.append(label)
         if response_language == "ko":
-            text = "완전히 확실하진 않지만, 지금은 이쪽 후보가 가장 유력해 보여요. 파일명/기간/태그를 조금만 더 주시면 정확도를 더 올릴 수 있어요."
+            if option_lines:
+                options = "\n".join(f"{idx}. {value}" for idx, value in enumerate(option_lines[:3], start=1))
+                text = (
+                    "현재 근거 점수가 비슷해서 방향 확인이 필요합니다. "
+                    "아래 후보 중 가까운 항목을 선택해 주세요:\n"
+                    f"{options}"
+                )
+            else:
+                text = "현재 근거 점수가 비슷해서 방향 확인이 필요합니다. 파일명/기간/태그를 한 줄만 더 알려주세요."
         else:
-            text = "Evidence confidence was low, so I returned candidates instead of a final answer. Please retry with file name, year, or tag."
+            if option_lines:
+                options = "\n".join(f"{idx}. {value}" for idx, value in enumerate(option_lines[:3], start=1))
+                text = (
+                    "Evidence scores are close, so I need one direction check. "
+                    "Please pick the closest item:\n"
+                    f"{options}"
+                )
+            else:
+                text = "Evidence scores are close. Please add one hint such as file name, date, or tag."
         return ExecutionResult(
             result_type="candidate",
             structured_payload={"reason": reason, "items": items},
@@ -301,7 +321,10 @@ class CoreChatHelpers(CoreChatPostHelpers):
             last_context=last_context,
         )
         context_summary = ""
-        should_apply_context = self._should_apply_conversation_context(
+        context_injection_enabled = str(
+            os.getenv("LOCAL_AI_CONVERSATION_CONTEXT_INJECTION", "0") or "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        should_apply_context = context_injection_enabled and self._should_apply_conversation_context(
             req.query,
             has_session_digest=bool(session_digest),
             has_last_context=bool(last_context),
@@ -396,7 +419,7 @@ class CoreChatHelpers(CoreChatPostHelpers):
                     model_profile=getattr(settings, "model_profile", "recommended"),
                     query=req.query,
                 ),
-                timeout_seconds=float(os.getenv("LOCAL_AI_INFERENCE_TIMEOUT_SECONDS", "40")),
+                timeout_seconds=None,
             )
             execution.tool_logs.insert(0, f"router:intent={ReasoningIntent.GENERAL_CHAT.value}")
             if auto_web_search_request and web_report:
@@ -591,6 +614,9 @@ class CoreChatHelpers(CoreChatPostHelpers):
         return composed
 
     def _general_chat_assist_mode(*, parsed_intent: ParsedIntent, query: str) -> tuple[str, float, bool]:
+        if str(os.getenv("LOCAL_AI_GENERAL_CHAT_ASSIST_ENABLED", "1") or "1").strip().lower() not in {"1", "true", "yes", "on"}:
+            confidence = float(getattr(parsed_intent, "confidence", 0.0) or 0.0)
+            return "none", confidence, True
         operation = str(getattr(parsed_intent, "operation", "chat") or "chat")
         target = str(getattr(parsed_intent, "target", "") or "").strip()
         ambiguity = str(getattr(parsed_intent, "ambiguity", "clear") or "clear")

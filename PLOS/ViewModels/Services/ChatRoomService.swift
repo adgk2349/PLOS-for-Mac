@@ -99,7 +99,10 @@ final class ChatRoomService {
 
         let firstLine = candidateLines.first(where: { line in
             let lowered = line.lowercased()
-            return !lowered.hasPrefix("첨부 파일:") && !lowered.hasPrefix("attached file:")
+            return !lowered.hasPrefix("첨부 파일:") &&
+                !lowered.hasPrefix("attached file:") &&
+                !lowered.hasPrefix("첨부[") &&
+                !lowered.hasPrefix("attachment[")
         }) ?? candidateLines[0]
 
         var text = firstLine

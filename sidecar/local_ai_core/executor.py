@@ -45,6 +45,7 @@ class LocalExecutor:
         language_preference: str | None,
         session_summary: str | None,
         max_tokens: int,
+        message_state: list[dict[str, str]] | None = None,
     ) -> str:
         payload = {
             "q": str(query or ""),
@@ -56,6 +57,7 @@ class LocalExecutor:
             "lang": str(language_preference or ""),
             "s": str(session_summary or ""),
             "t": int(max_tokens),
+            "ms": message_state or [],
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8", errors="ignore")
         return hashlib.blake2b(encoded, digest_size=16).hexdigest()
@@ -94,6 +96,7 @@ class LocalExecutor:
         session_summary: str | None,
         max_tokens: int = 320,
         timeout_seconds: float | None = None,
+        message_state: list[dict[str, str]] | None = None,
     ) -> ExecutionResult:
         offloaded = self._async_adapter.run(
             self.execute_conversation,
@@ -106,11 +109,10 @@ class LocalExecutor:
             language_preference=language_preference,
             session_summary=session_summary,
             max_tokens=max_tokens,
+            message_state=message_state,
         )
         result = (
-            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
-            if timeout_seconds and timeout_seconds > 0
-            else await offloaded
+            await offloaded
         )
         result.tool_logs.append("inference_offload:conversation")
         return result
@@ -146,9 +148,7 @@ class LocalExecutor:
             response_length=response_length,
         )
         result = (
-            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
-            if timeout_seconds and timeout_seconds > 0
-            else await offloaded
+            await offloaded
         )
         result.tool_logs.append("inference_offload:executor_execute")
         return result
@@ -156,36 +156,28 @@ class LocalExecutor:
     async def generate_async(self, *, timeout_seconds: float | None = None, **kwargs):
         offloaded = self._async_adapter.run(self._local_inference.generate, **kwargs)
         inference = (
-            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
-            if timeout_seconds and timeout_seconds > 0
-            else await offloaded
+            await offloaded
         )
         return inference
 
     async def generate_conversational_async(self, *, timeout_seconds: float | None = None, **kwargs):
         offloaded = self._async_adapter.run(self._local_inference.generate_conversational, **kwargs)
         inference = (
-            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
-            if timeout_seconds and timeout_seconds > 0
-            else await offloaded
+            await offloaded
         )
         return inference
 
     async def generate_agentic_step_async(self, *, timeout_seconds: float | None = None, **kwargs):
         offloaded = self._async_adapter.run(self._local_inference.generate_agentic_step, **kwargs)
         action = (
-            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
-            if timeout_seconds and timeout_seconds > 0
-            else await offloaded
+            await offloaded
         )
         return action
 
     async def generate_reflection_async(self, *, timeout_seconds: float | None = None, **kwargs):
         offloaded = self._async_adapter.run(self._local_inference.generate_reflection, **kwargs)
         reflection = (
-            await asyncio.wait_for(offloaded, timeout=max(0.1, float(timeout_seconds)))
-            if timeout_seconds and timeout_seconds > 0
-            else await offloaded
+            await offloaded
         )
         return reflection
 
@@ -201,6 +193,7 @@ class LocalExecutor:
         language_preference: str | None,
         session_summary: str | None,
         max_tokens: int = 320,
+        message_state: list[dict[str, str]] | None = None,
     ) -> ExecutionResult:
         cache_key = self._conversation_cache_key(
             query=query,
@@ -212,6 +205,7 @@ class LocalExecutor:
             language_preference=language_preference,
             session_summary=session_summary,
             max_tokens=max_tokens,
+            message_state=message_state,
         )
         cached = self._conversation_cache_get(cache_key)
         if cached is not None:
@@ -228,6 +222,7 @@ class LocalExecutor:
             max_tokens=max_tokens,
             session_summary=session_summary,
             allow_static_fallback=False,
+            message_state=message_state,
         )
         result = ExecutionResult(
             result_type="conversation",
@@ -242,6 +237,16 @@ class LocalExecutor:
             used_fallback=conversational.used_fallback,
             runtime_detail=conversational.detail,
         )
+        generated = str(result.generated_text or "").strip()
+        if generated.lower().startswith("error:"):
+            result.generated_text = ""
+            result.used_fallback = False
+            detail = str(result.runtime_detail or "").strip()
+            if detail:
+                result.runtime_detail = f"{detail}; generated_error_filtered={generated[:160]}"
+            else:
+                result.runtime_detail = f"generated_error_filtered={generated[:160]}"
+            result.tool_logs.append("conversation:error_text_filtered")
         if str(result.generated_text or "").strip() and not result.used_fallback:
             self._conversation_cache_put(cache_key, result)
         return result
@@ -294,54 +299,29 @@ class LocalExecutor:
         selected = self._selected_citations(plan=plan, citations=citations)
         language = resolve_response_language(query, language_preference)
         if not selected:
-            if parsed_intent in {
-                ReasoningIntent.FOLLOWUP_QUESTION,
-                ReasoningIntent.FOLLOWUP_REFINE,
-                ReasoningIntent.CONTINUE_PREVIOUS_RESULT,
-                ReasoningIntent.SOFT_CONFIRM,
-                ReasoningIntent.SELECT_PREVIOUS_CANDIDATE,
-                ReasoningIntent.NEXT_CANDIDATE,
-                ReasoningIntent.REDUCE_SCOPE,
-                ReasoningIntent.LIGHTWEIGHT_ACTION_REQUEST,
-                ReasoningIntent.OPEN_FILE,
-            }:
-                conversational = self._local_inference.generate_conversational(
-                    query=query,
-                    mode=mode,
-                    profile=startup_profile.value,
-                    engine=engine,
-                    mlx_model_path=mlx_model_path,
-                    llama_model_path=llama_model_path,
-                    language_preference=language_preference,
-                    max_tokens=self._max_tokens_for(response_length="short", mode=mode),
-                    allow_static_fallback=False,
-                )
-                return ExecutionResult(
-                    result_type="answer",
-                    structured_payload={
-                        "text": conversational.answer,
-                        "ungrounded_allowed": True,
-                    },
-                    citations=[],
-                    tool_logs=[f"conversational_inference:{conversational.engine_used.value}", "no_citation_conversation"],
-                    generated_text=conversational.answer,
-                    engine_used=conversational.engine_used,
-                    used_fallback=conversational.used_fallback,
-                    runtime_detail=conversational.detail,
-                )
+            conversational = self._local_inference.generate_conversational(
+                query=query,
+                mode=mode,
+                profile=startup_profile.value,
+                engine=engine,
+                mlx_model_path=mlx_model_path,
+                llama_model_path=llama_model_path,
+                language_preference=language_preference,
+                max_tokens=self._max_tokens_for(response_length="short", mode=mode),
+                allow_static_fallback=False,
+            )
             return ExecutionResult(
-                result_type="candidate",
-                structured_payload={"items": []},
+                result_type="conversation",
+                structured_payload={
+                    "text": conversational.answer,
+                    "ungrounded_allowed": True,
+                },
                 citations=[],
-                tool_logs=["no_selected_citations"],
-                generated_text=(
-                    "근거가 부족해 후보 형태로 안내합니다."
-                    if language == "ko"
-                    else "Grounded evidence was insufficient, returning candidate-style output."
-                ),
-                engine_used=None,
-                used_fallback=False,
-                runtime_detail=None,
+                tool_logs=[f"conversational_inference:{conversational.engine_used.value}", "no_citation_conversation"],
+                generated_text=conversational.answer,
+                engine_used=conversational.engine_used,
+                used_fallback=conversational.used_fallback,
+                runtime_detail=conversational.detail,
             )
 
         summary_hook_source = PluginCapabilitySource.BUILT_IN

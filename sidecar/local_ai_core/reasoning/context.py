@@ -32,3 +32,4 @@ class ReasoningContext:
     session_digest: str | None
     effective_query: str
     force_web_search: bool = False
+    session_digest_payload: dict[str, Any] | None = None

@@ -3,6 +3,142 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 
+private struct PluginImportDescriptor {
+    let manifestURL: URL
+    let pluginDirectory: URL
+    let shouldPrepareRuntime: Bool
+}
+
+private enum PluginImportBootstrapper {
+    static func prepare(
+        request: PluginRegisterRequest,
+        pluginDirectory: URL,
+        shouldPrepareRuntime: Bool
+    ) throws -> PluginRegisterRequest {
+        guard shouldPrepareRuntime else { return request }
+
+        var patched = request
+        let entrypoint = patched.manifest.entrypoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !entrypoint.isEmpty, !entrypoint.hasPrefix("builtin://") else { return patched }
+
+        let fm = FileManager.default
+        let requirementsURL = pluginDirectory.appendingPathComponent("requirements.txt")
+        let venvDirectory = pluginDirectory.appendingPathComponent(".venv", isDirectory: true)
+        let venvPythonURL = venvDirectory.appendingPathComponent("bin/python3")
+        if fm.fileExists(atPath: requirementsURL.path) {
+            try ensureVirtualEnvIfNeeded(
+                pluginDirectory: pluginDirectory,
+                requirementsURL: requirementsURL,
+                venvDirectory: venvDirectory,
+                venvPythonURL: venvPythonURL
+            )
+        }
+
+        let launcherURL = pluginDirectory.appendingPathComponent(".plos_plugin_entrypoint.sh")
+        let launcherScript = makeLauncherScript(
+            pluginDirectory: pluginDirectory,
+            entrypoint: entrypoint,
+            preferredPython: fm.isExecutableFile(atPath: venvPythonURL.path) ? venvPythonURL.path : nil
+        )
+        try launcherScript.write(to: launcherURL, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: launcherURL.path)
+
+        patched.manifest.entrypoint = launcherURL.path
+        return patched
+    }
+
+    private static func ensureVirtualEnvIfNeeded(
+        pluginDirectory: URL,
+        requirementsURL: URL,
+        venvDirectory: URL,
+        venvPythonURL: URL
+    ) throws {
+        let fm = FileManager.default
+        let stampURL = pluginDirectory.appendingPathComponent(".plos_plugin_requirements.stamp")
+        let requirementsMTime = (try? fm.attributesOfItem(atPath: requirementsURL.path)[.modificationDate] as? Date) ?? .distantPast
+        let stampMTime = (try? fm.attributesOfItem(atPath: stampURL.path)[.modificationDate] as? Date) ?? .distantPast
+        let needsInstall = !fm.isExecutableFile(atPath: venvPythonURL.path) || stampMTime < requirementsMTime
+        guard needsInstall else { return }
+
+        if !fm.isExecutableFile(atPath: venvPythonURL.path) {
+            let pythonCandidates = SidecarBootstrapService.resolveSystemPythonExecutables()
+            guard let systemPython = pythonCandidates.first else {
+                throw APIError(message: "플러그인 Python 환경 생성을 위한 python3(3.11~3.13)를 찾지 못했습니다.")
+            }
+            try SidecarBootstrapService.runCommand(
+                executable: systemPython,
+                arguments: ["-m", "venv", venvDirectory.path],
+                cwd: pluginDirectory,
+                step: "플러그인 가상환경 생성"
+            )
+        }
+
+        try SidecarBootstrapService.runCommand(
+            executable: venvPythonURL.path,
+            arguments: ["-m", "pip", "install", "--upgrade", "pip"],
+            cwd: pluginDirectory,
+            step: "플러그인 pip 업그레이드"
+        )
+        try SidecarBootstrapService.runCommand(
+            executable: venvPythonURL.path,
+            arguments: ["-m", "pip", "install", "-r", requirementsURL.path],
+            cwd: pluginDirectory,
+            step: "플러그인 의존성 설치"
+        )
+        try "ok".write(to: stampURL, atomically: true, encoding: .utf8)
+    }
+
+    private static func makeLauncherScript(
+        pluginDirectory: URL,
+        entrypoint: String,
+        preferredPython: String?
+    ) -> String {
+        let directory = shellDoubleQuoted(pluginDirectory.path)
+        if let (module, extraArgs) = parsePythonModuleEntrypoint(entrypoint) {
+            let pythonExec = shellDoubleQuoted(preferredPython ?? "python3")
+            let moduleArg = shellDoubleQuoted(module)
+            let trailing = extraArgs.map { shellDoubleQuoted($0) }.joined(separator: " ")
+            let suffix = trailing.isEmpty ? "" : " \(trailing)"
+            return """
+#!/usr/bin/env bash
+set -euo pipefail
+cd \(directory)
+exec \(pythonExec) -m \(moduleArg)\(suffix) "$@"
+"""
+        }
+
+        let forwarded = "\(entrypoint) \"$@\""
+        return """
+#!/usr/bin/env bash
+set -euo pipefail
+cd \(directory)
+exec /bin/bash -lc \(shellSingleQuoted(forwarded)) -- "$@"
+"""
+    }
+
+    private static func parsePythonModuleEntrypoint(_ entrypoint: String) -> (module: String, extraArgs: [String])? {
+        let tokens = entrypoint
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+        guard tokens.count >= 3 else { return nil }
+        guard tokens[0].lowercased().contains("python") else { return nil }
+        guard tokens[1] == "-m" else { return nil }
+        let module = tokens[2]
+        guard module.range(of: #"^[A-Za-z_][A-Za-z0-9_\.]*$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        return (module, Array(tokens.dropFirst(3)))
+    }
+
+    private static func shellSingleQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
+    private static func shellDoubleQuoted(_ value: String) -> String {
+        "\"\(value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\""
+    }
+}
+
 @MainActor
 extension AppViewModel {
     func refreshExtensionState() async throws {
@@ -13,6 +149,7 @@ extension AppViewModel {
         }
         extensionCapabilities = snapshot.0.capabilities.sorted { $0.capability.rawValue < $1.capability.rawValue }
         pluginEntries = sortPluginEntries(snapshot.1.entries)
+        reconcileSelectedPluginPanel()
     }
 
     func refreshExtensionsNow() async {
@@ -24,6 +161,7 @@ extension AppViewModel {
             if isEndpointNotFound(error) {
                 extensionCapabilities = []
                 pluginEntries = []
+                reconcileSelectedPluginPanel()
                 return
             }
             handleViewModelError(error)
@@ -82,6 +220,7 @@ extension AppViewModel {
             }
             extensionCapabilities = snapshot.0.capabilities.sorted { $0.capability.rawValue < $1.capability.rawValue }
             pluginEntries = sortPluginEntries(snapshot.1.entries)
+            reconcileSelectedPluginPanel()
             resetPluginDraft()
         } catch {
             handleViewModelError(error)
@@ -91,10 +230,10 @@ extension AppViewModel {
     func registerPluginFromManifestFile() async {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
-        panel.canChooseDirectories = false
+        panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         if #available(macOS 12.0, *) {
-            panel.allowedContentTypes = [.json]
+            panel.allowedContentTypes = [.json, .folder]
         } else {
             panel.allowedFileTypes = ["json"]
         }
@@ -104,25 +243,37 @@ extension AppViewModel {
             return
         }
 
-        await registerPluginFromManifestURL(url)
+        await registerPluginFromImportURL(url)
     }
 
     func registerPluginFromDroppedItemProviders(_ providers: [NSItemProvider]) async {
         guard !providers.isEmpty else {
             return
         }
-        guard let url = await resolveDroppedManifestURL(from: providers) else {
-            lastError = "드롭한 파일에서 플러그인 manifest(.json)를 찾지 못했습니다."
+        guard let url = await resolveDroppedPluginURL(from: providers) else {
+            lastError = "드롭한 항목에서 플러그인 폴더 또는 manifest(.json)를 찾지 못했습니다."
             return
         }
-        await registerPluginFromManifestURL(url)
+        await registerPluginFromImportURL(url)
     }
 
-    private func registerPluginFromManifestURL(_ url: URL) async {
-        let accessed = url.startAccessingSecurityScopedResource()
+    private func registerPluginFromImportURL(_ url: URL) async {
+        let descriptor: PluginImportDescriptor
+        do {
+            descriptor = try resolvePluginImportDescriptor(url)
+        } catch {
+            handleViewModelError(error)
+            return
+        }
+
+        let rootAccessed = url.startAccessingSecurityScopedResource()
+        let manifestAccessed = descriptor.manifestURL.path == url.path ? false : descriptor.manifestURL.startAccessingSecurityScopedResource()
         defer {
-            if accessed {
+            if rootAccessed {
                 url.stopAccessingSecurityScopedResource()
+            }
+            if manifestAccessed {
+                descriptor.manifestURL.stopAccessingSecurityScopedResource()
             }
         }
 
@@ -130,8 +281,13 @@ extension AppViewModel {
         defer { isPluginBusy = false }
 
         do {
-            let data = try Data(contentsOf: url)
-            let request = try decodePluginRegisterRequest(from: data)
+            let data = try Data(contentsOf: descriptor.manifestURL)
+            let decoded = try decodePluginRegisterRequest(from: data)
+            let request = try PluginImportBootstrapper.prepare(
+                request: decoded,
+                pluginDirectory: descriptor.pluginDirectory,
+                shouldPrepareRuntime: descriptor.shouldPrepareRuntime
+            )
             let snapshot = try await performWithSidecarRetry { client in
                 _ = try await extensionServiceAdapter.registerPlugin(client: client, request: request)
                 async let capabilitiesResponse = extensionServiceAdapter.fetchCapabilities(client: client)
@@ -140,15 +296,21 @@ extension AppViewModel {
             }
             extensionCapabilities = snapshot.0.capabilities.sorted { $0.capability.rawValue < $1.capability.rawValue }
             pluginEntries = sortPluginEntries(snapshot.1.entries)
+            reconcileSelectedPluginPanel()
         } catch {
             handleViewModelError(error)
         }
     }
 
-    private func resolveDroppedManifestURL(from providers: [NSItemProvider]) async -> URL? {
+    private func resolveDroppedPluginURL(from providers: [NSItemProvider]) async -> URL? {
+        let fm = FileManager.default
         for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
             guard let url = await loadURL(from: provider, typeIdentifier: UTType.fileURL.identifier) else {
                 continue
+            }
+            var isDirectory: ObjCBool = false
+            if fm.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                return url
             }
             if url.pathExtension.lowercased() == "json" {
                 return url
@@ -191,6 +353,7 @@ extension AppViewModel {
             }
             upsertPluginEntry(response.plugin)
             extensionCapabilities = response.capabilities.sorted { $0.capability.rawValue < $1.capability.rawValue }
+            reconcileSelectedPluginPanel()
         } catch {
             handleViewModelError(error)
         }
@@ -206,6 +369,7 @@ extension AppViewModel {
             }
             upsertPluginEntry(response.plugin)
             extensionCapabilities = response.capabilities.sorted { $0.capability.rawValue < $1.capability.rawValue }
+            reconcileSelectedPluginPanel()
         } catch {
             handleViewModelError(error)
         }
@@ -228,9 +392,77 @@ extension AppViewModel {
                 }
                 extensionCapabilities = []
             }
+            reconcileSelectedPluginPanel()
         } catch {
             handleViewModelError(error)
         }
+    }
+
+    struct ComposerPluginToggleItem: Identifiable, Hashable {
+        let id: String
+        let pluginID: String
+        let toggleID: String
+        let title: String
+        let help: String?
+        let defaultValue: Bool
+        let pluginEnabled: Bool
+    }
+
+    var composerPluginToggles: [ComposerPluginToggleItem] {
+        let language = appLanguage
+        var items: [ComposerPluginToggleItem] = []
+
+        for entry in pluginEntries {
+            guard let ui = entry.manifest.ui else { continue }
+            for toggle in ui.toggles where toggle.location == .composerModelControls {
+                let storageKey = pluginToggleStorageKey(pluginID: entry.plugin_id, toggleID: toggle.id)
+                items.append(
+                    ComposerPluginToggleItem(
+                        id: storageKey,
+                        pluginID: entry.plugin_id,
+                        toggleID: toggle.id,
+                        title: toggle.title(language: language),
+                        help: toggle.help(language: language),
+                        defaultValue: toggle.default_enabled,
+                        pluginEnabled: entry.enabled
+                    )
+                )
+            }
+        }
+
+        return items.sorted { lhs, rhs in
+            if lhs.pluginEnabled != rhs.pluginEnabled {
+                return lhs.pluginEnabled && !rhs.pluginEnabled
+            }
+            if lhs.pluginID != rhs.pluginID {
+                return lhs.pluginID < rhs.pluginID
+            }
+            return lhs.toggleID < rhs.toggleID
+        }
+    }
+
+    func pluginToggleBinding(pluginID: String, toggleID: String, defaultValue: Bool) -> Binding<Bool> {
+        let key = pluginToggleStorageKey(pluginID: pluginID, toggleID: toggleID)
+        return Binding(
+            get: {
+                if let cached = self.pluginUIToggleStates[key] {
+                    return cached
+                }
+                let defaults = UserDefaults.standard
+                let value: Bool
+                if defaults.object(forKey: key) == nil {
+                    value = defaultValue
+                } else {
+                    value = defaults.bool(forKey: key)
+                }
+                self.pluginUIToggleStates[key] = value
+                return value
+            },
+            set: { isOn in
+                self.pluginUIToggleStates[key] = isOn
+                UserDefaults.standard.set(isOn, forKey: key)
+            }
+        )
     }
 
     func pluginDraftCapabilityBinding(_ capability: ExtensionCapability) -> Binding<Bool> {
@@ -284,6 +516,32 @@ extension AppViewModel {
         pluginEntries = sortPluginEntries(pluginEntries)
     }
 
+    private func pluginToggleStorageKey(pluginID: String, toggleID: String) -> String {
+        let normalizedPluginID = pluginID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedToggleID = toggleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "local_ai_plugin_ui_toggle_v1.\(normalizedPluginID).\(normalizedToggleID)"
+    }
+
+    private func reconcileSelectedPluginPanel() {
+        guard selectedMainPanel == .plugin else { return }
+        let pluginID = selectedPluginPanelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let panelID = selectedPluginPanelViewID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pluginID.isEmpty else {
+            switchToChatPanel()
+            return
+        }
+        guard let entry = pluginEntries.first(where: { $0.plugin_id == pluginID }) else {
+            switchToChatPanel()
+            return
+        }
+        guard !panelID.isEmpty else { return }
+        let views = entry.manifest.ui?.views ?? []
+        let panelExists = views.contains(where: { $0.location == .mainPanel && $0.id == panelID })
+        if !panelExists {
+            switchToChatPanel()
+        }
+    }
+
     func isBuiltInPluginEntry(_ entry: PluginRegistryEntry) -> Bool {
         if entry.is_builtin == true {
             return true
@@ -325,5 +583,32 @@ extension AppViewModel {
         }
         let manifest = try decoder.decode(PluginManifestV1.self, from: data)
         return PluginRegisterRequest(manifest: manifest, enabled: false)
+    }
+
+    private func resolvePluginImportDescriptor(_ url: URL) throws -> PluginImportDescriptor {
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            throw APIError(message: "선택한 경로를 찾을 수 없습니다: \(url.path)")
+        }
+
+        if isDirectory.boolValue {
+            let manifestURL = url.appendingPathComponent("plugin.json")
+            guard fm.fileExists(atPath: manifestURL.path) else {
+                throw APIError(message: "플러그인 폴더에 plugin.json이 없습니다: \(manifestURL.path)")
+            }
+            return PluginImportDescriptor(manifestURL: manifestURL, pluginDirectory: url, shouldPrepareRuntime: true)
+        }
+
+        guard url.pathExtension.lowercased() == "json" else {
+            throw APIError(message: "지원하지 않는 파일 형식입니다. plugin.json 또는 플러그인 폴더를 선택해 주세요.")
+        }
+        let pluginDirectory = url.deletingLastPathComponent()
+        let shouldPrepareRuntime = false
+        return PluginImportDescriptor(
+            manifestURL: url,
+            pluginDirectory: pluginDirectory,
+            shouldPrepareRuntime: shouldPrepareRuntime
+        )
     }
 }
