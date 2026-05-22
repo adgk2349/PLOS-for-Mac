@@ -27,6 +27,8 @@ class _StubInferenceEngine(LocalInferenceEngine):
         llama_model_path: str | None,
         max_tokens: int,
         style: str = "grounded",
+        message_state: list[dict[str, str]] | None = None,
+        response_language: str | None = None,
     ) -> str | None:
         output = self._outputs.get(engine)
         if output is None:
@@ -53,6 +55,8 @@ class _SequentialStubInferenceEngine(LocalInferenceEngine):
         llama_model_path: str | None,
         max_tokens: int,
         style: str = "grounded",
+        message_state: list[dict[str, str]] | None = None,
+        response_language: str | None = None,
     ) -> str | None:
         values = self._outputs_by_engine.get(engine) or []
         if not values:
@@ -274,8 +278,8 @@ def test_looks_conversational_answer_rejects_user_message_rule_leak():
 
 def test_korean_quality_issues_detects_query_echo():
     issues = LocalInferenceEngine._korean_quality_issues(
-        query="오늘 뭐 먹지?",
-        answer="오늘 뭐 먹지?",
+        query="오늘 점심에 뭐 먹을지 메뉴 추천해줘",
+        answer="오늘 점심에 뭐 먹을지 메뉴 추천해줘",
         response_language="ko",
     )
     assert "query_echo" in issues

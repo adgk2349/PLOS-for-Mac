@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -14,6 +16,7 @@ from ...answer_contract import (
 
 
 class GeneralChatConversationExecutionHelpers:
+    logger = logging.getLogger(__name__)
     @staticmethod
     def contract_regen_prompt(
         *,
@@ -122,7 +125,7 @@ class GeneralChatConversationExecutionHelpers:
                     max_tokens=220,
                     generation_style="rewrite",
                     sampling_overrides={"temperature": 0.18, "top_p": 0.85, "top_k": 22},
-                    timeout_seconds=max(6.0, float(os.getenv("LOCAL_AI_AUX_TIMEOUT_SECONDS", "25") or "25")),
+                    timeout_seconds=None,
                     session_summary_override="",
                     style_profile=style_profile,
                 )
@@ -193,53 +196,9 @@ class GeneralChatConversationExecutionHelpers:
         base_text = str(execution.generated_text or "").strip()
         if not strategy._looks_incomplete_answer(base_text):
             return execution
-        continuation_prompt = (
-            "Continue only the unfinished tail of the previous answer.\n"
-            "Do not restart from the beginning.\n"
-            "Do not repeat already written content.\n"
-            f"Language: {context.response_language}\n"
-            f"User request: {query}\n"
-            f"Previous answer:\n{base_text}\n\n"
-            "Continuation:"
-        )
-        try:
-            continuation = await strategy._run_conversation_inference(
-                executor=executor,
-                query=continuation_prompt,
-                context=context,
-                max_tokens=max(192, min(max(640, int(base_max_tokens * 0.8)), int(base_max_tokens))),
-                generation_style="rewrite",
-                sampling_overrides={"temperature": 0.22, "top_p": 0.82, "top_k": 16, "repeat_penalty": 1.12},
-                timeout_seconds=max(4.0, min(14.0, float(timeout_seconds))),
-                session_summary_override=session_summary_override,
-                style_profile=style_profile,
-            )
-            if not strategy._conversation_answer_ready(continuation):
-                trimmed = strategy._trim_incomplete_tail(base_text)
-                if trimmed != base_text:
-                    logs = [*list(execution.tool_logs or []), "recovery:trim_incomplete_tail"]
-                    return execution.model_copy(update={"generated_text": trimmed, "tool_logs": logs})
-                return execution
-            tail_text = str(continuation.generated_text or "").strip()
-            if not tail_text:
-                trimmed = strategy._trim_incomplete_tail(base_text)
-                if trimmed != base_text:
-                    logs = [*list(execution.tool_logs or []), "recovery:trim_incomplete_tail"]
-                    return execution.model_copy(update={"generated_text": trimmed, "tool_logs": logs})
-                return execution
-            merged = strategy._merge_continuation(base_text, tail_text)
-            if merged == base_text:
-                return execution
-            logs = [*list(execution.tool_logs or []), "recovery:continuation_append"]
-            return execution.model_copy(update={"generated_text": merged, "tool_logs": logs})
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            trimmed = strategy._trim_incomplete_tail(base_text)
-            if trimmed != base_text:
-                logs = [*list(execution.tool_logs or []), "recovery:trim_incomplete_tail"]
-                return execution.model_copy(update={"generated_text": trimmed, "tool_logs": logs})
-            return execution
+        # Keep model-native conversational output. Rewrite-style continuation can
+        # introduce unnatural tone drift and fragment artifacts.
+        return execution
 
     @staticmethod
     async def run_conversation_with_recovery(
@@ -253,6 +212,108 @@ class GeneralChatConversationExecutionHelpers:
         style_profile: Optional[Dict[str, Any]] = None,
         generation_style: str = "conversation",
     ) -> tuple[ExecutionResult, Dict[str, Any]]:
+        # Simplified Ollama-like path (default):
+        # - keep model-native output
+        # - run at most one retry
+        # - avoid salvage/rewriter-heavy recovery branches
+        simplified_path_enabled = str(
+            os.getenv("LOCAL_AI_CONVERSATION_SIMPLE_RECOVERY_ENABLED", "1") or "1"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if simplified_path_enabled:
+            decode_profile = strategy._decode_profile_with_style(
+                fallback_profile=strategy._conversation_decode_profile(query=context.req.query),
+                style_profile=style_profile,
+            )
+            if strategy._roleplay_mode_enabled(context=context):
+                decode_profile = "roleplay"
+            metadata: dict[str, Any] = {
+                "generation_retry_count": 0,
+                "generation_backoff_profile": "1.00,0.82",
+                "recovery_path": "none",
+                "degraded_internal": False,
+                "keep_waiting_mode": True,
+                "fast_chat_mode": False,
+                "conversation_decode_profile": decode_profile,
+            }
+            retry_cap = max(strategy._retry_tokens_cap(), int(base_max_tokens))
+            first_tokens = min(retry_cap, max(strategy._retry_min_tokens_floor(), int(base_max_tokens)))
+            first_sampling = strategy._sampling_for_attempt(
+                profile=decode_profile,
+                attempt_index=0,
+                generation_style="conversation",
+            )
+            try:
+                first = await strategy._run_conversation_inference(
+                    executor=executor,
+                    query=str(query or "").strip(),
+                    context=context,
+                    max_tokens=first_tokens,
+                    generation_style="conversation",
+                    sampling_overrides=first_sampling,
+                    timeout_seconds=None,
+                    session_summary_override=session_summary_override,
+                    style_profile=style_profile,
+                )
+                if strategy._conversation_answer_ready(first):
+                    first.tool_logs.append(f"recovery:attempt=1;max_tokens={first_tokens};style=conversation")
+                    return first, metadata
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+            retry_tokens = min(retry_cap, max(strategy._retry_min_tokens_floor(), int(base_max_tokens * 0.82)))
+            retry_sampling = {"temperature": 0.20, "top_p": 0.80, "top_k": 20}
+            try:
+                second = await strategy._run_conversation_inference(
+                    executor=executor,
+                    query=str(query or "").strip(),
+                    context=context,
+                    max_tokens=retry_tokens,
+                    generation_style="conversation",
+                    sampling_overrides=retry_sampling,
+                    timeout_seconds=None,
+                    session_summary_override=session_summary_override,
+                    style_profile=style_profile,
+                )
+                if strategy._conversation_answer_ready(second):
+                    second.tool_logs.append(f"recovery:attempt=2;max_tokens={retry_tokens};style=conversation")
+                    metadata["generation_retry_count"] = 1
+                    metadata["recovery_path"] = "single_retry"
+                    return second, metadata
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                metadata["last_error"] = str(exc)
+
+            metadata["generation_retry_count"] = 2
+            metadata["recovery_path"] = "regenerate_required"
+            metadata["degraded_internal"] = True
+            return (
+                ExecutionResult(
+                    result_type="conversation",
+                    structured_payload={
+                        "style": "general_chat",
+                        "reason": "generation_retry_exhausted",
+                        "ungrounded_allowed": True,
+                        "offer_regenerate": True,
+                        "regenerate_prompt": str(query or "").strip(),
+                    },
+                    citations=[],
+                    tool_logs=["recovery:generation_retry_exhausted"],
+                    generated_text="",
+                    engine_used=context.settings.local_engine,
+                    used_fallback=False,
+                    runtime_detail="generation_retry_exhausted",
+                ),
+                metadata,
+            )
+
+        # Policy simplification:
+        # - Do not apply fast-chat short-circuit budgets.
+        # - Prefer keep-generating flow over timeout-style early failure.
+        fast_chat = False
+        keep_waiting_mode = True
         attempts = strategy._generation_retry_max_attempts(context=context)
         backoff = strategy._generation_backoff_steps()[: max(1, attempts)]
         total_budget_ms = strategy._generation_retry_total_budget_ms()
@@ -263,11 +324,14 @@ class GeneralChatConversationExecutionHelpers:
             "generation_backoff_profile": ",".join(f"{step:.2f}" for step in backoff),
             "recovery_path": "none",
             "degraded_internal": False,
+            "keep_waiting_mode": bool(keep_waiting_mode),
+            "fast_chat_mode": bool(fast_chat),
         }
         decode_profile = strategy._decode_profile_with_style(
             fallback_profile=strategy._conversation_decode_profile(query=context.req.query),
             style_profile=style_profile,
         )
+        turn_started = time.time()
         if strategy._roleplay_mode_enabled(context=context):
             decode_profile = "roleplay"
         metadata["conversation_decode_profile"] = decode_profile
@@ -287,6 +351,7 @@ class GeneralChatConversationExecutionHelpers:
             )
 
         last_failure_detail = ""
+        last_failed_text = ""
         retry_floor = strategy._retry_min_tokens_floor()
         retry_cap = strategy._retry_tokens_cap()
         split_cap = strategy._split_answer_tokens_cap()
@@ -295,36 +360,21 @@ class GeneralChatConversationExecutionHelpers:
         for idx, scale in enumerate(backoff):
             max_tokens = min(retry_cap, max(retry_floor, int(base_max_tokens * scale)))
             timeout = timeouts[min(idx, len(timeouts) - 1)]
-            if idx <= 0:
-                sampling = strategy._sampling_for_attempt(
-                    profile=decode_profile,
-                    attempt_index=idx,
-                    generation_style="conversation",
-                )
-                style = "conversation"
-            elif idx == 1:
-                sampling = strategy._sampling_for_attempt(
-                    profile=decode_profile,
-                    attempt_index=idx,
-                    generation_style="conversation",
-                )
-                style = "conversation"
-            else:
-                sampling = strategy._sampling_for_attempt(
-                    profile=decode_profile,
-                    attempt_index=idx,
-                    generation_style="rewrite",
-                )
-                style = "rewrite"
+            sampling = strategy._sampling_for_attempt(
+                profile=decode_profile,
+                attempt_index=idx,
+                generation_style="conversation",
+            )
+            style = "conversation"
             try:
                 execution = await strategy._run_conversation_inference(
                     executor=executor,
                     query=base_query,
                     context=context,
                     max_tokens=max_tokens,
-                    generation_style=generation_style if idx <= 1 else "rewrite",
+                    generation_style="conversation",
                     sampling_overrides=sampling,
-                    timeout_seconds=timeout,
+                    timeout_seconds=None,
                     session_summary_override=session_summary_override,
                     style_profile=style_profile,
                 )
@@ -336,7 +386,7 @@ class GeneralChatConversationExecutionHelpers:
                         query=query,
                         execution=execution,
                         base_max_tokens=base_max_tokens,
-                        timeout_seconds=timeout,
+                        timeout_seconds=None,
                         session_summary_override=session_summary_override,
                         style_profile=style_profile,
                     )
@@ -345,6 +395,7 @@ class GeneralChatConversationExecutionHelpers:
                         metadata["recovery_path"] = "token_backoff"
                     return execution, metadata
                 last_failure_detail = str(execution.runtime_detail or "").strip()
+                last_failed_text = str(execution.generated_text or "").strip()
             except asyncio.TimeoutError:
                 last_failure_detail = f"inference_timeout:attempt{idx + 1}"
             except asyncio.CancelledError:
@@ -352,8 +403,9 @@ class GeneralChatConversationExecutionHelpers:
             except Exception as exc:
                 last_failure_detail = str(exc)
 
-        # Attempt 4: split generation (bridge + answer), both LLM-generated.
+        # Split generation path is intentionally disabled to avoid policy-heavy rewriting.
         try:
+            raise RuntimeError("split_generate_disabled")
             split_timeout = timeouts[min(len(backoff), len(timeouts) - 1)]
             bridge_prompt = (
                 f"Task: Create a single natural bridge sentence for a topic switch in {context.response_language}.\n"
@@ -404,7 +456,7 @@ class GeneralChatConversationExecutionHelpers:
                     query=query,
                     execution=execution,
                     base_max_tokens=base_max_tokens,
-                    timeout_seconds=split_timeout,
+                    timeout_seconds=None,
                     session_summary_override=session_summary_override,
                     style_profile=style_profile,
                 )
@@ -415,17 +467,32 @@ class GeneralChatConversationExecutionHelpers:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            last_failure_detail = str(exc)
+            detail = str(exc).strip()
+            # Preserve earlier concrete failure cause; split-disable marker is informational only.
+            if detail and detail != "split_generate_disabled":
+                last_failure_detail = detail
 
         no_fallback_mode = strategy._no_fallback_mode_enabled()
-        if strategy._retry_until_cancel_enabled() or no_fallback_mode:
+        if keep_waiting_mode:
             steady_scale = backoff[-1] if backoff else 0.45
             steady_tokens = min(retry_cap, max(retry_floor, int(base_max_tokens * steady_scale)))
             steady_timeout = timeouts[-1] if timeouts else 12.0
             steady_sampling = {"temperature": 0.28, "top_p": 0.84, "top_k": 20}
             steady_started = time.time()
-            max_extra_attempts = 1_000_000_000 if no_fallback_mode else strategy._retry_until_cancel_max_attempts()
-            max_extra_seconds = float("inf") if no_fallback_mode else strategy._retry_until_cancel_max_seconds()
+            try:
+                max_extra_attempts = max(
+                    1,
+                    min(4, int(float(str(os.getenv("LOCAL_AI_RETRY_UNTIL_CANCEL_MAX_ATTEMPTS", "1")).strip() or "1"))),
+                )
+            except Exception:
+                max_extra_attempts = 1
+            try:
+                max_extra_seconds = max(
+                    6.0,
+                    min(60.0, float(str(os.getenv("LOCAL_AI_RETRY_UNTIL_CANCEL_MAX_SECONDS", "18")).strip() or "18")),
+                )
+            except Exception:
+                max_extra_seconds = 18.0
             extra_attempt = 0
             while extra_attempt < max_extra_attempts and (time.time() - steady_started) < max_extra_seconds:
                 extra_attempt += 1
@@ -435,9 +502,9 @@ class GeneralChatConversationExecutionHelpers:
                         query=base_query,
                         context=context,
                         max_tokens=steady_tokens,
-                        generation_style="rewrite",
+                        generation_style="conversation",
                         sampling_overrides=steady_sampling,
-                        timeout_seconds=steady_timeout,
+                        timeout_seconds=None,
                         session_summary_override=session_summary_override,
                         style_profile=style_profile,
                     )
@@ -448,7 +515,7 @@ class GeneralChatConversationExecutionHelpers:
                             query=query,
                             execution=execution,
                             base_max_tokens=base_max_tokens,
-                            timeout_seconds=steady_timeout,
+                            timeout_seconds=None,
                             session_summary_override=session_summary_override,
                             style_profile=style_profile,
                         )
@@ -462,6 +529,21 @@ class GeneralChatConversationExecutionHelpers:
                             metadata["no_fallback_mode"] = True
                         return execution, metadata
                     last_failure_detail = str(execution.runtime_detail or "").strip()
+                    last_failed_text = str(execution.generated_text or "").strip()
+                    # Deterministic engine/runtime failures should not spin forever.
+                    lowered_detail = last_failure_detail.lower()
+                    if any(
+                        marker in lowered_detail
+                        for marker in (
+                            "mlx_isolated_failed_no_inprocess_fallback",
+                            "worker_start_",
+                            "워커 응답 타임아웃",
+                            "워커 추론 실패",
+                            "모델 경로가 비어",
+                            "runtime_error",
+                        )
+                    ):
+                        break
                 except asyncio.TimeoutError:
                     last_failure_detail = f"inference_timeout:steady{extra_attempt}"
                 except asyncio.CancelledError:
@@ -469,36 +551,143 @@ class GeneralChatConversationExecutionHelpers:
                 except Exception as exc:
                     last_failure_detail = str(exc)
                 await asyncio.sleep(0.15)
-            if no_fallback_mode:
-                # Safety net: keep waiting until caller cancellation rather than emitting fallback text.
-                while True:
-                    await asyncio.sleep(0.5)
-            metadata["degraded_internal"] = True
-            metadata["retry_until_cancel_exhausted"] = True
+            # Exit keep-waiting loop and return regenerate-required runtime error below.
 
-        # Do not emit synthetic fallback chat text on exhaustion.
-        # Return a runtime error and let UI provide explicit regenerate action.
+        # Fail-open path: prefer returning minimally sanitized model text over empty runtime error.
+        salvage_text = str(last_failed_text or "").strip()
+        # Never salvage from runtime-detail raw_preview fragments.
+        # They may contain internal diagnostics (route/quality markers).
+        if salvage_text:
+            cleaned = ""
+            compact = re.sub(r"\s+", " ", salvage_text).strip()
+            compact = re.sub(r"(?im)^\s*(?:user|assistant|answer|response|답변)\s*[:：]\s*", "", compact).strip()
+            compact = re.sub(r"(?i)\b(?:do not repeat instructions|respond with plain answer text only)\b\.?", "", compact).strip()
+            lines = [ln.strip() for ln in compact.splitlines() if ln.strip()]
+            if len(lines) >= 4 and len(set(lines)) == 1:
+                compact = lines[0]
+            cleaned = compact.strip()
+            q_compact = re.sub(r"\s+", "", str(query or "")).lower()
+            c_compact = re.sub(r"\s+", "", cleaned).lower()
+            if q_compact and c_compact:
+                # Drop obvious query-echo loops from fail-open salvage.
+                if c_compact.startswith(q_compact) and len(c_compact) >= max(18, len(q_compact) * 2):
+                    cleaned = ""
+                elif len(set(re.findall(r"[A-Za-z가-힣0-9_]+", c_compact))) <= 2 and len(c_compact) >= 24:
+                    cleaned = ""
+            if cleaned:
+                token_count = len(re.findall(r"\S+", cleaned))
+                if token_count <= 2 or strategy._looks_leading_fragment(cleaned):
+                    cleaned = ""
+            if cleaned:
+                metadata["generation_retry_count"] = len(backoff) + 1
+                metadata["recovery_path"] = "fail_open_last_text"
+                metadata["degraded_internal"] = True
+                GeneralChatConversationExecutionHelpers.logger.warning(
+                    "[GeneralChat] fail-open applied after retry exhaustion; detail=%s text=%s",
+                    (last_failure_detail or "")[:240],
+                    cleaned[:120],
+                )
+                return (
+                    ExecutionResult(
+                        result_type="conversation",
+                        structured_payload={
+                            "style": "general_chat",
+                            "ungrounded_allowed": True,
+                            "answer_type": "medium",
+                            "contract_format": "plain",
+                            "response_mode": "conversational_direct",
+                        },
+                        citations=[],
+                        tool_logs=["recovery:fail_open_last_text"],
+                        generated_text=cleaned,
+                        engine_used=context.settings.local_engine,
+                        used_fallback=False,
+                        runtime_detail=last_failure_detail or "fail_open_last_text",
+                    ),
+                    metadata,
+                )
+
+        # Last attempt: run once more without timeout and with full token budget.
+        try:
+            final_execution = await strategy._run_conversation_inference(
+                executor=executor,
+                query=base_query,
+                context=context,
+                max_tokens=retry_cap,
+                generation_style="conversation",
+                sampling_overrides={"temperature": 0.26, "top_p": 0.86, "top_k": 24},
+                timeout_seconds=None,
+                session_summary_override=session_summary_override,
+                style_profile=style_profile,
+            )
+            if strategy._conversation_answer_ready(final_execution):
+                final_execution = await strategy._stabilize_conversation_completion(
+                    executor=executor,
+                    context=context,
+                    query=query,
+                    execution=final_execution,
+                    base_max_tokens=base_max_tokens,
+                    timeout_seconds=None,
+                    session_summary_override=session_summary_override,
+                    style_profile=style_profile,
+                )
+                final_execution.tool_logs.append("recovery:last_unbounded_attempt")
+                metadata["generation_retry_count"] = len(backoff) + 1
+                metadata["recovery_path"] = "last_unbounded_attempt"
+                metadata["degraded_internal"] = True
+                return final_execution, metadata
+            last_failure_detail = str(final_execution.runtime_detail or last_failure_detail or "").strip()
+            final_failed_text = str(final_execution.generated_text or "").strip()
+            if final_failed_text:
+                last_failed_text = final_failed_text
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_failure_detail = str(exc).strip() or last_failure_detail
+
+        # If final attempt produced text but quality gate still rejected it,
+        # return that text as degraded output instead of blank response.
+        if last_failed_text:
+            metadata["generation_retry_count"] = len(backoff) + 1
+            metadata["recovery_path"] = "last_unbounded_degraded_text"
+            metadata["degraded_internal"] = True
+            return (
+                ExecutionResult(
+                    result_type="conversation",
+                    structured_payload={
+                        "style": "general_chat",
+                        "ungrounded_allowed": True,
+                        "answer_type": "medium",
+                        "contract_format": "plain",
+                        "response_mode": "conversational_direct",
+                    },
+                    citations=[],
+                    tool_logs=["recovery:last_unbounded_degraded_text"],
+                    generated_text=last_failed_text,
+                    engine_used=context.settings.local_engine,
+                    used_fallback=False,
+                    runtime_detail=last_failure_detail or "last_unbounded_degraded_text",
+                ),
+                metadata,
+            )
+
+        # Return runtime error only when generation truly failed after all retries and final unbounded attempt.
         metadata["generation_retry_count"] = len(backoff) + 1
         metadata["recovery_path"] = "regenerate_required"
         metadata["degraded_internal"] = True
-        if context.response_language == "ja":
-            regenerate_message = "ローカル生成が時間内に完了しませんでした。『再生成』で再試行してください。"
-        elif context.response_language == "en":
-            regenerate_message = "Local generation did not finish in time. Use \"Regenerate\" to retry."
-        else:
-            regenerate_message = "로컬 생성이 시간 내 완료되지 않았습니다. '응답 다시 생성'으로 재시도해 주세요."
+        regenerate_message = ""
         return (
             ExecutionResult(
                 result_type="conversation",
                 structured_payload={
-                    "style": "runtime_error",
+                    "style": "general_chat",
                     "reason": "generation_retry_exhausted",
                     "ungrounded_allowed": True,
                     "offer_regenerate": True,
                     "regenerate_prompt": str(query or "").strip(),
                 },
                 citations=[],
-                tool_logs=["runtime_error:generation_retry_exhausted"],
+                tool_logs=["recovery:generation_retry_exhausted"],
                 generated_text=regenerate_message,
                 engine_used=context.settings.local_engine,
                 used_fallback=False,

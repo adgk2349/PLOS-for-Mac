@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import threading
 import uuid
@@ -11,6 +10,13 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 import httpx
+from .model_manager_modules import (
+    parse_content_length,
+    progress_ratio,
+    read_progress_int,
+    read_progress_percent,
+    system_memory_gb,
+)
 
 from .models import (
     DownloadProgressItem,
@@ -147,7 +153,7 @@ class ModelManager:
         try:
             with httpx.stream("GET", url, timeout=None, follow_redirects=True) as response:
                 response.raise_for_status()
-                total_bytes = self._parse_content_length(response.headers.get("Content-Length"))
+                total_bytes = parse_content_length(response.headers.get("Content-Length"))
                 self._update_progress_bytes(download_id, downloaded_bytes=0, total_bytes=total_bytes)
                 with target.open("wb") as handle:
                     for chunk in response.iter_bytes():
@@ -172,7 +178,7 @@ class ModelManager:
             engine=engine,
             bytes_written=bytes_written,
             total_bytes=total_bytes,
-            progress_percent=self._read_progress_percent(progress_snapshot),
+            progress_percent=read_progress_percent(progress_snapshot),
             download_id=download_id,
         )
 
@@ -278,9 +284,9 @@ class ModelManager:
                     installed_path=installed_path,
                     active=is_active,
                     failure_reason=failure_reason,
-                    progress_percent=self._read_progress_percent(progress),
-                    downloaded_bytes=self._read_progress_int(progress, "downloaded_bytes"),
-                    total_bytes=self._read_progress_int(progress, "total_bytes"),
+                    progress_percent=read_progress_percent(progress),
+                    downloaded_bytes=read_progress_int(progress, "downloaded_bytes"),
+                    total_bytes=read_progress_int(progress, "total_bytes"),
                 )
             )
 
@@ -293,10 +299,10 @@ class ModelManager:
     def install_catalog_model(self, model_id: str) -> ModelCatalogInstallResponse:
         model = self._find_catalog_model(model_id)
         download_id = self._catalog_download_id(model.id)
-        system_memory_gb = self._system_memory_gb()
-        if system_memory_gb < int(model.recommended_memory_gb):
+        avail_memory_gb = system_memory_gb()
+        if avail_memory_gb < int(model.recommended_memory_gb):
             raise ValueError(
-                f"현재 시스템 메모리({system_memory_gb}GB)로는 "
+                f"현재 시스템 메모리({avail_memory_gb}GB)로는 "
                 f"{model.name} 다운로드를 권장하지 않습니다. "
                 f"최소 권장 사양은 {model.recommended_memory_gb}GB입니다."
             )
@@ -466,27 +472,6 @@ class ModelManager:
                 return model
         raise ValueError(f"지원하지 않는 모델 ID: {model_id}")
 
-    @staticmethod
-    def _system_memory_gb() -> int:
-        override = (os.getenv("LOCAL_AI_SYSTEM_MEMORY_GB_OVERRIDE") or "").strip()
-        if override:
-            try:
-                parsed = int(float(override))
-                if parsed > 0:
-                    return parsed
-            except Exception:
-                pass
-
-        try:
-            page_size = os.sysconf("SC_PAGE_SIZE")
-            phys_pages = os.sysconf("SC_PHYS_PAGES")
-            if isinstance(page_size, int) and isinstance(phys_pages, int) and page_size > 0 and phys_pages > 0:
-                total_bytes = page_size * phys_pages
-                return max(1, int(total_bytes / (1024**3)))
-        except Exception:
-            pass
-        return 16
-
     def _load_catalog_manifest(self) -> ModelCatalogManifest:
         if not self._catalog_path.exists():
             raise FileNotFoundError(f"model catalog not found: {self._catalog_path}")
@@ -565,47 +550,6 @@ class ModelManager:
     def _catalog_download_id(model_id: str) -> str:
         return f"catalog:{model_id}"
 
-    @staticmethod
-    def _parse_content_length(raw: str | None) -> int | None:
-        if not raw:
-            return None
-        try:
-            parsed = int(raw)
-        except Exception:
-            return None
-        return parsed if parsed > 0 else None
-
-    @staticmethod
-    def _read_progress_percent(progress: dict[str, Any] | None) -> float | None:
-        if not progress:
-            return None
-        value = progress.get("progress_percent")
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _read_progress_int(progress: dict[str, Any] | None, key: str) -> int | None:
-        if not progress:
-            return None
-        value = progress.get(key)
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _progress_ratio(downloaded_bytes: int, total_bytes: int | None) -> float | None:
-        if not total_bytes or total_bytes <= 0:
-            return None
-        ratio = max(0.0, min(1.0, float(downloaded_bytes) / float(total_bytes)))
-        return ratio * 100.0
-
     def _start_progress(
         self,
         download_id: str,
@@ -626,7 +570,7 @@ class ModelManager:
             "file_name": file_name,
             "downloaded_bytes": 0,
             "total_bytes": total_bytes,
-            "progress_percent": self._progress_ratio(0, total_bytes),
+            "progress_percent": progress_ratio(0, total_bytes),
             "detail": detail,
             "error": None,
             "updated_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -649,7 +593,7 @@ class ModelManager:
             if total_bytes is not None:
                 payload["total_bytes"] = total_bytes
             payload["downloaded_bytes"] = max(0, int(downloaded_bytes))
-            payload["progress_percent"] = self._progress_ratio(payload["downloaded_bytes"], payload.get("total_bytes"))
+            payload["progress_percent"] = progress_ratio(payload["downloaded_bytes"], payload.get("total_bytes"))
             if detail is not None:
                 payload["detail"] = detail
             payload["updated_at"] = datetime.now(tz=timezone.utc).isoformat()

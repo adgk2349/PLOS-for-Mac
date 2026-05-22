@@ -34,6 +34,14 @@ from .repositories.document_repo import DocumentRepository
 from .repositories.memory_repo import MemoryRepository
 from .repositories.settings_repo import SettingsRepository
 from .repositories.infrastructure_repo import InfrastructureRepository
+from .db_modules import (
+    apply_doc_filters,
+    normalize_metadata,
+    parse_json_dict,
+    parse_json_list,
+    row_to_effective_dict,
+    row_to_raw_dict,
+)
 
 def utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
@@ -214,7 +222,7 @@ class Database:
         modified_at: float,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        normalized = self._normalize_metadata(metadata)
+        normalized = normalize_metadata(metadata)
         self.documents.upsert_document(
             doc_id=doc_id,
             path=path,
@@ -225,7 +233,7 @@ class Database:
         )
 
     def update_document_auto_metadata(self, doc_id: str, metadata: dict[str, Any]) -> DocumentMetadata | None:
-        normalized = self._normalize_metadata(metadata)
+        normalized = normalize_metadata(metadata)
         self.documents.update_document_auto_metadata(doc_id, normalized)
         return self.get_document_metadata(doc_id)
 
@@ -242,17 +250,17 @@ class Database:
         row = self.documents.get_document_record(doc_id)
         if not row:
             return None
-        return self._row_to_raw_dict(row)
+        return row_to_raw_dict(row)
 
     def get_document_metadata(self, doc_id: str) -> DocumentMetadata | None:
         row = self.documents.get_document_record(doc_id)
         if row is None:
             return None
-        return DocumentMetadata(**self._row_to_effective_dict(row))
+        return DocumentMetadata(**row_to_effective_dict(row))
 
     def get_documents_metadata_map(self, doc_ids: list[str]) -> dict[str, dict[str, Any]]:
         rows = self.documents.get_documents_metadata_map(doc_ids)
-        return {row["doc_id"]: self._row_to_effective_dict(row) for row in rows}
+        return {row["doc_id"]: row_to_effective_dict(row) for row in rows}
 
     def list_documents(
         self,
@@ -280,12 +288,12 @@ class Database:
             limit=limit,
             offset=offset,
         )
-        return [DocumentMetadata(**self._row_to_effective_dict(row)) for row in rows], total
+        return [DocumentMetadata(**row_to_effective_dict(row)) for row in rows], total
 
     def find_doc_ids(self, *, filters: ChatFilters | None, search: str | None = None) -> set[str]:
         rows = self.documents.find_doc_ids()
-        effective = [self._row_to_effective_dict(row) for row in rows]
-        filtered = self._apply_doc_filters(effective, search=search, filters=filters)
+        effective = [row_to_effective_dict(row) for row in rows]
+        filtered = apply_doc_filters(effective, search=search, filters=filters)
         return {item["doc_id"] for item in filtered}
 
     def find_doc_ids_for_workspace(
@@ -297,8 +305,8 @@ class Database:
         search: str | None = None,
     ) -> set[str]:
         rows = self.documents.find_doc_ids()
-        effective = [self._row_to_effective_dict(row) for row in rows]
-        filtered = self._apply_doc_filters(effective, search=search, filters=filters)
+        effective = [row_to_effective_dict(row) for row in rows]
+        filtered = apply_doc_filters(effective, search=search, filters=filters)
 
         include_roots = [Path(item).expanduser().resolve() for item in included_paths if str(item).strip()]
         exclude_roots = [Path(item).expanduser().resolve() for item in excluded_paths if str(item).strip()]
@@ -589,7 +597,7 @@ class Database:
         # Fetch retrieval_weight entries via the repository (no raw SQL in facade).
         weight_rows = self.memory.get_retrieval_weights()
         for row in weight_rows:
-            payload = self._parse_json_dict(row["value_json"])
+            payload = parse_json_dict(row["value_json"])
             value = payload.get("weight")
             try:
                 weights[row["key"]] = max(0.5, min(float(value), 1.8))
@@ -783,33 +791,17 @@ class Database:
 
     @staticmethod
     def _parse_json_dict(raw: Any) -> dict[str, Any]:
-        if raw is None:
-            return {}
-        if isinstance(raw, dict):
-            return raw
-        try:
-            val = json.loads(raw)
-            return val if isinstance(val, dict) else {}
-        except Exception:
-            return {}
+        return parse_json_dict(raw)
 
     @staticmethod
     def _parse_json_list(raw: Any) -> list[str]:
-        if raw is None:
-            return []
-        if isinstance(raw, list):
-            return [str(i) for i in raw]
-        try:
-            val = json.loads(raw)
-            return [str(i) for i in val] if isinstance(val, list) else []
-        except Exception:
-            return []
+        return parse_json_list(raw)
 
     @staticmethod
     def _row_to_session_memory(row: sqlite3.Row) -> SessionMemoryItem:
         return SessionMemoryItem(
             id=row["id"], session_id=row["session_id"], key=row["key"],
-            value_json=Database._parse_json_dict(row["value_json"]),
+            value_json=parse_json_dict(row["value_json"]),
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
             expires_at=datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None,
@@ -819,7 +811,7 @@ class Database:
     def _row_to_workspace_memory(row: sqlite3.Row) -> WorkspaceMemoryItem:
         return WorkspaceMemoryItem(
             id=row["id"], workspace_id=row["workspace_id"], memory_type=row["memory_type"], key=row["key"],
-            value_json=Database._parse_json_dict(row["value_json"]),
+            value_json=parse_json_dict(row["value_json"]),
             confidence=float(row["confidence"] or 0.0), source=row["source"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
@@ -829,7 +821,7 @@ class Database:
     def _row_to_user_preference(row: sqlite3.Row) -> UserPreferenceItem:
         return UserPreferenceItem(
             id=row["id"], key=row["key"],
-            value_json=Database._parse_json_dict(row["value_json"]),
+            value_json=parse_json_dict(row["value_json"]),
             confidence=float(row["confidence"] or 0.0), source=row["source"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
@@ -839,9 +831,9 @@ class Database:
     def _row_to_episodic_memory(row: sqlite3.Row) -> EpisodicMemoryEvent:
         return EpisodicMemoryEvent(
             id=row["id"], workspace_id=row["workspace_id"], event_type=row["event_type"], summary=row["summary"],
-            related_file_ids=Database._parse_json_list(row["related_file_ids"]),
-            related_action_ids=Database._parse_json_list(row["related_action_ids"]),
-            metadata_json=Database._parse_json_dict(row["metadata_json"]),
+            related_file_ids=parse_json_list(row["related_file_ids"]),
+            related_action_ids=parse_json_list(row["related_action_ids"]),
+            metadata_json=parse_json_dict(row["metadata_json"]),
             importance=float(row["importance"] or 0.0),
             created_at=datetime.fromisoformat(row["created_at"]),
         )
@@ -856,61 +848,18 @@ class Database:
 
     @staticmethod
     def _normalize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
-        p = metadata or {}
-        tags = [str(t).strip() for t in p.get("tags", []) if str(t).strip()][:8] if isinstance(p.get("tags"), list) else []
-        try:
-            importance = max(0.0, min(1.0, float(p.get("importance", 0.5))))
-        except Exception:
-            importance = 0.5
-        return {
-            "summary": str(p.get("summary") or "")[:260],
-            "category": str(p.get("category") or "참고자료"),
-            "subcategory": str(p.get("subcategory") or "")[:40],
-            "document_type": str(p.get("document_type") or "")[:40],
-            "tags": tags, "year": p.get("year"), "project": str(p.get("project") or "")[:48] or None,
-            "importance": importance, "excluded": bool(p.get("excluded", False)),
-        }
+        return normalize_metadata(metadata)
 
     def _apply_doc_filters(self, rows: list[dict[str, Any]], *, search: str | None, filters: ChatFilters | None) -> list[dict[str, Any]]:
-        result = rows
-        if search:
-            n = search.strip().lower()
-            if n: result = [r for r in result if n in r["path"].lower() or n in r["summary"].lower() or n in " ".join(r["tags"]).lower()]
-        if not filters: return result
-        if filters.category: result = [r for r in result if r["category"] == filters.category]
-        if filters.year is not None: result = [r for r in result if r.get("year") == filters.year]
-        if filters.project:
-            n = filters.project.lower()
-            result = [r for r in result if (r.get("project") or "").lower().find(n) >= 0]
-        if filters.tags:
-            w = {t.lower() for t in filters.tags if t.strip()}
-            if w: result = [r for r in result if w.intersection({t.lower() for t in r.get("tags", [])})]
-        if filters.excluded is not None: result = [r for r in result if bool(r.get("excluded")) == bool(filters.excluded)]
-        else: result = [r for r in result if not bool(r.get("excluded"))]
-        return result
+        return apply_doc_filters(rows, search=search, filters=filters)
 
     @staticmethod
     def _row_to_raw_dict(row: sqlite3.Row) -> dict[str, Any]:
-        return {k: row[k] for k in row.keys()}
+        return row_to_raw_dict(row)
 
     @staticmethod
     def _row_to_effective_dict(row: sqlite3.Row) -> dict[str, Any]:
-        c = row["user_category"] if row["user_category"] is not None else row["category"]
-        sc = row["user_subcategory"] if row["user_subcategory"] is not None else row["subcategory"]
-        dt = row["user_document_type"] if row["user_document_type"] is not None else row["document_type"]
-        y = row["user_year"] if row["user_year"] is not None else row["year"]
-        pj = row["user_project"] if row["user_project"] is not None else row["project"]
-        imp = row["user_importance"] if row["user_importance"] is not None else row["importance"]
-        ex = row["user_excluded"] if row["user_excluded"] is not None else row["excluded"]
-        ts = Database._parse_json_list(row["user_tags"] if row["user_tags"] is not None else row["tags"])
-        return {
-            "doc_id": row["doc_id"], "path": row["path"], "file_type": row["file_type"],
-            "modified_at": datetime.fromtimestamp(float(row["modified_at"]), tz=timezone.utc),
-            "indexed_at": datetime.fromisoformat(row["indexed_at"]),
-            "summary": row["summary"] or "", "category": c or "참고자료", "subcategory": sc or "",
-            "document_type": dt or "", "tags": ts, "year": y, "project": pj,
-            "importance": float(imp or 0.5), "excluded": bool(ex or 0),
-        }
+        return row_to_effective_dict(row)
 
     def _fetchone(self, query: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
         with self._lock:

@@ -18,9 +18,45 @@ class MemoryCommitter:
         session_id: str,
         session_digest_text: str,
     ) -> None:
+        print(f"[DEBUG_COMMIT] session_id={session_id}, memory={memory is not None}, composed={composed is not None}")
         if not memory or not composed:
+            print(f"[DEBUG_COMMIT] early exit: memory={memory}, composed={composed}")
             return
         try:
+            payload = getattr(getattr(composed, "execution_result", None), "structured_payload", None)
+            print(f"[DEBUG_COMMIT] payload={payload}")
+            if not isinstance(payload, dict):
+                payload = {}
+            # Skip digest/context writes for retry-only runtime messages to avoid polluting
+            # conversational memory with operational failure text.
+            is_regenerate = bool(payload.get("offer_regenerate"))
+            is_exhausted = str(payload.get("reason") or "") == "generation_retry_exhausted"
+            print(f"[DEBUG_COMMIT] is_regenerate={is_regenerate}, is_exhausted={is_exhausted}")
+            if is_regenerate or is_exhausted:
+                try:
+                    fact_stats = memory.upsert_session_fact_memory(
+                        session_id=session_id,
+                        user_query=str(req.query or ""),
+                    )
+                    fact_items = list((fact_stats or {}).get("items") or [])
+                    composed.metadata["fact_memory_upserted"] = len(fact_items)
+                    composed.metadata["fact_overwrite_blocked"] = int((fact_stats or {}).get("overwrite_blocked") or 0)
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    pass
+                try:
+                    scene_stats = memory.upsert_session_scene_memory(
+                        session_id=session_id,
+                        user_query=str(req.query or ""),
+                        assistant_summary=str(composed.generated_text or ""),
+                    )
+                    composed.metadata["scene_memory_upserted"] = len(list((scene_stats or {}).get("items") or []))
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    pass
+                composed.metadata["context_digest_used"] = bool(session_digest_text)
+                composed.metadata["context_injected"] = bool(session_digest_text)
+                composed.metadata["digest_refresh"] = "skipped_regenerate"
+                return
+
             composed.metadata["context_digest_used"] = bool(session_digest_text)
             composed.metadata["context_injected"] = bool(session_digest_text)
 
@@ -79,6 +115,25 @@ class MemoryCommitter:
                     "web_sources": safe_web_sources,
                 },
             )
+            try:
+                fact_stats = memory.upsert_session_fact_memory(
+                    session_id=session_id,
+                    user_query=str(req.query or ""),
+                )
+                fact_items = list((fact_stats or {}).get("items") or [])
+                composed.metadata["fact_memory_upserted"] = len(fact_items)
+                composed.metadata["fact_overwrite_blocked"] = int((fact_stats or {}).get("overwrite_blocked") or 0)
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                pass
+            try:
+                scene_stats = memory.upsert_session_scene_memory(
+                    session_id=session_id,
+                    user_query=str(req.query or ""),
+                    assistant_summary=str(composed.generated_text or ""),
+                )
+                composed.metadata["scene_memory_upserted"] = len(list((scene_stats or {}).get("items") or []))
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                pass
 
             web_summary = str(composed.metadata.get("web_summary") or "").strip()
             web_query = str(composed.metadata.get("web_query") or req.query).strip()
@@ -99,4 +154,5 @@ class MemoryCommitter:
                     conversation_path=conversation_path,
                 )
         except (AttributeError, TypeError, ValueError, RuntimeError) as e:
+            print(f"[DEBUG_COMMIT] Exception occurred: {e}")
             logger.warning("[Orchestrator] Failed to save conversation context: %s", e)

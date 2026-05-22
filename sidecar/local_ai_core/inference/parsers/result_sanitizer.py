@@ -14,6 +14,63 @@ if TYPE_CHECKING:
 
 # Component: result_sanitizer.py
 class ResultSanitizer(BaseDelegate):
+
+    @staticmethod
+    def _normalize_korean_leading_address(text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        # Remove awkward formal-leading address that frequently appears as
+        # model artifact and degrades conversational tone.
+        value = re.sub(r"^\s*께서는\s+", "", value).strip()
+        value = re.sub(r"^\s*당신은\s+", "", value).strip()
+        return value
+    @staticmethod
+    def _heuristic_korean_spacing(text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        # conservative fallback: avoid heavy particle-splitting.
+        # only add spacing at likely sentence/phrase boundaries.
+        value = re.sub(r"([가-힣]{3,})(합니다|했습니다|해요|했어요|입니다|이에요|예요|네요|군요|죠|요)(?=[가-힣])", r"\1\2 ", value)
+        value = re.sub(r"([.!?])([가-힣A-Za-z0-9])", r"\1 \2", value)
+        value = re.sub(r"([가-힣])([A-Za-z0-9])", r"\1 \2", value)
+        value = re.sub(r"([A-Za-z0-9])([가-힣])", r"\1 \2", value)
+        value = re.sub(r"\s{2,}", " ", value).strip()
+        return value
+    @staticmethod
+    def _normalize_echo_text(text: str) -> str:
+        value = str(text or "").strip().lower()
+        if not value:
+            return ""
+        value = re.sub(r"^[\"'`“”‘’\(\[\{<\s]+|[\"'`“”‘’\)\]\}>\s]+$", "", value)
+        value = re.sub(r"\s+", " ", value).strip()
+        return value
+
+    def _is_hard_query_echo(self, answer: str, query: str) -> bool:
+        a = self._normalize_echo_text(answer)
+        q = self._normalize_echo_text(query)
+        if not a or not q:
+            return False
+        if a == q:
+            return True
+        if a.rstrip(".!?") == q.rstrip(".!?"):
+            return True
+        if (a.startswith(q) or q.startswith(a)) and self._text_similarity(a, q) >= 0.92:
+            return True
+        return False
+
+    @staticmethod
+    def _is_action_request_query(query: str) -> bool:
+        lowered = str(query or "").strip().lower()
+        if not lowered:
+            return False
+        cues = (
+            "해줘", "해 줘", "해봐", "정리해줘", "나눠줘", "뽑아줘", "남겨줘", "만들어줘",
+            "줘", "해", "해주세요", "please", "do this", "give me",
+        )
+        return any(token in lowered for token in cues)
+
     def _directness_score(self, answer: str | None, *, query: str, is_recommendation_query: bool) -> int:
         text = str(answer or "").strip()
         if not text:
@@ -24,6 +81,10 @@ class ResultSanitizer(BaseDelegate):
         first_sentence = self._first_sentence(text)
         if self._looks_question_sentence(first_sentence):
             score += 2
+        if self._is_action_request_query(query):
+            score += question_count * 2
+            if self._looks_question_sentence(first_sentence):
+                score += 3
         if is_recommendation_query and not self._looks_three_option_shape(text):
             score += 2
         if self._text_similarity(text, query) >= 0.88:
@@ -134,6 +195,184 @@ class ResultSanitizer(BaseDelegate):
         return "\n".join(lines).strip()
 
     def _postprocess_conversational_answer(self, answer: str, *, query: str, response_language: str) -> str:
+        raw_pass_mode = str(os.getenv("LOCAL_AI_CONVERSATION_RAW_PASS_ENABLED", "0") or "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if raw_pass_mode:
+            text = str(answer or "").strip()
+            if not text:
+                return ""
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            text = re.sub(r"(?is)<\|channel[^>]*>", "", text).strip()
+            text = re.sub(r"(?im)^\s*(?:answer|response|final answer|답변|최종 답변)\s*[:：]\s*", "", text).strip()
+            text = re.sub(r"(?:,\s*){4,}", ", ", text).strip(" ,")
+            # If the model already provides actionable content, drop leading
+            # "lack-of-info" disclaimers that make normal chat feel blocked.
+            lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+            if lines:
+                first = lines[0]
+                lack_info_preamble = bool(
+                    re.search(r"(알지 못해서|정보가 부족|추천해\s*드리기\s*어렵)", first)
+                )
+                has_actionable_body = bool(
+                    re.search(r"(?m)^\s*(?:\d+\.\s+|[-*]\s+)", text)
+                    or ("추천" in text and len(lines) >= 2)
+                )
+                if lack_info_preamble and has_actionable_body:
+                    text = "\n".join(lines[1:]).strip()
+            # Strip stray Korean honorific/particle fragments that appear at the very start
+            # (e.g. "께서도", "에서도", "으로도") — these are model hallucination artifacts
+            # caused by continuing a cut-off previous assistant turn.
+            text = re.sub(r"^(?:께서는|께서도|에서도|으로도|부터도|에게도|한테도|로도|도요|이에요|예요)\b\s*", "", text).strip()
+            # Strip role labels that still leak through
+            text = re.sub(r"(?im)^\s*(?:user|assistant|사용자|어시스턴트)\s*[:：]\s*", "", text).strip()
+            # Guard: if the answer is a near-verbatim copy of recent history,
+            # find and remove the echoed prefix (up to 120 chars).
+            if "\n" in text:
+                first_line = text.split("\n")[0].strip()
+                if len(first_line) >= 8 and self._is_hard_query_echo(first_line, query):
+                    text = "\n".join(text.split("\n")[1:]).strip()
+            # Keep model-native wording; only reject obvious hard prompt echo.
+            if len(re.sub(r"\s+", "", query or "")) >= 10 and self._is_hard_query_echo(text, query):
+                return ""
+            return self._normalize_korean_leading_address(text)
+
+        light_postprocess = str(os.getenv("LOCAL_AI_CONVERSATION_LIGHT_POSTPROCESS", "0") or "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if light_postprocess:
+            original = str(answer or "").strip()
+            text = original
+            if not text:
+                return ""
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            text = re.sub(r"(?im)^\s*continuation\s*:\s*", "", text).strip()
+            text = re.sub(r"(?is)^```+\s*$", "", text).strip()
+            text = re.sub(r"(?is)^```+\s*[a-zA-Z0-9_-]*\s*$", "", text).strip()
+            text = re.sub(r"(?im)^:?\s*please\s*provide\s*the\s*text\s*you\s*would\s*like\s*me\s*to\s*continue\.?\s*$", "", text).strip()
+            text = re.sub(r"(?i)pleaseprovidethetextyouwouldlikemetocontinue\.?", "", text).strip()
+            text = re.sub(r"(?i),?\s*please\s*provide\s*the\s*conversation\s*history[^.!?\n]*", "", text).strip()
+            text = re.sub(r"(?i),?pleaseprovidetheconversationhistory[^.!?\n]*", "", text).strip()
+            text = re.sub(r"(?is)<\|channel[^>]*>", "", text).strip()
+            text = re.sub(r"\[\s*\*\*[^][]{1,80}\*\*\s*\]", "", text).strip()
+            text = re.sub(r"\(\s*\*\*[^()]{1,80}\*\*\s*\)", "", text).strip()
+            text = re.sub(r"(?im)^\s*(?:answer|response|final answer|답변|최종 답변)\s*[:：]\s*", "", text).strip()
+            text = re.sub(r"(?im)^\s*(?:user|assistant|you|a|q)\s*[:：]?\s*", "", text).strip()
+            text = re.sub(r"(?i)^\s*amente[\s,:\-]+", "", text).strip()
+            text = re.sub(r"(?im)^\s*mente[\s,:\-]+.*$", "", text).strip()
+            text = re.sub(r"(?:,\s*){3,}", ", ", text).strip(" ,")
+            text = re.sub(r"(?m)^\s*#{2,}\s*.*$", "", text).strip()
+            text = re.sub(r"(?is),?\s*\)+\s*;\s*route\s*=\s*engine_[^\\n]*$", "", text).strip()
+            text = re.sub(r"(?is)\broute\s*=\s*engine_[^\\n]*$", "", text).strip()
+            text = re.sub(r"(?is)\bmemory_guard:[^\\n]*$", "", text).strip()
+            text = re.sub(r"(?is)\bmodel_residency=[^\\n]*$", "", text).strip()
+            text = re.sub(r"(?im)^\s*지시\s*:\s*위\s*메모리.*$", "", text).strip()
+            text = re.sub(r"(?im)^\s*instruction\s*:\s*use\s*this\s*only\s*as\s*hidden\s*context.*$", "", text).strip()
+            if response_language == "ko":
+                ko_chars = len(re.findall(r"[가-힣]", text))
+                latin_words = len(re.findall(r"[A-Za-z]{3,}", text))
+                latin_chars = len(re.findall(r"[A-Za-z]", text))
+                if latin_words >= 8 and ko_chars < 6:
+                    return ""
+                if ko_chars == 0 and latin_chars >= 12:
+                    return ""
+                if ko_chars >= 24 and len(re.findall(r"\s+", text)) <= 1 and len(text) >= 40:
+                    spaced = self._heuristic_korean_spacing(text)
+                    if spaced:
+                        text = spaced
+                # If still densely packed Korean, apply a second-pass conservative split
+                # around common particles/connectors to avoid no-space blobs.
+                if ko_chars >= 24 and len(re.findall(r"\s+", text)) <= 1 and len(text) >= 40:
+                    text = re.sub(r"(은|는|이|가|을|를|에|에서|으로|와|과|도|만|의)([가-힣]{2,})", r"\1 \2", text)
+                    text = re.sub(r"(고|며|면|서|라서|지만)([가-힣]{2,})", r"\1 \2", text)
+            text = re.sub(r"\s{2,}", " ", text).strip()
+            if not text:
+                # prevent empty-output regression by returning a minimally cleaned original
+                fallback = re.sub(r"(?is)<\|channel[^>]*>", "", original).strip()
+                fallback = re.sub(r"(?im)^\s*(?:answer|response|final answer|답변|최종 답변)\s*[:：]\s*", "", fallback).strip()
+                fallback = re.sub(r"\s{2,}", " ", fallback).strip()
+                if response_language == "ko" and fallback:
+                    ko_chars = len(re.findall(r"[가-힣]", fallback))
+                    latin_chars = len(re.findall(r"[A-Za-z]", fallback))
+                    if ko_chars == 0 and latin_chars >= 12:
+                        return ""
+                    if ko_chars >= 24 and len(re.findall(r"\s+", fallback)) <= 1 and len(fallback) >= 40:
+                        fallback = self._heuristic_korean_spacing(fallback)
+                return self._normalize_korean_leading_address(fallback[:320].strip())
+            return self._normalize_korean_leading_address(text)
+
+        minimal_mode = str(os.getenv("LOCAL_AI_MINIMAL_POSTPROCESS", "0") or "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if minimal_mode:
+            text = (answer or "").strip()
+            if not text:
+                return ""
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            text = re.sub(r"(?is)```+\s*generationresponse\([^`]*```+", "", text).strip()
+            text = re.sub(r"(?is)generationresponse\([^)]*\)", "", text).strip()
+            text = re.sub(r"(?im)^\s*token\s*=\s*\d+\s*$", "", text).strip()
+            text = re.sub(r"(?im)^\s*from_draft\s*=\s*(?:true|false)\s*$", "", text).strip()
+            text = re.sub(r"(?im)^\s*prompt_tokens\s*=\s*\d+\s*$", "", text).strip()
+            text = re.sub(r"(?i)\bfrom_draft\s*=\s*(?:true|false)\b", "", text).strip()
+            text = re.sub(r"(?i)\bprompt_tokens\s*=\s*\d+\b", "", text).strip()
+            text = re.sub(r"(?i)\bprompt_tps\s*=\s*[0-9.]+\b", "", text).strip()
+            text = re.sub(r"(?i)\bgeneration_tokens\s*=\s*\d+\b", "", text).strip()
+            text = re.sub(r"(?i)\bgeneration_tps\s*=\s*[0-9.]+\b", "", text).strip()
+            text = re.sub(r"(?i)\bpeak_memory\s*=\s*[0-9.]+\b", "", text).strip()
+            text = re.sub(r"(?i)\bfinish_reason\s*=\s*['\"]?[a-z_]+['\"]?\)?", "", text).strip()
+            text = re.sub(r"(?i)\bcontinuation\s*:\s*", "", text).strip()
+            text = re.sub(r"(?i)\brecent_user\s*:\s*[^\\n]{0,160}", "", text).strip()
+            text = re.sub(r"(?i)\brecent_assistant\s*:\s*[^\\n]{0,160}", "", text).strip()
+            text = re.sub(r"(?i)\blast_query\s*:\s*[^\\n]{0,160}", "", text).strip()
+            text = re.sub(r"(?i)\bnt_user\s*:\s*[^\\n]{0,120}", "", text).strip()
+            text = re.sub(r"(?i)\bnt_assistant\s*:\s*[^\\n]{0,120}", "", text).strip()
+            text = re.sub(r"(?i)\b사용자\s*메시지\s*:\s*", "", text).strip()
+            text = re.sub(r"(?is)<\|channel[^>]*>", "", text).strip()
+            text = re.sub(r"(?is)<followup_hint>.*?(?:</followup_hint>|$)", "", text).strip()
+            text = re.sub(r"(?i)\b(?:a|an|nswer|answer)\s*[:：]\s*", "", text).strip()
+            text = re.sub(r"(?i)\bnt_u\b", "", text).strip()
+            text = re.sub(r"(?im)^\s*(?:answer|response|final answer|답변|최종 답변)\s*[:：]\s*", "", text).strip()
+            text = re.sub(r"(?im)^\s*(?:user|assistant|you|a|q)\s*[:：]?\s*", "", text).strip()
+            text = re.sub(r"(?is)<\|channel\|?>\s*(?:thought|analysis|final)?\s*", "", text).strip()
+            text = re.sub(r"(?is)<\|start_header_id\|>.*?<\|end_header_id\|>\s*", "", text).strip()
+            text = re.sub(r"(?i)^\s*amente[\s,:\-]+\s*", "", text).strip()
+            # Avoid over-filtering for short casual turns (e.g., greetings).
+            # Hard echo rejection stays for longer queries only.
+            if len(re.sub(r"\s+", "", query or "")) >= 10 and self._is_hard_query_echo(text, query):
+                return ""
+            # Guard against runaway repetition loops from the model.
+            if self._has_pathological_repetition(text):
+                text = self._compress_repetition_fallback(text, max_tokens=24)
+            text = re.sub(r"(?:답변\s*[:：]\s*){2,}", "답변: ", text)
+            text = re.sub(r"(?:사용자\s*메시지\s*:\s*){2,}", "", text)
+            text = re.sub(r"(?:안녕\s*){6,}", "안녕하세요.", text)
+            text = re.sub(r"[؟]{2,}", "?", text)
+            text = re.sub(r"(?:,\s*){4,}", "", text).strip()
+            punct_only = re.sub(r"[\s,.;:!?\-_/\\|()\[\]{}'\"`~]+", "", text)
+            if not punct_only:
+                return ""
+            # Guard against character-level loops like "거나거나..." or "녕녕녕...".
+            text = re.sub(r"([가-힣]{1,2})\1{6,}", r"\1", text)
+            # Guard against punctuation loops like "( ) ) ) ) ...".
+            text = re.sub(r"(?:\(\s*\)\s*){6,}", "", text).strip()
+            text = re.sub(r"(?:\)\s*){10,}", "", text).strip()
+            # Collapse trivial same-line loops (e.g., emoji repeated per line).
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if len(lines) >= 4 and len(set(lines)) == 1:
+                text = lines[0]
+            # Enforce Korean when Korean was requested/query is Korean.
+            if response_language == "ko" and re.search(r"[가-힣]", query or ""):
+                ko_chars = len(re.findall(r"[가-힣]", text))
+                ja_chars = len(re.findall(r"[\u3040-\u30ff]", text))
+                en_words = len(re.findall(r"[A-Za-z]{3,}", text))
+                if ja_chars >= 6 and ko_chars <= ja_chars:
+                    return ""
+                if en_words >= 8 and ko_chars < 6:
+                    return ""
+            text = re.sub(r"\s{2,}", " ", text).strip()
+            return self._normalize_korean_leading_address(text)
+
         text = (answer or "").strip()
         if not text:
             return ""
@@ -179,16 +418,16 @@ class ResultSanitizer(BaseDelegate):
         lowered_query = (query or "").lower()
         is_greeting = any(token in lowered_query for token in ("안녕", "hello", "hi", "hey"))
         if not is_greeting:
-            return text
+            return self._normalize_korean_leading_address(text)
 
         segments = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
         if not segments:
-            return text
+            return self._normalize_korean_leading_address(text)
         limited = segments[:2]
         joined = " ".join(limited).strip()
         if response_language == "ko" and len(joined) > 130:
             joined = limited[0]
-        return joined.strip()
+        return self._normalize_korean_leading_address(joined.strip())
 
     def _looks_conversational_answer(self, text: str, *, response_language: str, query: str) -> bool:
         content = (text or "").strip()
@@ -353,13 +592,14 @@ class ResultSanitizer(BaseDelegate):
         lowered = content.lower()
         leak_markers = (
             "<think>", "</think>", "thinking process:", "analyze the request",
+            "<|channel|>", "<|channel>", "<|start_header_id|>", "<|end_header_id|>",
             "constraint 1:", "constraint 2:", "constraint 3:",
             "do not output system logs", "never role-play both user and assistant",
             "role-play both user and assistant", "start with the answer directly",
             "okay, let's see", "okay, i'll go with that response", "hmm,", "i should",
-            "the user", "follow-up question:", "recent session context",
+            "follow-up question:", "recent session context",
             "최근 세션 컨텍스트", "세션 컨텍스트", "이전 문장에 대한 답변으로",
-            "user:", "assistant:", "you:", "a:", "q:", "mode:", "_continuation",
+            "user:", "assistant:", "a:", "q:", "mode:", "_continuation",
             "evidence:", "explanation:", "the question asks", "based on the evidence provided",
             "therefore, the answer is", "(more)", "최종 답변:", "사용자에게 물어볼 때는",
             "반드시 '?'를 붙여주세요", "답이 명확하지 않을 경우", "추가로 설명해 주세요",
@@ -485,7 +725,7 @@ class ResultSanitizer(BaseDelegate):
             text = self._compress_repetition_fallback(text, max_tokens=22)
         if len(text) > 220:
             text = text[:220].rsplit(" ", 1)[0].rstrip() + "..."
-        return text.strip()
+        return self._normalize_korean_leading_address(text.strip())
 
     def _looks_instructional_meta_response(self, text: str) -> bool:
         lowered = (text or "").strip().lower()
@@ -534,7 +774,11 @@ class ResultSanitizer(BaseDelegate):
         if not lowered: return False
         task_cues = ("파일", "문서", "요약", "정리해", "찾아", "열어", "비교", "주차", "file", "document", "summary", "summarize", "find", "open", "compare")
         if any(token in lowered for token in task_cues): return False
-        recommendation_cues = ("추천", "메뉴", "뭐 먹", "어때", "골라", "선택", "뭐가 좋아", "뭐가 나아", "뭐할까", "어떤 게 좋아", "recommend", "suggest", "what should i", "which one", "choice")
+        recommendation_cues = (
+            "추천", "메뉴", "뭐 먹", "어때", "골라", "선택", "뭐가 좋아", "뭐가 나아", "뭐할까", "어떤 게 좋아",
+            "결정해", "정해줘", "정해 봐", "pick one", "choose for me",
+            "recommend", "suggest", "what should i", "which one", "choice",
+        )
         return any(token in lowered for token in recommendation_cues)
 
     def _near_duplicate(self, a: str, b: str) -> bool:

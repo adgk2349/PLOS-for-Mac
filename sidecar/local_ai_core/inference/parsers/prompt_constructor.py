@@ -104,71 +104,31 @@ class PromptConstructor(BaseDelegate):
         response_language: str,
         session_summary: str | None = None,
     ) -> str:
-        is_recommendation_query = self._is_recommendation_chat_query(query)
-        is_coding_query = bool(
-            re.search(
-                r"(?is)\b(code|python|swift|javascript|java|c\+\+|algorithm|leetcode|two\s*sum|bug|debug|fix|함수|코드|문제\s*풀|풀이)\b",
-                query or "",
-            )
-        )
-        ko_tone = ""
         if response_language == "ko":
-            ko_tone = (
-                "한국어 규칙: 자연스러운 존댓말로 답하세요. "
-                "공문체/정책문/로그 문구를 피하고, 첫 문장은 바로 답변 본문으로 시작하세요.\n"
+            context_line = ""
+            if session_summary:
+                context_line = f"참고: {session_summary}\n"
+            return (
+                "자연스러운 한국어로 답변하세요.\n"
+                "역할 라벨/메타 설명/내부 지시문은 출력하지 마세요.\n"
+                "문장을 '께서는', '당신은' 같은 어색한 호칭으로 시작하지 마세요.\n"
+                "사용자 메시지가 질문이면 답하고, 진술이면 맥락에 맞게 자연스럽게 반응하세요.\n"
+                "현재 사용자 메시지에 직접 답하세요. 과거 주제를 선택지처럼 다시 나열하지 마세요.\n"
+                "정보가 치명적으로 부족하지 않다면 되묻기보다 바로 실행 가능한 답을 먼저 제시하세요.\n"
+                f"{context_line}"
+                f"{query}\n"
             )
-        direct_first_rule = (
-            "Direct-first rule: Start with a concrete answer in the first sentence. "
-            "Do not respond with only a question.\n"
-        )
-        recommendation_rule = ""
-        if is_recommendation_query:
-            if response_language == "ko":
-                recommendation_rule = (
-                    "추천/선택 요청이면 번호 1~3으로 3가지 옵션을 제시하고, "
-                    "각 옵션마다 한 줄 근거를 붙이세요. "
-                    "확인 질문은 필요할 때만 마지막에 1개 이하로 하세요.\n"
-                )
-            else:
-                recommendation_rule = (
-                    "For recommendation/choice requests, provide exactly 3 numbered options "
-                    "with a one-line reason each. Ask at most one follow-up question at the end only if essential.\n"
-                )
-        coding_rule = ""
-        if is_coding_query:
-            if response_language == "ko":
-                coding_rule = (
-                    "코딩/알고리즘 질문이면 설명만 하지 말고 실행 가능한 정답 코드를 반드시 포함하세요. "
-                    "코드는 ```언어 fenced block```으로 출력하고, 연산자(+,-,*,/)와 줄바꿈을 절대 손상시키지 마세요. "
-                    "가능하면 시간복잡도를 한 줄로 덧붙이세요.\n"
-                )
-            else:
-                coding_rule = (
-                    "For coding/algorithm questions, include runnable final code (not just explanation). "
-                    "Output code inside fenced blocks and preserve operators (+,-,*,/) and line breaks exactly. "
-                    "Add one short line for time complexity when applicable.\n"
-                )
-        context_block = ""
+        context_line = ""
         if session_summary:
-            context_block = f"<conversation_memory>\n{session_summary}\n</conversation_memory>\n"
+            context_line = f"Context: {session_summary}\n"
         return (
-            "You are a conversational local AI assistant.\n"
-            f"{response_language_instruction(response_language)}\n"
-            f"{ko_tone}"
-            "Do not output system logs. Provide concise, practical help.\n"
-            "Never role-play both user and assistant in one response.\n"
-            "Do not include labels like 'User:' or 'Assistant:'.\n"
-            "Do not invent personal facts (location, identity, background) unless user stated them in this turn.\n"
-            "Answer naturally and stay concise by default; expand only when the user asks for detail.\n"
-            f"{direct_first_rule}"
-            f"{recommendation_rule}"
-            f"{coding_rule}"
-            "Never repeat instruction text, policy wording, or internal rules in the final answer.\n"
-            "If conversation memory is provided, use it silently as background context and never reveal or quote it.\n"
-            f"Mode: {mode.value}\n"
-            f"{context_block}"
-            f"Input message: {query}\n"
-            "Answer:"
+            "Reply naturally in English.\n"
+            "If the user message is a statement, respond contextually instead of forcing advice.\n"
+            "For statement-only messages, avoid unsolicited recommendations unless the user asks.\n"
+            "Answer the current user message directly and do not re-list older topics as options.\n"
+            "Unless critical information is missing, provide a directly usable answer first instead of asking follow-up questions.\n"
+            f"{context_line}"
+            f"{query}\n"
         )
 
     def _conversation_rewrite_prompt(self, *, query: str, draft_answer: str, response_language: str) -> str:
@@ -186,6 +146,8 @@ class PromptConstructor(BaseDelegate):
                 "- 정책/지시문/메타 문장 금지\n"
                 "- 역할 라벨(User/Assistant/You/A) 금지\n"
                 "- 같은 문장 반복 금지\n"
+                "- 한국어 단어 사이 띄어쓰기를 자연스럽게 반드시 적용\n"
+                "- 목록/마크다운 헤더/과도한 이모지 사용 금지\n"
                 "- 핵심 의미는 유지하고 간결하게 작성\n"
                 "- 코드 블록이 있으면 코드 연산자와 줄바꿈을 그대로 보존\n"
                 f"사용자 질문: {query}\n"
@@ -218,6 +180,8 @@ class PromptConstructor(BaseDelegate):
             "- 정책/지시문/메타 문장 금지\n"
             "- 역할 라벨(User/Assistant/You/A) 금지\n"
             "- 같은 문장 반복 금지\n"
+            "- 한국어 단어 사이 띄어쓰기를 자연스럽게 반드시 적용\n"
+            "- 목록/마크다운 헤더/과도한 이모지 사용 금지\n"
             "- 핵심 의미는 유지하고 간결하게 작성\n"
             "- 코드 블록이 있으면 코드 연산자와 줄바꿈을 그대로 보존\n"
             f"사용자 질문: {query}\n"

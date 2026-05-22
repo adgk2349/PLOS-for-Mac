@@ -27,6 +27,8 @@ class _StubInferenceEngine(LocalInferenceEngine):
         llama_model_path: str | None,
         max_tokens: int,
         style: str = "grounded",
+        message_state: list[dict[str, str]] | None = None,
+        response_language: str | None = None,
     ) -> str | None:
         output = self._outputs.get(engine)
         if output is None:
@@ -53,6 +55,8 @@ class _SequentialStubInferenceEngine(LocalInferenceEngine):
         llama_model_path: str | None,
         max_tokens: int,
         style: str = "grounded",
+        message_state: list[dict[str, str]] | None = None,
+        response_language: str | None = None,
     ) -> str | None:
         values = self._outputs_by_engine.get(engine) or []
         if not values:
@@ -187,7 +191,7 @@ def test_mlx_prepare_prompt_skips_template_for_non_qwen_model():
     rendered = engine._mlx_prepare_prompt(
         prompt=prompt,
         style="conversation",
-        model_path="/tmp/gemma-3-12b-it",
+        model_path="/tmp/some-base-model",
     )
     assert rendered == prompt
 

@@ -16,6 +16,162 @@ if TYPE_CHECKING:
 
 # Component: runtime_manager.py
 class RuntimeManager(BaseDelegate):
+    _MODEL_FAMILY_PRESETS: dict[str, dict[str, dict[str, float | int]]] = {
+        # Ollama-benchmarked: conversation temperature raised to 0.75-0.80,
+        # repeat_penalty lowered to protect Korean morphology, top_k fixed at 40,
+        # min_p=0.05 added for smarter token cutoff (Ollama default).
+        "gemma": {
+            "conversation": {"temperature": 0.80, "top_p": 0.90, "repeat_penalty": 1.08, "top_k": 40, "min_p": 0.05},
+            "rewrite":      {"temperature": 0.42, "top_p": 0.90, "repeat_penalty": 1.10, "top_k": 32, "min_p": 0.0},
+            "grounded":     {"temperature": 0.24, "top_p": 0.88, "repeat_penalty": 1.12, "top_k": 24, "min_p": 0.0},
+        },
+        "qwen": {
+            "conversation": {"temperature": 0.78, "top_p": 0.90, "repeat_penalty": 1.08, "top_k": 40, "min_p": 0.05},
+            "rewrite":      {"temperature": 0.38, "top_p": 0.90, "repeat_penalty": 1.08, "top_k": 30, "min_p": 0.0},
+            "grounded":     {"temperature": 0.22, "top_p": 0.88, "repeat_penalty": 1.10, "top_k": 24, "min_p": 0.0},
+        },
+        "llama": {
+            "conversation": {"temperature": 0.80, "top_p": 0.90, "repeat_penalty": 1.10, "top_k": 40, "min_p": 0.05},
+            "rewrite":      {"temperature": 0.36, "top_p": 0.88, "repeat_penalty": 1.08, "top_k": 30, "min_p": 0.0},
+            "grounded":     {"temperature": 0.22, "top_p": 0.88, "repeat_penalty": 1.12, "top_k": 24, "min_p": 0.0},
+        },
+        "deepseek": {
+            "conversation": {"temperature": 0.75, "top_p": 0.90, "repeat_penalty": 1.08, "top_k": 40, "min_p": 0.05},
+            "rewrite":      {"temperature": 0.36, "top_p": 0.88, "repeat_penalty": 1.08, "top_k": 34, "min_p": 0.0},
+            "grounded":     {"temperature": 0.20, "top_p": 0.86, "repeat_penalty": 1.12, "top_k": 24, "min_p": 0.0},
+        },
+    }
+    _MODEL_FAMILY_STOPS: dict[str, dict[str, list[str]]] = {
+        "gemma": {
+            "conversation": ["<|end_of_turn|>", "<|endoftext|>"],
+            "rewrite": ["<|end_of_turn|>", "<|endoftext|>"],
+            "grounded": ["<|end_of_turn|>", "<|endoftext|>"],
+        },
+        "qwen": {
+            "conversation": ["<|im_end|>", "<|endoftext|>"],
+            "rewrite": ["<|im_end|>", "<|endoftext|>"],
+            "grounded": ["<|im_end|>", "<|endoftext|>"],
+        },
+        "llama": {
+            "conversation": ["<|eot_id|>", "<|end_of_text|>", "<|endoftext|>"],
+            "rewrite": ["<|eot_id|>", "<|end_of_text|>", "<|endoftext|>"],
+            "grounded": ["<|eot_id|>", "<|end_of_text|>", "<|endoftext|>"],
+        },
+        "deepseek": {
+            "conversation": ["<|end_of_sentence|>", "<|endoftext|>"],
+            "rewrite": ["<|end_of_sentence|>", "<|endoftext|>"],
+            "grounded": ["<|end_of_sentence|>", "<|endoftext|>"],
+        },
+    }
+
+    @staticmethod
+    def _model_family_presets_enabled() -> bool:
+        raw = str(os.getenv("LOCAL_AI_MODEL_FAMILY_PRESET_ENABLED", "1") or "1").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _detect_model_family(model_path: str | None) -> str:
+        value = str(model_path or "").strip().lower()
+        if not value:
+            return "default"
+        compact = re.sub(r"[^a-z0-9]+", "", value)
+        if "deepseek" in compact:
+            return "deepseek"
+        if "qwen" in compact:
+            return "qwen"
+        if "gemma" in compact:
+            return "gemma"
+        if "llama" in compact or "mistral" in compact:
+            return "llama"
+        return "default"
+
+    def _sampling_preset_for_model(
+        self,
+        *,
+        style: Literal["grounded", "conversation", "rewrite"],
+        engine: LocalEngine,
+        model_path: str | None,
+    ) -> dict[str, float | int]:
+        base = dict(self._sampling_preset(style=style, engine=engine))
+        if not self._model_family_presets_enabled():
+            return base
+        family = self._detect_model_family(model_path)
+        family_block = self._MODEL_FAMILY_PRESETS.get(family, {})
+        override = family_block.get(style, {})
+        if override:
+            base.update(override)
+        return base
+
+    def _stop_sequences_for_model(
+        self,
+        *,
+        style: Literal["grounded", "conversation", "rewrite"],
+        model_path: str | None,
+        default_sequences: list[str],
+    ) -> list[str]:
+        if not self._model_family_presets_enabled():
+            return list(default_sequences)
+        family = self._detect_model_family(model_path)
+        family_block = self._MODEL_FAMILY_STOPS.get(family, {})
+        custom = family_block.get(style, [])
+        if not custom:
+            return list(default_sequences)
+        return list(custom)
+
+    @staticmethod
+    def _system_memory_usage_ratio() -> float:
+        try:
+            import psutil  # type: ignore
+            mem = psutil.virtual_memory()
+            total = float(getattr(mem, "total", 0.0) or 0.0)
+            used = float(getattr(mem, "used", 0.0) or 0.0)
+            if total <= 0:
+                return 0.0
+            return max(0.0, min(1.0, used / total))
+        except Exception:
+            return 0.0
+
+    def _recent_oom_like_failure(self) -> bool:
+        try:
+            recent_errors = " | ".join(str(v or "") for v in self._last_engine_error.values()).lower()
+        except Exception:
+            recent_errors = ""
+        if not recent_errors:
+            return False
+        markers = (
+            "outofmemory",
+            "insufficient memory",
+            "kio gpu command buffer",
+            "mlx_isolated_failed_no_inprocess_fallback",
+            "워커 응답 타임아웃",
+            "워커 추론 실패",
+        )
+        return any(token in recent_errors for token in markers)
+
+    def _oom_aware_token_cap(self, *, base_cap: int) -> int:
+        cap = max(256, int(base_cap))
+        # Skip dynamic capping if explicitly disabled (e.g. on machines with plenty of memory).
+        if str(os.getenv("LOCAL_AI_DISABLE_OOM_TOKEN_CAP", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}:
+            return cap
+        usage = self._system_memory_usage_ratio()
+        # Mac unified memory regularly runs at 80-90% — only cap at extreme pressure.
+        if usage >= 0.99:
+            cap = min(cap, 256)
+        elif usage >= 0.97:
+            cap = min(cap, 384)
+        elif usage >= 0.95:
+            cap = min(cap, 512)
+        if self._recent_oom_like_failure():
+            cap = min(cap, 384)
+        # Optional hard clamp knob for low-memory machines.
+        try:
+            env_cap = int(float(str(os.getenv("LOCAL_AI_DYNAMIC_MAX_TOKENS_CAP", "0") or "0").strip()))
+            if env_cap > 0:
+                cap = min(cap, max(256, env_cap))
+        except Exception:
+            pass
+        return max(256, cap)
+
     def _generate_grounded_candidate(
         self,
         *,
@@ -63,10 +219,27 @@ class RuntimeManager(BaseDelegate):
         llama_model_path: str | None,
         max_tokens: int,
         style: Literal["grounded", "conversation", "rewrite"] = "grounded",
+        message_state: list[dict[str, str]] | None = None,
+        response_language: str | None = None,
     ) -> str | None:
         if engine == LocalEngine.LLAMA_CPP:
-            return self._generate_with_llama(prompt, llama_model_path, max_tokens=max_tokens, style=style)
-        return self._generate_with_mlx(prompt, profile, mlx_model_path, max_tokens=max_tokens, style=style)
+            return self._generate_with_llama(
+                prompt,
+                llama_model_path,
+                max_tokens=max_tokens,
+                style=style,
+                message_state=message_state,
+                response_language=response_language,
+            )
+        return self._generate_with_mlx(
+            prompt,
+            profile,
+            mlx_model_path,
+            max_tokens=max_tokens,
+            style=style,
+            message_state=message_state,
+            response_language=response_language,
+        )
 
     def prepare_runtime(
         self,
@@ -163,15 +336,16 @@ class RuntimeManager(BaseDelegate):
     ) -> dict[str, float | int]:
         if style == "conversation":
             if engine == LocalEngine.LLAMA_CPP:
-                return {"temperature": 0.55, "top_p": 0.92, "repeat_penalty": 1.14, "top_k": 48}
-            return {"temperature": 0.52, "top_p": 0.92, "repeat_penalty": 1.14, "top_k": 0}
+                return {"temperature": 0.80, "top_p": 0.90, "repeat_penalty": 1.10, "top_k": 40, "min_p": 0.05}
+            # MLX: top_k=40 (was 0/unlimited) to prevent stray tokens
+            return {"temperature": 0.78, "top_p": 0.90, "repeat_penalty": 1.10, "top_k": 40, "min_p": 0.05}
         if style == "rewrite":
             if engine == LocalEngine.LLAMA_CPP:
-                return {"temperature": 0.35, "top_p": 0.9, "repeat_penalty": 1.1, "top_k": 40}
-            return {"temperature": 0.34, "top_p": 0.9, "repeat_penalty": 1.1, "top_k": 0}
+                return {"temperature": 0.35, "top_p": 0.90, "repeat_penalty": 1.08, "top_k": 40, "min_p": 0.0}
+            return {"temperature": 0.34, "top_p": 0.90, "repeat_penalty": 1.08, "top_k": 40, "min_p": 0.0}
         if engine == LocalEngine.LLAMA_CPP:
-            return {"temperature": 0.22, "top_p": 0.9, "repeat_penalty": 1.15, "top_k": 32}
-        return {"temperature": 0.2, "top_p": 0.9, "repeat_penalty": 1.14, "top_k": 0}
+            return {"temperature": 0.22, "top_p": 0.90, "repeat_penalty": 1.12, "top_k": 32, "min_p": 0.0}
+        return {"temperature": 0.20, "top_p": 0.90, "repeat_penalty": 1.12, "top_k": 32, "min_p": 0.0}
 
     def _profile_to_model(self, profile: str) -> str | None:
         key = profile.lower()
@@ -352,5 +526,6 @@ class RuntimeManager(BaseDelegate):
             memory_cap = 2048
 
         requested = int(max_tokens) if max_tokens is not None else profile_default
-        effective = min(requested, profile_limit, memory_cap)
+        dynamic_cap = self._oom_aware_token_cap(base_cap=min(profile_limit, memory_cap))
+        effective = min(requested, profile_limit, memory_cap, dynamic_cap)
         return max(160, effective)

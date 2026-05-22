@@ -15,12 +15,17 @@ logger = logging.getLogger(__name__)
 class MemoryService(_memory_service_mixins.MemoryServiceMethodsMixin):
     _DIGEST_KEY = "conversation_digest_v1"
     _DIGEST_VERSION = "v1"
-    _DIGEST_RECENT_TURNS_CAP = 8
+    # DB에 저장하는 최근 턴 수 (raw turns buffer before compression)
+    _DIGEST_RECENT_TURNS_CAP = 20
     _DIGEST_TOPICS_CAP = 8
     _DIGEST_FACTS_CAP = 10
     _DIGEST_OPEN_LOOPS_CAP = 6
-    _DIGEST_RECENT_TURN_MAX_CHARS = 220
-    _DIGEST_ITEM_MAX_CHARS = 180
+    _DIGEST_RECENT_TURN_MAX_CHARS = 300
+    _DIGEST_ITEM_MAX_CHARS = 240
+    # L1: MessageState에 원문 그대로 주입할 최근 턴 수 (user+assistant 각 1개 = 2개)
+    _DIGEST_WINDOW_VERBATIM = 10
+    # L2: rolling_summary 최대 글자수
+    _DIGEST_ROLLING_SUMMARY_MAX_CHARS = 600
     _TOPIC_STOPWORDS = {
         "and",
         "the",

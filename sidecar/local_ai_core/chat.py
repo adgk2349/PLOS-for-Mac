@@ -68,7 +68,9 @@ class RoomRoutingService:
 
 class ChatExecutionService:
     def __init__(self) -> None:
-        self._route_timeout_seconds = float(os.getenv("LOCAL_AI_ROUTE_TIMEOUT_SECONDS", "240"))
+        # Default: no route-level timeout for local generation.
+        # Slow devices should wait until completion or user cancellation.
+        self._route_timeout_seconds = float(os.getenv("LOCAL_AI_ROUTE_TIMEOUT_SECONDS", "0"))
 
     def execute(self, *, target_chat: "ChatService", req: LocalChatRequestV2):
         if self._route_timeout_seconds <= 0:

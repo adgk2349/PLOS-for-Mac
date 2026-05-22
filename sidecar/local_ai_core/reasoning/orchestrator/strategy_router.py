@@ -14,8 +14,21 @@ class StrategyRouter:
     def select(self, *, req, context, strategies: list[Any], force_general_chat: bool):
         if force_general_chat:
             return GeneralChatStrategy()
-        if req.mode == WorkMode.DEVELOPMENT and context.parsed_intent.intent == ReasoningIntent.GENERAL_CHAT:
-            return WorkspaceRagStrategy()
+        # In GENERAL mode, keep default routing on conversation path unless it is an explicit tool/action intent.
+        if req.mode == WorkMode.GENERAL and context.parsed_intent.intent not in {
+            ReasoningIntent.OPEN_FILE,
+            ReasoningIntent.LIGHTWEIGHT_ACTION_REQUEST,
+            ReasoningIntent.SELECT_PREVIOUS_CANDIDATE,
+            ReasoningIntent.NEXT_CANDIDATE,
+            ReasoningIntent.SYSTEM_ACTION,
+        }:
+            return GeneralChatStrategy()
+        # Keep pure general chat on the conversation-first path except in DEVELOPMENT mode.
+        # Routing general chat into WorkspaceRAG in GENERAL mode caused unnecessary fallback hops.
+        if context.parsed_intent.intent == ReasoningIntent.GENERAL_CHAT:
+            if req.mode == WorkMode.DEVELOPMENT:
+                return WorkspaceRagStrategy()
+            return GeneralChatStrategy()
         for strategy in strategies:
             if strategy.handles_intent(context.parsed_intent, context.followup_resolution):
                 return strategy

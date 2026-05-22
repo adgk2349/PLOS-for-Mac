@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 from local_ai_core.models import Citation, LocalChatRequestV2, SystemFilePermission, WorkMode
 from local_ai_core.reasoning.strategies.workspace_rag import WorkspaceRagStrategy
+from local_ai_core.reasoning.strategies.workspace_rag_development import WorkspaceRagDevelopment
+from local_ai_core.reasoning.strategies.workspace_rag_modules import WorkspaceRagRetriever
 
 
 def _citation(idx: int) -> Citation:
@@ -20,11 +22,17 @@ def _citation(idx: int) -> Citation:
 
 def test_large_development_request_detection_by_file_count() -> None:
     strategy = WorkspaceRagStrategy()
+    retriever = WorkspaceRagRetriever(
+        file_limit=strategy._DEVELOPMENT_BATCH_FILE_LIMIT,
+        chunks_per_file=strategy._DEVELOPMENT_BATCH_CHUNKS_PER_FILE,
+        char_limit=strategy._DEVELOPMENT_BATCH_CHAR_LIMIT,
+        max_files=strategy._DEVELOPMENT_BATCH_MAX_FILES,
+    )
     req = LocalChatRequestV2(query="코드리뷰", mode=WorkMode.DEVELOPMENT)
     citations = [_citation(i) for i in range(3)]
     file_doc_ids = [f"doc-{i}" for i in range(strategy._DEVELOPMENT_BATCH_TRIGGER_FILES)]
 
-    assert strategy._is_large_development_review_request(
+    assert retriever.is_large_development_review_request(
         req=req,
         citations=citations,
         file_doc_ids=file_doc_ids,
@@ -56,18 +64,17 @@ def test_build_patch_plan_requires_evidence_and_limits_items() -> None:
         }
     )
 
-    plan = strategy._build_patch_plan(issues)
+    plan = WorkspaceRagDevelopment.build_patch_plan(issues, max_items=strategy._DEVELOPMENT_PATCH_MAX_ITEMS)
     assert len(plan) == strategy._DEVELOPMENT_PATCH_MAX_ITEMS
     assert all(str(item.get("evidence") or "").strip() for item in plan)
 
 
 def test_apply_patch_denied_without_full_access() -> None:
-    strategy = WorkspaceRagStrategy()
     executor = SimpleNamespace()
     settings = SimpleNamespace(system_file_permission=SystemFilePermission.READ_ONLY)
     workspace = SimpleNamespace()
 
-    applied, failed, logs = strategy._apply_patch_items(
+    applied, failed, logs = WorkspaceRagDevelopment.apply_patch_items(
         executor=executor,
         settings=settings,
         workspace=workspace,
@@ -77,3 +84,4 @@ def test_apply_patch_denied_without_full_access() -> None:
     assert applied == 0
     assert failed == 1
     assert "patch_apply:denied_permission" in logs
+

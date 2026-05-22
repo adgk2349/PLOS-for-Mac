@@ -12,6 +12,21 @@ class ComposerSummaryHelpers:
     _KOREAN_ENDING_REGEX = r"(습니다|입니다|해요|해줘요|해줄게요|할게요|이에요|예요|됐어요|됐습니다)[.!?]?$"
 
     @staticmethod
+    def _truncate(text: str, *, max_chars: int) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        limit = max(8, int(max_chars))
+        if len(value) <= limit:
+            return value
+        clipped = value[:limit].rstrip()
+        # Prefer trimming at a natural sentence boundary near the tail.
+        boundary = max(clipped.rfind("."), clipped.rfind("!"), clipped.rfind("?"))
+        if boundary >= max(20, int(limit * 0.55)):
+            clipped = clipped[: boundary + 1].rstrip()
+        return clipped
+
+    @staticmethod
     def _is_noisy_generated_text(text: str) -> bool:
         compact = " ".join((text or "").split()).lower()
         if not compact:

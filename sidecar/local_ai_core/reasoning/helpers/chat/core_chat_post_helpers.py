@@ -376,25 +376,19 @@ class CoreChatPostHelpers:
 
     @staticmethod
     def _runtime_error_execution(response_language: str, detail: str | None) -> ExecutionResult:
-        normalized_detail = str(detail or "").strip()
-        if response_language == "ko":
-            text = "로컬 대화 엔진을 실행하지 못했습니다. 모델 설치/경로를 확인한 뒤 다시 시도해 주세요."
-        else:
-            text = "The local conversation engines are unavailable. Verify model installation/path and try again."
-        if normalized_detail:
-            text = f"{text}\n    \n    상세 원인: {normalized_detail}" if response_language == "ko" else f"{text}\n    \n    Details: {normalized_detail}"
         return ExecutionResult(
             result_type="conversation",
             structured_payload={
-                "style": "general_chat",
+                "style": "runtime_error",
                 "reason": "conversation_engine_unavailable",
                 "ungrounded_allowed": True,
+                "offer_regenerate": True,
             },
             citations=[],
             tool_logs=[],
-            generated_text=text,
+            generated_text="",
             engine_used=None,
-            used_fallback=True,
+            used_fallback=False,
             runtime_detail=detail,
         )
 
