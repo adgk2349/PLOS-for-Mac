@@ -57,6 +57,179 @@ extension SettingsPanelView {
         .plosGlassPanel()
     }
 
+    var advancedSettingsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            DisclosureGroup(isExpanded: $showAdvancedSettingsAccordion) {
+                VStack(alignment: .leading, spacing: 12) {
+                    advancedMultimodalVisionSection
+                    pluginSection
+                    webSearchSection
+                    apiKeySection
+                    foldersSection
+                }
+                .padding(.top, 8)
+            } label: {
+                Text(t("고급 설정", "Advanced settings", "詳細設定"))
+                    .font(.headline)
+            }
+        }
+        .padding(12)
+        .plosGlassPanel()
+    }
+
+    var advancedMultimodalVisionSection: some View {
+        DisclosureGroup(isExpanded: $showAdvancedMultimodalRuntime) {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(
+                    t("이미지 비전 해석 활성화", "Enable image vision analysis", "画像ビジョン解析を有効化"),
+                    isOn: $viewModel.sidecarVisionEnabled
+                )
+                Toggle(
+                    t("채팅에 생각 과정 표시", "Show thinking process in chat", "チャットに思考過程を表示"),
+                    isOn: $viewModel.showThinkingProcessInChat
+                )
+
+                Divider()
+                    .overlay(Color.white.opacity(0.1))
+
+                Toggle(
+                    t("MLX KV 캐시 TurboQuant 실험 모드", "MLX KV cache TurboQuant experimental mode", "MLX KVキャッシュ TurboQuant 実験モード"),
+                    isOn: $viewModel.sidecarMlxKVQEnabled
+                )
+
+                Toggle(
+                    t("대화 Turbo 모드(응답 길이/후처리 완화)", "Conversation Turbo mode (relax length/postprocess)", "会話Turboモード（長さ/後処理の緩和）"),
+                    isOn: $viewModel.sidecarConversationTurboEnabled
+                )
+
+                Toggle(
+                    t("추론 제한시간 비활성화(고급)", "Disable inference timeout (advanced)", "推論タイムアウト無効化（上級）"),
+                    isOn: $viewModel.sidecarInferenceTimeoutDisabled
+                )
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text(t("본답변 제한시간(초)", "Main response timeout (sec)", "本回答タイムアウト（秒）"))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Text(
+                            viewModel.sidecarInferenceTimeoutDisabled
+                            ? t("무제한", "Unlimited", "無制限")
+                            : "\(viewModel.sidecarMainResponseTimeoutSeconds)s"
+                        )
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    }
+                    Stepper(
+                        value: $viewModel.sidecarMainResponseTimeoutSeconds,
+                        in: 30 ... 3600,
+                        step: 30
+                    ) {
+                        EmptyView()
+                    }
+                    .disabled(viewModel.sidecarInferenceTimeoutDisabled)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text(t("보조경로 제한시간(초)", "Auxiliary path timeout (sec)", "補助経路タイムアウト（秒）"))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Text("\(viewModel.sidecarAuxiliaryTimeoutSeconds)s")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Stepper(
+                        value: $viewModel.sidecarAuxiliaryTimeoutSeconds,
+                        in: 4 ... 120,
+                        step: 1
+                    ) {
+                        EmptyView()
+                    }
+                }
+
+                if viewModel.sidecarInferenceTimeoutDisabled {
+                    Text(
+                        t(
+                            "주의: 응답이 무한 대기 상태가 될 수 있습니다. 필요 시 sidecar 재시작으로 중단하세요.",
+                            "Caution: responses may wait indefinitely. Restart sidecar to force-stop if needed.",
+                            "注意: 応答が無期限待機になる場合があります。必要時はsidecar再起動で停止してください。"
+                        )
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.orange.opacity(0.95))
+                }
+
+                HStack(spacing: 8) {
+                    Text(t("KVQ 모드", "KVQ mode", "KVQモード"))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Picker("", selection: $viewModel.sidecarMlxKVQMode) {
+                        Text("turbo3").tag(SidecarMlxKVQMode.turbo3)
+                        Text("turbo4").tag(SidecarMlxKVQMode.turbo4)
+                        Text("off").tag(SidecarMlxKVQMode.off)
+                    }
+                    .pickerStyle(.segmented)
+                }
+                .disabled(!viewModel.sidecarMlxKVQEnabled)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(t("KV 인덱스 비트", "KV index bits", "KVインデックスビット"))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Text("\(viewModel.sidecarMlxKVQBits)bit")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { Double(viewModel.sidecarMlxKVQBits) },
+                            set: { viewModel.sidecarMlxKVQBits = Int($0.rounded()) }
+                        ),
+                        in: 2 ... 8,
+                        step: 1
+                    )
+                }
+                .disabled(!viewModel.sidecarMlxKVQEnabled)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(t("캡션 모델 ID", "Caption model ID", "キャプションモデルID"))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    TextField("microsoft/git-base-coco", text: $viewModel.sidecarVisionCaptionModel)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .plosGlassInputFrame()
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(t("분류 모델 ID", "Classification model ID", "分類モデルID"))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    TextField("google/vit-base-patch16-224", text: $viewModel.sidecarVisionClassifyModel)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .plosGlassInputFrame()
+                }
+
+                Text(t("고급 옵션: 저장 시 sidecar 재시작 후 적용됩니다.", "Advanced option: applied after sidecar restart on save.", "詳細オプション: 保存時にsidecar再起動後に適用されます。"))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.top, 6)
+        } label: {
+            Text(t("고급: 멀티모달/비전", "Advanced: multimodal/vision", "詳細: マルチモーダル/ビジョン"))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+    }
+
     var behaviorSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(t("기본 작업 동작", "Default behavior", "基本動作"))
@@ -94,27 +267,40 @@ extension SettingsPanelView {
                 .font(.headline)
 
             if !viewModel.installedModelsSorted.isEmpty {
-                Text(t("설치된 모델", "Installed models", "インストール済みモデル"))
-                    .font(.subheadline.weight(.semibold))
-
-                ForEach(viewModel.installedModelsSorted.prefix(8)) { model in
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(model.file_name)
-                                .lineLimit(1)
-                            Text(model.engine.title)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                DisclosureGroup(isExpanded: $showInstalledModelsList) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(viewModel.installedModelsSorted.prefix(8)) { model in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(model.file_name)
+                                        .lineLimit(1)
+                                    Text(model.engine.title)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button(viewModel.isInstalledModelActive(model) ? t("사용중", "Active", "使用中") : t("사용", "Use", "使用")) {
+                                    Task { await viewModel.selectInstalledModel(model) }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .plosGlassInputFrame()
                         }
-                        Spacer()
-                        Button(viewModel.isInstalledModelActive(model) ? t("사용중", "Active", "使用中") : t("사용", "Use", "使用")) {
-                            Task { await viewModel.selectInstalledModel(model) }
-                        }
-                        .buttonStyle(.plain)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .plosGlassInputFrame()
+                    .padding(.top, 6)
+                } label: {
+                    HStack(spacing: 8) {
+                        Text(t("설치된 모델", "Installed models", "インストール済みモデル"))
+                            .font(.subheadline.weight(.semibold))
+                        Text("\(min(viewModel.installedModelsSorted.count, 8))")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .plosGlassChip()
+                    }
                 }
             } else {
                 Text(t("설치된 모델이 없습니다. 아래 카탈로그에서 먼저 다운로드해 주세요.", "No installed model. Download one from catalog first.", "インストール済みモデルがありません。カタログから先にダウンロードしてください。"))
@@ -133,75 +319,87 @@ extension SettingsPanelView {
                 Text(t("저장소 경로", "Storage paths", "保存先パス"))
                     .font(.subheadline.weight(.semibold))
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(t("모델 저장 경로", "Model storage path", "モデル保存パス"))
-                        .font(.caption.weight(.semibold))
-                    Text(viewModel.modelsStorageDirectoryPath)
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(t("모델 저장 경로", "Model storage path", "モデル保存パス"))
+                            .font(.caption.weight(.semibold))
+                        Text(viewModel.modelsStorageDirectoryPath)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                        HStack(spacing: 8) {
+                            Button(t("폴더 선택", "Choose folder", "フォルダ選択")) {
+                                Task { await viewModel.chooseModelsStorageDirectory() }
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .plosGlassControl()
+                            .disabled(viewModel.isBusy)
+
+                            Button(t("기본값 복원", "Reset default", "既定値に戻す")) {
+                                Task { await viewModel.resetModelsStorageDirectoryToDefault() }
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .plosGlassControl()
+                            .disabled(viewModel.isBusy)
+                        }
+                        Text(
+                            t("적용 경로", "Effective path", "適用パス")
+                            + ": "
+                            + (viewModel.effectiveModelsStorageDirectoryPath.isEmpty ? viewModel.modelsStorageDirectoryPath : viewModel.effectiveModelsStorageDirectoryPath)
+                        )
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
-                    HStack(spacing: 8) {
-                        Button(t("폴더 선택", "Choose folder", "フォルダ選択")) {
-                            Task { await viewModel.chooseModelsStorageDirectory() }
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .plosGlassControl()
-                        .disabled(viewModel.isBusy)
-
-                        Button(t("기본값 복원", "Reset default", "既定値に戻す")) {
-                            Task { await viewModel.resetModelsStorageDirectoryToDefault() }
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .plosGlassControl()
-                        .disabled(viewModel.isBusy)
                     }
-                    Text(t("적용 경로", "Effective path", "適用パス") + ": " + (viewModel.effectiveModelsStorageDirectoryPath.isEmpty ? viewModel.modelsStorageDirectoryPath : viewModel.effectiveModelsStorageDirectoryPath))
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .plosGlassInputFrame()
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(t("런타임(venv) 경로", "Runtime (venv) path", "ランタイム(venv)パス"))
+                            .font(.caption.weight(.semibold))
+                        Text(viewModel.runtimeStorageDirectoryPath)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                        HStack(spacing: 8) {
+                            Button(t("폴더 선택", "Choose folder", "フォルダ選択")) {
+                                Task { await viewModel.chooseRuntimeStorageDirectory() }
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .plosGlassControl()
+                            .disabled(viewModel.isBusy)
+
+                            Button(t("기본값 복원", "Reset default", "既定値に戻す")) {
+                                Task { await viewModel.resetRuntimeStorageDirectoryToDefault() }
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .plosGlassControl()
+                            .disabled(viewModel.isBusy)
+                        }
+                        Text(
+                            t("적용 경로", "Effective path", "適用パス")
+                            + ": "
+                            + (viewModel.effectiveRuntimeStorageDirectoryPath.isEmpty ? viewModel.runtimeStorageDirectoryPath : viewModel.effectiveRuntimeStorageDirectoryPath)
+                        )
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .plosGlassInputFrame()
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(t("런타임(venv) 경로", "Runtime (venv) path", "ランタイム(venv)パス"))
-                        .font(.caption.weight(.semibold))
-                    Text(viewModel.runtimeStorageDirectoryPath)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                    HStack(spacing: 8) {
-                        Button(t("폴더 선택", "Choose folder", "フォルダ選択")) {
-                            Task { await viewModel.chooseRuntimeStorageDirectory() }
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .plosGlassControl()
-                        .disabled(viewModel.isBusy)
-
-                        Button(t("기본값 복원", "Reset default", "既定値に戻す")) {
-                            Task { await viewModel.resetRuntimeStorageDirectoryToDefault() }
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .plosGlassControl()
-                        .disabled(viewModel.isBusy)
                     }
-                    Text(t("적용 경로", "Effective path", "適用パス") + ": " + (viewModel.effectiveRuntimeStorageDirectoryPath.isEmpty ? viewModel.runtimeStorageDirectoryPath : viewModel.effectiveRuntimeStorageDirectoryPath))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .plosGlassInputFrame()
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .plosGlassInputFrame()
 
                 if !viewModel.storageDirectoryWarning.isEmpty {
                     Text(viewModel.storageDirectoryWarning)
@@ -212,28 +410,68 @@ extension SettingsPanelView {
             }
             .padding(.horizontal, 2)
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text(t("모델 성능 가이드", "Model capability guide", "モデル性能ガイド"))
                     .font(.caption.weight(.semibold))
-                Text(t("16GB급(3B~8B): 기본 대화/검색 중심, 요약 작업은 API 필요", "16GB class (3B~8B): basic chat/search; summarization needs API", "16GB級(3B~8B): 基本会話/検索中心、要約はAPI推奨"))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text(t("주의: Gemma/DeepSeek 같은 8B+ 모델을 RAM 부족 상태에서 오래 쓰면 swap I/O 증가로 SSD 수명에 영향을 줄 수 있습니다.", "Caution: long swap-heavy runs with 8B+ models can increase SSD wear.", "注意: 8B+モデルをメモリ不足で長時間使うとSSD負荷が増える可能性があります。"))
-                    .font(.caption2)
-                    .foregroundStyle(.orange.opacity(0.95))
-                Text(t("32GB급(14B~32B): 일반 요약/정리는 로컬 가능, 고난도는 API 권장", "32GB class (14B~32B): local summary generally possible; API for hard tasks", "32GB級(14B~32B): 要約はローカル可能、難問はAPI推奨"))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text(t("64GB+급(70B): 긴 문서 요약/분석도 로컬 가능(속도 비용 큼)", "64GB+ (70B): long-doc summary/analysis possible locally (slow)", "64GB以上(70B): 長文要約/分析もローカル可能(速度コスト大)"))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text(t("정책 권장: 16GB급 모델에서 '요약/정리' 요청은 API 경로 우선", "Policy: on 16GB-class models, prefer API for summary/organization", "推奨: 16GB級モデルでは要約/整理はAPI優先"))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("16GB")
+                            .font(.caption.weight(.semibold))
+                        Text(t("3B~8B 중심. 기본 대화/검색에는 적합하고, 긴 요약/정리는 외부 API 경로가 안정적입니다.", "Best with 3B~8B. Good for basic chat/search; external API is safer for long summaries.", "3B~8B中心。基本会話/検索向けで、長い要約は外部APIが安定します。"))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .plosGlassInputFrame()
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("32GB")
+                            .font(.caption.weight(.semibold))
+                        Text(t("14B~32B까지 일반 요약/정리를 로컬에서 처리 가능. 고난도 추론은 외부 API를 권장합니다.", "Can handle general local summarization up to 14B~32B. Use external API for harder reasoning.", "14B~32Bで一般的な要約はローカル可能。高難度推論は外部API推奨。"))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .plosGlassInputFrame()
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("64GB+")
+                            .font(.caption.weight(.semibold))
+                        Text(t("70B급도 로컬 처리 가능하지만 속도 비용이 큽니다. 장시간 작업은 발열/전력까지 고려하세요.", "Even 70B can run locally, but latency is high. Consider sustained heat/power for long runs.", "70B級もローカル動作可能ですが遅延コストが大きいです。長時間運用では発熱/電力も考慮してください。"))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .plosGlassInputFrame()
+                }
+
+                HStack(alignment: .top, spacing: 10) {
+                    Text(t("주의: Gemma/DeepSeek 같은 8B+ 모델을 RAM 부족 상태에서 오래 쓰면 swap I/O 증가로 SSD 수명에 영향을 줄 수 있습니다.", "Caution: long swap-heavy runs with 8B+ models can increase SSD wear.", "注意: 8B+モデルをメモリ不足で長時間使うとSSD負荷が増える可能性があります。"))
+                        .font(.caption2)
+                        .foregroundStyle(.orange.opacity(0.95))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .plosGlassInputFrame()
+                    Text(t("정책 권장: 16GB급 모델에서 '요약/정리' 요청은 API 경로 우선", "Policy: on 16GB-class models, prefer API for summary/organization", "推奨: 16GB級モデルでは要約/整理はAPI優先"))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .plosGlassInputFrame()
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
             .plosGlassInputFrame()
+
         }
         .padding(12)
         .plosGlassPanel()
@@ -383,7 +621,7 @@ extension SettingsPanelView {
                 .font(.subheadline.weight(.semibold))
 
             HStack(spacing: 8) {
-                Button(t("플러그인 파일 추가", "Add plugin file", "プラグインファイル追加")) {
+                Button(t("플러그인 추가(파일/폴더)", "Add plugin (file/folder)", "プラグイン追加（ファイル/フォルダ）")) {
                     Task { await viewModel.registerPluginFromManifestFile() }
                 }
                 .buttonStyle(.plain)
@@ -393,8 +631,18 @@ extension SettingsPanelView {
                 .disabled(viewModel.isPluginBusy || viewModel.isBusy)
             }
 
+            Text(
+                t(
+                    "폴더 내부 json 파일 선택 방식 지원: 폴더 선택 시 내부 plugin.json이 자동 사용됩니다.",
+                    "Folder-internal JSON selection is supported: selecting a folder automatically uses its plugin.json.",
+                    "フォルダ内JSON選択方式に対応: フォルダ選択時は内部のplugin.jsonが自動適用されます。"
+                )
+            )
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+
             VStack(alignment: .leading, spacing: 6) {
-                Text(t("manifest JSON 파일을 여기로 드래그 앤 드롭", "Drag & drop manifest JSON file here", "manifest JSONファイルをここにドラッグ＆ドロップ"))
+                Text(t("플러그인 폴더 또는 manifest JSON 파일을 여기로 드래그 앤 드롭", "Drag & drop plugin folder or manifest JSON here", "プラグインフォルダまたはmanifest JSONをここにドラッグ＆ドロップ"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)

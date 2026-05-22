@@ -460,6 +460,20 @@ struct BehaviorOverrides: Codable {
     var preferred_response_length: ResponseLength?
 }
 
+enum ChatAttachmentKind: String, Codable {
+    case file
+    case image
+    case audio
+}
+
+struct ChatAttachmentV2: Codable, Identifiable {
+    var id: String
+    var kind: ChatAttachmentKind
+    var file_path: String
+    var file_name: String?
+    var mime_type: String?
+}
+
 struct LocalChatRequestV2: Codable {
     var query: String
     var mode: WorkMode
@@ -472,6 +486,9 @@ struct LocalChatRequestV2: Codable {
     var behavior_overrides: BehaviorOverrides?
     var development_action: String? = nil
     var fix_mode: String? = nil
+    var attachments: [ChatAttachmentV2]? = nil
+    var roleplay_mode: Bool? = nil
+    var roleplay_persona: String? = nil
 }
 
 struct SuggestedAction: Codable, Identifiable, Hashable {
@@ -574,6 +591,16 @@ struct StructuredResult: Codable {
     var data: [String: JSONValue]
 }
 
+struct GeneratedArtifact: Codable, Identifiable {
+    var artifact_id: String
+    var title: String
+    var file_uri: String
+    var mime_type: String
+    var size_bytes: Int
+
+    var id: String { artifact_id }
+}
+
 struct ChatStreamEvent: Codable {
     var type: String
     var message: String?
@@ -586,6 +613,7 @@ struct ComposedChatResponseV2: Codable {
     var lead: String
     var structured_result: StructuredResult
     var generated_text: String?
+    var artifacts: [GeneratedArtifact]?
     var citations: [Citation]
     var actions: [SuggestedAction]
     var prompt_cache_hit: Bool?

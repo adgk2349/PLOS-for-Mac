@@ -168,9 +168,31 @@ struct ChatPanelView: View {
                         }
                         .buttonStyle(.plain)
                     }
+                    Divider()
+                        .padding(.vertical, 2)
+                    Toggle(
+                        t("역할극 모드", "Roleplay mode", "ロールプレイモード"),
+                        isOn: Binding(
+                            get: { viewModel.roleplayModeEnabled },
+                            set: { viewModel.setRoleplayMode($0) }
+                        )
+                    )
+                    .toggleStyle(.switch)
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 6)
+                    Text(
+                        t(
+                            "캐릭터/말투 유지 우선. 사실 검색 라우팅은 줄어듭니다.",
+                            "Prioritizes character/tone consistency and reduces factual web-search routing.",
+                            "キャラクター/口調の維持を優先し、事実検索ルーティングを抑えます。"
+                        )
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
                 }
                 .padding(10)
-                .frame(width: 280)
+                .frame(width: 320)
                 .background(PLOSGlassBackground())
             }
 
@@ -580,25 +602,32 @@ struct ChatPanelView: View {
         let traceEvents = thinkingTraceEvents(for: message)
 
         if let text = message.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+            let content = animatedText(for: message, field: "text", raw: nfc(text))
             markdownRichContent(
-                animatedText(for: message, field: "text", raw: nfc(text)),
+                content,
                 font: .body,
                 keyPrefix: "\(message.id.uuidString)-local-text"
             )
         }
         if let lead = message.lead, !lead.isEmpty {
+            let content = animatedText(for: message, field: "lead", raw: nfc(lead))
             markdownRichContent(
-                animatedText(for: message, field: "lead", raw: nfc(lead)),
+                content,
                 font: .body.weight(.semibold),
                 keyPrefix: "\(message.id.uuidString)-lead"
             )
         }
         if let summary = message.resultSummary, !summary.isEmpty {
+            let content = animatedText(for: message, field: "summary", raw: nfc(summary))
             markdownRichContent(
-                animatedText(for: message, field: "summary", raw: nfc(summary)),
+                content,
                 font: .body,
                 keyPrefix: "\(message.id.uuidString)-summary"
             )
+        }
+        let artifacts = message.artifacts ?? []
+        if !artifacts.isEmpty {
+            artifactSection(artifacts)
         }
 
         let smallCitations = citationsForMessage(message)
@@ -606,7 +635,7 @@ struct ChatPanelView: View {
             miniCitationStrip(smallCitations)
         }
 
-        if hasReasoningSignal(message) {
+        if viewModel.showThinkingProcessInChat, hasReasoningSignal(message) {
             if isReasoningInProgress(for: message) {
                 let isExpanded = isLiveReasoningExpanded(messageID: message.id)
                 VStack(alignment: .leading, spacing: 3) {
@@ -706,13 +735,88 @@ struct ChatPanelView: View {
         }
     }
 
+    @ViewBuilder
+    private func artifactSection(_ artifacts: [GeneratedArtifact]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(t("생성 결과", "Generated artifacts", "生成成果物"))
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            ForEach(artifacts) { artifact in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(artifact.title)
+                        .font(.callout.weight(.semibold))
+                    if artifact.mime_type.lowercased().hasPrefix("image/"),
+                       let filePath = filePath(from: artifact.file_uri),
+                       let image = NSImage(contentsOfFile: filePath)
+                    {
+                        Image(nsImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxHeight: 220)
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+                    if let destination = urlForArtifactURI(artifact.file_uri) {
+                        Link(artifact.file_uri, destination: destination)
+                            .font(.caption2)
+                            .foregroundStyle(Color.blue.opacity(0.92))
+                    } else {
+                        Text(artifact.file_uri)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .plosGlassInputFrame(radius: 10)
+            }
+        }
+    }
+
+    private func urlForArtifactURI(_ raw: String) -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let url = URL(string: trimmed), url.scheme != nil {
+            return url
+        }
+        return URL(fileURLWithPath: trimmed)
+    }
+
+    private func filePath(from uri: String) -> String? {
+        let trimmed = uri.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.hasPrefix("file://"), let url = URL(string: trimmed) {
+            return url.path
+        }
+        if trimmed.hasPrefix("/") {
+            return trimmed
+        }
+        return nil
+    }
+
     private var generatingIndicatorRow: some View {
+        let hasStreamingAssistantMessage = {
+            guard let activeID = viewModel.activeGeneratingMessageID else { return false }
+            guard let message = viewModel.chatMessages.first(where: { $0.id == activeID }) else { return false }
+            return message.isStreaming && message.source == .local
+        }()
         let traceEvents = generatingTraceEvents()
-        let showThinking = !traceEvents.isEmpty
+        let showThinking = viewModel.showThinkingProcessInChat && !traceEvents.isEmpty
         let isExpanded = isLiveReasoningExpanded(messageID: viewModel.activeGeneratingMessageID)
         return HStack {
+            if hasStreamingAssistantMessage {
+                EmptyView()
+            } else {
             VStack(alignment: .leading, spacing: 8) {
-                TypingDotsView()
+                if viewModel.sidecarRecoveryState == "recovering" {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(t("복구 중...", "Recovering...", "復旧中..."))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 if showThinking {
                     VStack(alignment: .leading, spacing: 3) {
                         Button {
@@ -743,16 +847,20 @@ struct ChatPanelView: View {
                         .frame(maxHeight: 140)
                         .plosGlassInputFrame(radius: 10)
                     }
+                } else {
+                    TypingDotsView()
                 }
             }
             .padding(.horizontal, 2)
             .padding(.vertical, 4)
             .frame(maxWidth: 840, alignment: .leading)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func hasReasoningSignal(_ message: ChatMessage) -> Bool {
+        guard viewModel.showThinkingProcessInChat else { return false }
         if !thinkingTraceEvents(for: message).isEmpty {
             return true
         }
@@ -776,6 +884,7 @@ struct ChatPanelView: View {
     }
 
     private func generatingTraceEvents() -> [ThinkingTraceEvent] {
+        guard viewModel.showThinkingProcessInChat else { return [] }
         if !viewModel.liveThinkingTraceEvents.isEmpty {
             return Array(viewModel.liveThinkingTraceEvents.prefix(24).enumerated()).map { index, item in
                 ThinkingTraceEvent(
@@ -802,6 +911,19 @@ struct ChatPanelView: View {
     }
 
     private func thinkingTraceEvents(for message: ChatMessage) -> [ThinkingTraceEvent] {
+        guard viewModel.showThinkingProcessInChat else { return [] }
+        if isReasoningInProgress(for: message) && !viewModel.liveThinkingTraceEvents.isEmpty {
+            return Array(viewModel.liveThinkingTraceEvents.prefix(24).enumerated()).map { index, item in
+                ThinkingTraceEvent(
+                    id: "live-\(index)-\(item.id.uuidString)",
+                    status: item.status,
+                    message: item.message,
+                    source: item.source,
+                    url: item.url,
+                    at: item.at
+                )
+            }
+        }
         guard let traceValues = message.responseMetadata?["trace_events"]?.arrayValue else {
             return []
         }
@@ -853,7 +975,7 @@ struct ChatPanelView: View {
         if ["retrieving", "retrieved", "warning"].contains(statusValue) {
             return true
         }
-        if ["external", "retrieval"].contains(sourceValue) {
+        if ["external", "retrieval", "model_reasoning"].contains(sourceValue) {
             return true
         }
         let lowered = message.lowercased()
@@ -972,6 +1094,9 @@ struct ChatPanelView: View {
     private var composer: some View {
         return VStack(spacing: 8) {
             composerInputField()
+            if !viewModel.composerAttachments.isEmpty {
+                attachmentChips
+            }
 
             HStack(spacing: 8) {
                 Button {
@@ -984,6 +1109,8 @@ struct ChatPanelView: View {
                         .plosGlassCircle()
                 }
                 .buttonStyle(.plain)
+                .disabled(!viewModel.isChatComposerEnabled || viewModel.isBusy)
+                .opacity((!viewModel.isChatComposerEnabled || viewModel.isBusy) ? 0.45 : 1.0)
 
                 Menu {
                     if viewModel.installedModelsSorted.isEmpty {
@@ -1017,6 +1144,22 @@ struct ChatPanelView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 
+                ForEach(viewModel.composerPluginToggles) { toggle in
+                    Toggle(
+                        toggle.title,
+                        isOn: viewModel.pluginToggleBinding(
+                            pluginID: toggle.pluginID,
+                            toggleID: toggle.toggleID,
+                            defaultValue: toggle.defaultValue
+                        )
+                    )
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .font(.caption)
+                    .disabled(!toggle.pluginEnabled)
+                    .help(toggle.help ?? toggle.pluginID)
+                }
+
                 if viewModel.isModelRuntimeBusy {
                     ProgressView()
                         .controlSize(.small)
@@ -1036,9 +1179,9 @@ struct ChatPanelView: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    Task { await viewModel.askLocal() }
+                    viewModel.submitOrStopLocalChatFromComposer()
                 } label: {
-                    Image(systemName: "arrow.up")
+                    Image(systemName: viewModel.isGeneratingChatResponse ? "stop.fill" : "arrow.up")
                         .font(.system(size: 15, weight: .bold))
                         .foregroundStyle(.white)
                         .frame(width: 18, height: 18)
@@ -1046,8 +1189,16 @@ struct ChatPanelView: View {
                         .plosGlassCircle()
                 }
                 .buttonStyle(.plain)
-                .disabled(viewModel.inputQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isBusy)
-                .opacity(viewModel.inputQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isBusy ? 0.45 : 1.0)
+                .disabled(
+                    viewModel.isGeneratingChatResponse
+                        ? false
+                        : (!viewModel.isChatComposerEnabled || !viewModel.canSubmitChatInput || viewModel.isBusy)
+                )
+                .opacity(
+                    viewModel.isGeneratingChatResponse
+                        ? 1.0
+                        : (!viewModel.isChatComposerEnabled || !viewModel.canSubmitChatInput || viewModel.isBusy ? 0.45 : 1.0)
+                )
             }
         }
         .padding(12)
@@ -1055,19 +1206,65 @@ struct ChatPanelView: View {
         .plosGlassPanel(radius: 14)
     }
 
+    private var attachmentChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(viewModel.composerAttachments) { attachment in
+                    HStack(spacing: 6) {
+                        Image(systemName: chipSymbol(for: attachment.kind))
+                            .font(.system(size: 10, weight: .semibold))
+                        Text(attachment.fileName)
+                            .lineLimit(1)
+                        Button {
+                            viewModel.removeComposerAttachment(attachment.id)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9, weight: .bold))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                    }
+                    .font(.caption)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Color.secondary.opacity(0.12), in: Capsule())
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func chipSymbol(for kind: ChatAttachmentKind) -> String {
+        switch kind {
+        case .file:
+            return "doc"
+        case .image:
+            return "photo"
+        case .audio:
+            return "waveform"
+        }
+    }
+
     private func composerInputField() -> some View {
-        let placeholder = t("무엇이든 부탁하세요", "Ask anything", "何でも聞いてください")
+        let placeholder = viewModel.isChatComposerEnabled
+            ? t("무엇이든 부탁하세요", "Ask anything", "何でも聞いてください")
+            : t("로컬 서버 준비 중입니다...", "Preparing local server...", "ローカルサーバーを準備中です...")
         return ZStack(alignment: .topLeading) {
             ComposerMultilineTextView(
                 text: $viewModel.inputQuery,
                 onSubmit: {
-                    guard !viewModel.isBusy else { return }
-                    Task { await viewModel.askLocal() }
+                    if viewModel.isGeneratingChatResponse {
+                        viewModel.stopActiveLocalChatGeneration()
+                        return
+                    }
+                    guard viewModel.isChatComposerEnabled, !viewModel.isBusy else { return }
+                    viewModel.submitOrStopLocalChatFromComposer()
                 }
             )
             .frame(height: 44)
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
+            .disabled(!viewModel.isChatComposerEnabled || viewModel.isBusy)
 
             if viewModel.inputQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 Text(placeholder)
@@ -1093,14 +1290,12 @@ struct ChatPanelView: View {
             if hasLink {
                 AnyView(
                     Text(attributed)
-                        .font(font)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.disabled)
                 )
             } else {
                 AnyView(
                     Text(attributed)
-                        .font(font)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                 )
@@ -1167,9 +1362,7 @@ struct ChatPanelView: View {
                 }
                 .help("코드 복사")
             }
-            Text(verbatim: code)
-                .font(.system(size: 13, weight: .regular, design: .monospaced))
-                .foregroundStyle(.primary)
+            Text(highlightedCodeAttributedString(code, language: language))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1177,6 +1370,49 @@ struct ChatPanelView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .plosGlassInputFrame(radius: 10)
+    }
+
+    private func highlightedCodeAttributedString(_ code: String, language: String?) -> AttributedString {
+        let text = code.isEmpty ? " " : code
+        let ns = text as NSString
+        let output = NSMutableAttributedString(
+            string: text,
+            attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                .foregroundColor: NSColor.labelColor,
+            ]
+        )
+
+        func apply(pattern: String, color: NSColor, options: NSRegularExpression.Options = []) {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else { return }
+            let range = NSRange(location: 0, length: ns.length)
+            regex.matches(in: text, options: [], range: range).forEach { match in
+                output.addAttribute(.foregroundColor, value: color, range: match.range)
+            }
+        }
+
+        let normalizedLanguage = (language ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let keywordPattern: String = {
+            if normalizedLanguage.contains("py") {
+                return #"\b(?:def|class|import|from|as|if|elif|else|for|while|try|except|finally|return|with|lambda|yield|async|await|True|False|None|and|or|not|in|is|pass|break|continue|raise)\b"#
+            }
+            if normalizedLanguage.contains("swift") {
+                return #"\b(?:func|let|var|struct|class|enum|protocol|extension|import|if|else|guard|for|while|switch|case|default|return|throw|throws|try|catch|async|await|nil|true|false|self|init|deinit)\b"#
+            }
+            return #"\b(?:function|const|let|var|class|import|export|from|if|else|for|while|switch|case|default|return|try|catch|finally|throw|new|async|await|true|false|null|undefined)\b"#
+        }()
+
+        apply(pattern: keywordPattern, color: NSColor.systemBlue)
+        apply(pattern: #"\b\d+(?:\.\d+)?\b"#, color: NSColor.systemOrange)
+        apply(pattern: #"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'"#, color: NSColor.systemRed)
+        apply(pattern: #"//.*$"#, color: NSColor.systemGreen, options: [.anchorsMatchLines])
+        apply(pattern: #"#.*$"#, color: NSColor.systemGreen, options: [.anchorsMatchLines])
+        apply(pattern: #"/\*[\s\S]*?\*/"#, color: NSColor.systemGreen)
+
+        if let converted = try? AttributedString(output, including: \.appKit) {
+            return converted
+        }
+        return AttributedString(text)
     }
 
     @ViewBuilder
@@ -1272,7 +1508,7 @@ struct ChatPanelView: View {
             return
         }
 
-        guard shouldAnimateMessageReveal(message) else {
+        guard shouldAnimateMessageReveal(message), shouldAnimateFieldReveal(raw: raw) else {
             revealedCharactersByKey[key] = total
             return
         }
@@ -1308,6 +1544,17 @@ struct ChatPanelView: View {
         let isFresh = Date().timeIntervalSince(message.timestamp) < 2.2
         let isLatestAssistant = message.id == latestAssistantMessageID
         return isFresh && isLatestAssistant
+    }
+
+    private func shouldAnimateFieldReveal(raw: String) -> Bool {
+        let normalized = nfc(raw)
+        if normalized.count > 520 {
+            return false
+        }
+        if normalized.contains("```") || normalized.contains("~~~") {
+            return false
+        }
+        return true
     }
 
     private func revealKey(messageID: UUID, field: String) -> String {

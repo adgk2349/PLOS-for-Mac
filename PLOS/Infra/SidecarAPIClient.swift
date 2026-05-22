@@ -2,6 +2,14 @@ import Foundation
 
 // MARK: - Infra
 
+struct SidecarHealthResponse: Codable {
+    var status: String
+    var ready: Bool?
+    var vector_store: String?
+    var vector_store_reason: String?
+    var vector_store_required: Bool?
+}
+
 struct APIError: Error, LocalizedError {
     let message: String
 
@@ -50,8 +58,16 @@ final class SidecarAPIClient {
         return formatter
     }()
 
-    func health() async throws {
-        _ = try await request(path: "/health", method: "GET") as [String: String]
+    func health() async throws -> SidecarHealthResponse {
+        let response: SidecarHealthResponse = try await request(path: "/health", method: "GET")
+        if response.ready == false {
+            throw APIError(message: "Sidecar not ready yet")
+        }
+        let status = response.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if status == "error" || status == "failed" {
+            throw APIError(message: "Sidecar health is \(response.status)")
+        }
+        return response
     }
 
     func updateWorkspace(_ payload: WorkspaceUpdateRequest) async throws -> WorkspaceResponse {
@@ -118,6 +134,71 @@ final class SidecarAPIClient {
         return response["removed"]?.boolCoercedValue ?? false
     }
 
+    func openExtensionPanel(_ payload: PluginPanelOpenRequest) async throws -> PluginPanelOpenResponse {
+        try await request(path: "/v1/extensions/panel/open", method: "POST", body: payload)
+    }
+
+    func submitExtensionPanelAction(_ payload: PluginPanelActionRequest) async throws -> PluginPanelActionResponse {
+        try await request(path: "/v1/extensions/panel/action", method: "POST", body: payload)
+    }
+
+    func getExtensionPanelStatus(jobID: String) async throws -> PluginPanelStatusResponse {
+        try await request(path: "/v1/extensions/panel/status/\(jobID)", method: "GET")
+    }
+
+    func streamExtensionPanelStatus(jobID: String) async throws -> AsyncThrowingStream<PluginPanelStatusResponse, Error> {
+        let url = try websocketURL(path: "/v1/extensions/panel/status/ws/\(jobID)")
+        var request = URLRequest(url: url)
+        request.setValue(sessionToken, forHTTPHeaderField: "x-session-token")
+        let socket = urlSession.webSocketTask(with: request)
+        socket.resume()
+
+        return AsyncThrowingStream { continuation in
+            let receiverTask = Task {
+                defer {
+                    socket.cancel(with: .normalClosure, reason: nil)
+                }
+                do {
+                    while !Task.isCancelled {
+                        let message = try await socket.receive()
+                        let data: Data
+                        switch message {
+                        case let .string(text):
+                            guard let encoded = text.data(using: .utf8) else { continue }
+                            data = encoded
+                        case let .data(raw):
+                            data = raw
+                        @unknown default:
+                            continue
+                        }
+                        let event = try self.decoder.decode(PluginPanelStatusResponse.self, from: data)
+                        continuation.yield(event)
+                        let status = event.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        if status != "queued", status != "running" {
+                            continuation.finish()
+                            return
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    if Task.isCancelled {
+                        continuation.finish()
+                        return
+                    }
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                receiverTask.cancel()
+                socket.cancel(with: .goingAway, reason: nil)
+            }
+        }
+    }
+
+    func generateExtensionImage(_ payload: ExtensionImageGenerateRequest) async throws -> ExtensionImageGenerateResponse {
+        try await request(path: "/v1/extensions/image/generate", method: "POST", body: payload)
+    }
+
     func localChat(_ payload: LocalChatRequest) async throws -> LocalChatResponse {
         try await request(path: "/v1/chat/local", method: "POST", body: payload)
     }
@@ -147,9 +228,13 @@ final class SidecarAPIClient {
         }
         
         return AsyncThrowingStream { continuation in
-            Task {
+            let readerTask = Task {
                 do {
                     for try await line in bytes.lines {
+                        if Task.isCancelled {
+                            continuation.finish()
+                            return
+                        }
                         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !trimmed.isEmpty else { continue }
                         guard let data = trimmed.data(using: .utf8) else { continue }
@@ -157,9 +242,14 @@ final class SidecarAPIClient {
                         continuation.yield(event)
                     }
                     continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
+            }
+            continuation.onTermination = { _ in
+                readerTask.cancel()
             }
         }
     }
@@ -575,5 +665,24 @@ final class SidecarAPIClient {
             let payload = String(data: data, encoding: .utf8) ?? ""
             throw APIError(message: "Decode failed: \(error.localizedDescription). Payload: \(payload)")
         }
+    }
+
+    private func websocketURL(path: String) throws -> URL {
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: true) else {
+            throw APIError(message: "Invalid base URL")
+        }
+        components.path = path
+        switch components.scheme?.lowercased() {
+        case "https":
+            components.scheme = "wss"
+        case "http":
+            components.scheme = "ws"
+        default:
+            break
+        }
+        guard let url = components.url else {
+            throw APIError(message: "Invalid websocket URL path: \(path)")
+        }
+        return url
     }
 }

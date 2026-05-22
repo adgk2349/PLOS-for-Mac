@@ -21,11 +21,11 @@ struct AppLanguage: RawRepresentable, Hashable, Identifiable, Codable {
         switch raw {
         case "", "auto", "system", "default":
             return "auto"
-        case "ko", "ko-kr", "korean", "kor":
+        case "ko", "ko-kr", "korean", "kor", "kr":
             return "kor"
         case "en", "en-us", "english", "eng":
             return "eng"
-        case "ja", "ja-jp", "japanese", "jpn":
+        case "ja", "ja-jp", "japanese", "jpn", "jp":
             return "jpn"
         default:
             return raw
@@ -177,11 +177,11 @@ private final class LanguageRegistry {
     private static func normalizeISO(_ value: String, languageID: String) -> String {
         let raw = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         switch raw {
-        case "ko", "ko-kr":
+        case "ko", "ko-kr", "kr":
             return "ko"
         case "en", "en-us":
             return "en"
-        case "ja", "ja-jp":
+        case "ja", "ja-jp", "jp":
             return "ja"
         default:
             switch languageID {

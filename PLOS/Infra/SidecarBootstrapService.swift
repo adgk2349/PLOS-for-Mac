@@ -3,15 +3,14 @@ import Darwin
 import Foundation
 
 enum SidecarBootstrapService {
-    static func ensureSidecarEnvironment(sidecarDirectory: URL, runtimeDirectory: URL) throws -> SidecarPythonRuntimeConfig {
+    nonisolated static func ensureSidecarEnvironment(sidecarDirectory: URL, runtimeDirectory: URL) throws -> SidecarPythonRuntimeConfig {
         let fm = FileManager.default
+        let includeMLX = shouldInstallMLXSupport()
         let runtimeVenvDirectory = runtimeDirectory.appendingPathComponent(".venv")
         let runtimeVenvPython = runtimeVenvDirectory.appendingPathComponent("bin/python3")
-        let runtimeSitePackages = runtimeDirectory.appendingPathComponent("site-packages")
         let stagedSourceDirectory = runtimeDirectory.appendingPathComponent("staged-sidecar-\(UUID().uuidString)", isDirectory: true)
         let probeDataDirectory = runtimeDirectory.appendingPathComponent("probe-data", isDirectory: true)
         let runtimePackagePythonPath = runtimeDirectory.path
-        let runtimeTargetPythonPath = "\(runtimeSitePackages.path):\(runtimePackagePythonPath)"
         let lockFD = try acquireRuntimeBootstrapLock(runtimeDirectory: runtimeDirectory)
 
         defer { releaseRuntimeBootstrapLock(lockFD) }
@@ -30,7 +29,8 @@ enum SidecarBootstrapService {
         if hasRequiredModules(
             python: runtimeVenvPython.path,
             pythonPath: runtimePackagePythonPath,
-            probeDataDir: probeDataDirectory.path
+            probeDataDir: probeDataDirectory.path,
+            includeMLX: includeMLX
         ) {
             return SidecarPythonRuntimeConfig(pythonExecutable: runtimeVenvPython.path, pythonPath: runtimePackagePythonPath)
         }
@@ -64,25 +64,29 @@ enum SidecarBootstrapService {
                 try installSidecarDependencies(
                     withPython: candidateVenvPython.path,
                     targetPath: nil,
-                    runtimeDirectory: runtimeDirectory
+                    runtimeDirectory: runtimeDirectory,
+                    includeMLX: includeMLX
                 )
 
                 var candidateReady = hasRequiredModules(
                     python: candidateVenvPython.path,
                     pythonPath: runtimePackagePythonPath,
-                    probeDataDir: probeDataDirectory.path
+                    probeDataDir: probeDataDirectory.path,
+                    includeMLX: includeMLX
                 )
                 if !candidateReady {
                     try installSidecarDependencies(
                         withPython: candidateVenvPython.path,
                         targetPath: nil,
                         runtimeDirectory: runtimeDirectory,
+                        includeMLX: includeMLX,
                         force: true
                     )
                     candidateReady = hasRequiredModules(
                         python: candidateVenvPython.path,
                         pythonPath: runtimePackagePythonPath,
-                        probeDataDir: probeDataDirectory.path
+                        probeDataDir: probeDataDirectory.path,
+                        includeMLX: includeMLX
                     )
                 }
 
@@ -91,7 +95,8 @@ enum SidecarBootstrapService {
                     guard hasRequiredModules(
                         python: runtimeVenvPython.path,
                         pythonPath: runtimePackagePythonPath,
-                        probeDataDir: probeDataDirectory.path
+                        probeDataDir: probeDataDirectory.path,
+                        includeMLX: includeMLX
                     ) else {
                         bootstrapErrors.append("\(systemPython): 활성화 후 모듈 점검 실패")
                         continue
@@ -102,48 +107,6 @@ enum SidecarBootstrapService {
             } catch {
                 bootstrapErrors.append("\(systemPython) [venv]: \(error.localizedDescription)")
             }
-
-            do {
-                if fm.fileExists(atPath: runtimeSitePackages.path) {
-                    try? fm.removeItem(at: runtimeSitePackages)
-                }
-                try fm.createDirectory(at: runtimeSitePackages, withIntermediateDirectories: true)
-
-                try installSidecarDependencies(
-                    withPython: systemPython,
-                    targetPath: runtimeSitePackages.path,
-                    runtimeDirectory: runtimeDirectory
-                )
-
-                var targetReady = hasRequiredModules(
-                    python: systemPython,
-                    pythonPath: runtimeTargetPythonPath,
-                    probeDataDir: probeDataDirectory.path
-                )
-                if !targetReady {
-                    try installSidecarDependencies(
-                        withPython: systemPython,
-                        targetPath: runtimeSitePackages.path,
-                        runtimeDirectory: runtimeDirectory,
-                        force: true
-                    )
-                    targetReady = hasRequiredModules(
-                        python: systemPython,
-                        pythonPath: runtimeTargetPythonPath,
-                        probeDataDir: probeDataDirectory.path
-                    )
-                }
-
-                if targetReady {
-                    return SidecarPythonRuntimeConfig(
-                        pythonExecutable: systemPython,
-                        pythonPath: runtimeTargetPythonPath
-                    )
-                }
-                bootstrapErrors.append("\(systemPython) [target]: 설치 후 모듈 점검 실패")
-            } catch {
-                bootstrapErrors.append("\(systemPython) [target]: \(error.localizedDescription)")
-            }
         }
 
         throw APIError(
@@ -151,15 +114,17 @@ enum SidecarBootstrapService {
         )
     }
 
-    static func stageSidecarSource(from sidecarDirectory: URL, to stagedSourceDirectory: URL) throws {
+    nonisolated static func stageSidecarSource(from sidecarDirectory: URL, to stagedSourceDirectory: URL) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: stagedSourceDirectory, withIntermediateDirectories: true)
 
         let packageSource = sidecarDirectory.appendingPathComponent("local_ai_core", isDirectory: true)
         let pyprojectSource = sidecarDirectory.appendingPathComponent("pyproject.toml")
+        let searxngSource = sidecarDirectory.appendingPathComponent("searxng", isDirectory: true)
 
         let packageTarget = stagedSourceDirectory.appendingPathComponent("local_ai_core", isDirectory: true)
         let pyprojectTarget = stagedSourceDirectory.appendingPathComponent("pyproject.toml")
+        let searxngTarget = stagedSourceDirectory.appendingPathComponent("searxng", isDirectory: true)
 
         guard fm.fileExists(atPath: packageSource.path), fm.fileExists(atPath: pyprojectSource.path) else {
             throw APIError(message: "sidecar 소스 파일을 찾지 못했습니다. local_ai_core 또는 pyproject.toml이 없습니다.")
@@ -168,9 +133,12 @@ enum SidecarBootstrapService {
         try copyDirectory(source: packageSource, destination: packageTarget)
         let pyprojectData = try Data(contentsOf: pyprojectSource)
         try pyprojectData.write(to: pyprojectTarget, options: .atomic)
+        if fm.fileExists(atPath: searxngSource.path) {
+            try copyDirectory(source: searxngSource, destination: searxngTarget)
+        }
     }
 
-    static func syncRuntimePackage(stagedSourceDirectory: URL, runtimeDirectory: URL) throws {
+    nonisolated static func syncRuntimePackage(stagedSourceDirectory: URL, runtimeDirectory: URL) throws {
         let fm = FileManager.default
         let stagedPackage = stagedSourceDirectory.appendingPathComponent("local_ai_core", isDirectory: true)
         let runtimePackage = runtimeDirectory.appendingPathComponent("local_ai_core", isDirectory: true)
@@ -178,35 +146,62 @@ enum SidecarBootstrapService {
             try? fm.removeItem(at: runtimePackage)
         }
         try copyDirectory(source: stagedPackage, destination: runtimePackage)
+
+        let stagedSearxng = stagedSourceDirectory.appendingPathComponent("searxng", isDirectory: true)
+        let runtimeSearxng = runtimeDirectory.appendingPathComponent("searxng", isDirectory: true)
+        if fm.fileExists(atPath: stagedSearxng.path) {
+            if fm.fileExists(atPath: runtimeSearxng.path) {
+                try? fm.removeItem(at: runtimeSearxng)
+            }
+            try copyDirectory(source: stagedSearxng, destination: runtimeSearxng)
+        }
     }
 
-    static func installSidecarDependencies(
+    nonisolated static func installSidecarDependencies(
         withPython pythonExecutable: String,
         targetPath: String?,
         runtimeDirectory: URL,
+        includeMLX: Bool,
         force: Bool = false
     ) throws {
         let stampURL = dependencyStampURL(runtimeDirectory: runtimeDirectory, pythonExecutable: pythonExecutable, targetPath: targetPath)
-        let fingerprint = dependencyFingerprint(pythonExecutable: pythonExecutable, targetPath: targetPath)
+        let fingerprint = dependencyFingerprint(pythonExecutable: pythonExecutable, targetPath: targetPath, includeMLX: includeMLX)
         if !force, let existing = try? String(contentsOf: stampURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), existing == fingerprint {
             return
         }
+
+        let dependencies = sidecarPipDependencies(includeMLX: includeMLX)
+        let coreDependencies = dependencies.filter { !$0.hasPrefix("mlx-lm") }
 
         var arguments = ["-m", "pip", "install", "--upgrade"]
         if let targetPath, !targetPath.isEmpty {
             arguments.append(contentsOf: ["--target", targetPath])
         }
-        arguments.append(contentsOf: sidecarPipDependencies())
+        arguments.append(contentsOf: coreDependencies)
         try runCommand(
             executable: pythonExecutable,
             arguments: arguments,
             cwd: nil,
             step: "sidecar 의존성 설치"
         )
+
+        if includeMLX, let mlxDependency = dependencies.first(where: { $0.hasPrefix("mlx-lm") }) {
+            var optionalArguments = ["-m", "pip", "install", "--upgrade"]
+            if let targetPath, !targetPath.isEmpty {
+                optionalArguments.append(contentsOf: ["--target", targetPath])
+            }
+            optionalArguments.append(mlxDependency)
+            try runCommand(
+                executable: pythonExecutable,
+                arguments: optionalArguments,
+                cwd: nil,
+                step: "sidecar 선택 의존성 설치(mlx)"
+            )
+        }
         try fingerprint.write(to: stampURL, atomically: true, encoding: .utf8)
     }
 
-    static func dependencyStampURL(
+    nonisolated static func dependencyStampURL(
         runtimeDirectory: URL,
         pythonExecutable: String,
         targetPath: String?
@@ -219,29 +214,30 @@ enum SidecarBootstrapService {
         return stampDirectory.appendingPathComponent("\(digest).stamp")
     }
 
-    static func dependencyFingerprint(pythonExecutable: String, targetPath: String?) -> String {
+    nonisolated static func dependencyFingerprint(pythonExecutable: String, targetPath: String?, includeMLX: Bool) -> String {
         let lines = [
             "python=\(pythonVersionLabel(pythonExecutable))",
             "target=\(targetPath ?? "")",
-            "deps=\(sidecarPipDependencies().joined(separator: "|"))",
+            "deps=\(sidecarPipDependencies(includeMLX: includeMLX).joined(separator: "|"))",
         ]
         return lines.joined(separator: "\n")
     }
 
-    static func pythonVersionLabel(_ executable: String) -> String {
+    nonisolated static func pythonVersionLabel(_ executable: String) -> String {
         guard let version = pythonVersionTuple(executable) else {
             return executable
         }
         return "\(version.0).\(version.1)"
     }
 
-    static func sidecarPipDependencies() -> [String] {
-        [
+    nonisolated static func sidecarPipDependencies(includeMLX: Bool) -> [String] {
+        var deps = [
             "fastapi>=0.116.0",
             "uvicorn[standard]>=0.35.0",
             "pydantic>=2.8.0",
             "pydantic-settings>=2.3.0",
             "httpx>=0.28.0",
+            "sentry-sdk[fastapi]>=2.20.0",
             "lancedb>=0.22.0",
             "numpy>=2.2.0",
             "pypdf>=5.3.0",
@@ -251,11 +247,35 @@ enum SidecarBootstrapService {
             "pypdfium2>=4.30.0",
             "rapidocr_onnxruntime>=1.4.4",
             "cryptography>=3.1",
-            "huggingface-hub>=0.30.0"
+            // Keep hf-hub below 2.x and verify runtime API compatibility in probe.
+            "huggingface-hub>=0.34.0,<2.0.0",
+            "sentence-transformers>=3.0.0",
+            "llama-cpp-python>=0.3.9"
         ]
+        if includeMLX {
+            deps.append("mlx-lm>=0.31.2")
+        }
+        return deps
     }
 
-    static func copyDirectory(source: URL, destination: URL) throws {
+    nonisolated static func shouldInstallMLXSupport() -> Bool {
+        let overrideRaw = (ProcessInfo.processInfo.environment["LOCAL_AI_FORCE_MLX_LM"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if ["1", "true", "yes", "on"].contains(overrideRaw) {
+            return true
+        }
+        if ["0", "false", "no", "off"].contains(overrideRaw) {
+            return false
+        }
+        #if arch(arm64)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    nonisolated static func copyDirectory(source: URL, destination: URL) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: destination, withIntermediateDirectories: true)
 
@@ -282,7 +302,7 @@ enum SidecarBootstrapService {
         }
     }
 
-    static func acquireRuntimeBootstrapLock(runtimeDirectory: URL) throws -> Int32 {
+    nonisolated static func acquireRuntimeBootstrapLock(runtimeDirectory: URL) throws -> Int32 {
         let fm = FileManager.default
         let lockURL = runtimeDirectory.appendingPathComponent(".bootstrap.lock")
         if !fm.fileExists(atPath: lockURL.path) {
@@ -304,13 +324,13 @@ enum SidecarBootstrapService {
         return fd
     }
 
-    static func releaseRuntimeBootstrapLock(_ fd: Int32) {
+    nonisolated static func releaseRuntimeBootstrapLock(_ fd: Int32) {
         guard fd >= 0 else { return }
         _ = flock(fd, LOCK_UN)
         _ = close(fd)
     }
 
-    static func activateRuntimeVenv(candidateVenvDirectory: URL, runtimeVenvDirectory: URL) throws {
+    nonisolated static func activateRuntimeVenv(candidateVenvDirectory: URL, runtimeVenvDirectory: URL) throws {
         let fm = FileManager.default
         let backupVenvDirectory = runtimeVenvDirectory.deletingLastPathComponent()
             .appendingPathComponent(".venv-backup-\(UUID().uuidString)")
@@ -337,34 +357,15 @@ enum SidecarBootstrapService {
         }
     }
 
-    static func prepareRuntimeDirectory(preferredDirectory: URL? = nil) throws -> URL {
+    nonisolated static func prepareRuntimeDirectory(preferredDirectory: URL? = nil) throws -> URL {
         let fm = FileManager.default
         var candidates: [URL] = []
 
         if let preferredDirectory {
-            candidates.append(preferredDirectory.standardizedFileURL)
+            candidates = [preferredDirectory.standardizedFileURL]
+        } else {
+            throw APIError(message: "런타임 디렉터리가 지정되지 않았습니다. 단일 런타임 폴더 경로를 설정해 주세요.")
         }
-
-        if let appSupportBase = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-            candidates.append(
-                appSupportBase
-                    .appendingPathComponent("LocalAICore", isDirectory: true)
-                    .appendingPathComponent("SidecarRuntime", isDirectory: true)
-            )
-        }
-
-        candidates.append(
-            fm.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support", isDirectory: true)
-                .appendingPathComponent("LocalAICore", isDirectory: true)
-                .appendingPathComponent("SidecarRuntime", isDirectory: true)
-        )
-
-        candidates.append(
-            fm.temporaryDirectory
-                .appendingPathComponent("LocalAICore", isDirectory: true)
-                .appendingPathComponent("SidecarRuntime", isDirectory: true)
-        )
 
         var deduped: [URL] = []
         var seen = Set<String>()
@@ -391,10 +392,11 @@ enum SidecarBootstrapService {
         throw APIError(message: "sidecar runtime 디렉터리를 생성하지 못했습니다.\n\(errors.joined(separator: "\n"))")
     }
 
-    static func hasRequiredModules(
+    nonisolated static func hasRequiredModules(
         python: String,
         pythonPath: String?,
-        probeDataDir: String
+        probeDataDir: String,
+        includeMLX: Bool
     ) -> Bool {
         do {
             var overrides: [String: String] = [
@@ -404,11 +406,12 @@ enum SidecarBootstrapService {
             if let pythonPath, !pythonPath.isEmpty {
                 overrides["PYTHONPATH"] = pythonPath
             }
+            let mlxProbe = includeMLX ? "; u.find_spec('mlx_lm')" : ""
             try runCommand(
                 executable: python,
                 arguments: [
                     "-c",
-                    "import importlib.util as u, inspect; import uvicorn, fastapi, httpx, pydantic, lancedb, local_ai_core.main as m; assert u.find_spec('pypdf') or u.find_spec('PyPDF2') or u.find_spec('pypdfium2'); assert u.find_spec('cryptography'); assert u.find_spec('huggingface_hub'); assert u.find_spec('rapidocr_onnxruntime'); src=inspect.getsource(m.create_app); assert '/v1/docs' in src and '/v1/models/download' in src and '/v1/models/catalog' in src"
+                    "import importlib.util as u, inspect; import uvicorn, fastapi, httpx, pydantic, lancedb, local_ai_core.main as m; assert u.find_spec('pypdf') or u.find_spec('PyPDF2') or u.find_spec('pypdfium2'); assert u.find_spec('cryptography'); assert u.find_spec('huggingface_hub'); from huggingface_hub.utils import get_session; assert callable(get_session); assert u.find_spec('rapidocr_onnxruntime'); assert u.find_spec('sentence_transformers'); assert u.find_spec('llama_cpp')\(mlxProbe); src=inspect.getsource(m.create_app); assert '/v1/docs' in src and '/v1/models/download' in src and '/v1/models/catalog' in src"
                 ],
                 cwd: nil,
                 step: "sidecar 모듈 점검",
@@ -420,7 +423,7 @@ enum SidecarBootstrapService {
         }
     }
 
-    static func resolveSystemPythonExecutables() -> [String] {
+    nonisolated static func resolveSystemPythonExecutables() -> [String] {
         let fm = FileManager.default
         let candidates = [
             "/opt/homebrew/bin/python3.11",
@@ -446,7 +449,7 @@ enum SidecarBootstrapService {
         return valid
     }
 
-    static func isRunnablePythonExecutable(_ path: String) -> Bool {
+    nonisolated static func isRunnablePythonExecutable(_ path: String) -> Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: path), fm.isExecutableFile(atPath: path) else {
             return false
@@ -467,7 +470,7 @@ enum SidecarBootstrapService {
         return process.terminationStatus == 0
     }
 
-    static func pythonVersionTuple(_ path: String) -> (Int, Int)? {
+    nonisolated static func pythonVersionTuple(_ path: String) -> (Int, Int)? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = [
@@ -497,7 +500,7 @@ enum SidecarBootstrapService {
         return (major, minor)
     }
 
-    static func runCommand(
+    nonisolated static func runCommand(
         executable: String,
         arguments: [String],
         cwd: URL?,

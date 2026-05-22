@@ -2,6 +2,16 @@ import Darwin
 import Foundation
 
 enum SidecarPortService {
+    private static func shouldPreemptConflictingSidecar() -> Bool {
+        let raw = (ProcessInfo.processInfo.environment["LOCAL_AI_PREEMPT_CONFLICTING_SIDECAR"] ?? "1")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if ["0", "false", "no", "off"].contains(raw) {
+            return false
+        }
+        return true
+    }
+
     static func portCandidates(preferred: Int) -> [Int] {
         var ports = [preferred]
         let fallback = [8777, 8787, 8797, 8807, 8817, 8827]
@@ -77,6 +87,7 @@ enum SidecarPortService {
     static func terminateStaleRuntimeSidecars(runtimeDirectory: URL, ports: [Int]) {
         var visited = Set<Int32>()
         let runtimePath = runtimeDirectory.standardizedFileURL.path
+        let preemptConflicting = shouldPreemptConflictingSidecar()
 
         for port in ports {
             let pids = listeningPIDs(on: port)
@@ -86,16 +97,37 @@ enum SidecarPortService {
                     continue
                 }
                 guard let cwd = processCurrentDirectory(pid: pid) else {
+                    if preemptConflicting {
+                        _ = kill(pid, SIGTERM)
+                    }
                     continue
                 }
-                if URL(fileURLWithPath: cwd).standardizedFileURL.path != runtimePath {
+                let normalizedCWD = URL(fileURLWithPath: cwd).standardizedFileURL.path
+                if normalizedCWD == runtimePath {
+                    _ = kill(pid, SIGTERM)
                     continue
                 }
-                _ = kill(pid, SIGTERM)
+                if preemptConflicting {
+                    _ = kill(pid, SIGTERM)
+                }
             }
         }
 
         usleep(200_000)
+
+        // Escalate to SIGKILL when conflicting processes survive graceful termination.
+        if preemptConflicting {
+            for port in ports {
+                for pid in listeningPIDs(on: port) where visited.contains(pid) {
+                    let command = processCommandLine(pid: pid).lowercased()
+                    guard command.contains("uvicorn local_ai_core.main:app") else {
+                        continue
+                    }
+                    _ = kill(pid, SIGKILL)
+                }
+            }
+            usleep(120_000)
+        }
     }
 
     static func listeningPIDs(on port: Int) -> [Int32] {

@@ -6,6 +6,7 @@
   "is_default": true,
   "strings": {
     "settings.title": "設定",
+    "chat.empty_response_fallback": "応答が途中で空のまま終了しました。もう一度お試しください。",
     "settings.language.option.auto": "自動",
     "privacy_mode.local_only": "ローカルのみ",
     "privacy_mode.hybrid": "ハイブリッド",
