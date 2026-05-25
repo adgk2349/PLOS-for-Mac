@@ -157,8 +157,8 @@ class GeneralChatUtilityMixin:
             return {"temperature": 0.34, "top_p": 0.88, "top_k": 28, "repeat_penalty": 1.14}
         if normalized_profile == "concise":
             if attempt_index <= 0:
-                return {"temperature": 0.52, "top_p": 0.90, "top_k": 36, "repeat_penalty": 1.16}
-            return {"temperature": 0.48, "top_p": 0.88, "top_k": 32, "repeat_penalty": 1.15}
+                return {"temperature": 0.34, "top_p": 0.84, "top_k": 24, "repeat_penalty": 1.18}
+            return {"temperature": 0.30, "top_p": 0.82, "top_k": 22, "repeat_penalty": 1.18}
         if normalized_profile == "analytic":
             if attempt_index <= 0:
                 return {"temperature": 0.50, "top_p": 0.92, "top_k": 38, "repeat_penalty": 1.16}

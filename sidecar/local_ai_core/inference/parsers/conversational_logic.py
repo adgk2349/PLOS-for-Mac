@@ -16,6 +16,18 @@ if TYPE_CHECKING:
 # Component: conversational_logic.py
 class ConversationalLogic(BaseDelegate):
     @staticmethod
+    def _looks_user_role_confusion_answer(text: str) -> bool:
+        value = str(text or "").strip()
+        if not value:
+            return False
+        lowered = value.lower()
+        if lowered.startswith("오늘은") and lowered.endswith("?"):
+            if re.search(r"(추천해\s*줄래요|알려\s*줄래요|정해\s*줄래요|해\s*줄래요|해줄래요)\??$", value):
+                return True
+        if re.search(r"(추천해\s*줄래요|알려\s*줄래요|정해\s*줄래요|해\s*줄래요|해줄래요)\??$", value):
+            return True
+        return False
+    @staticmethod
     def _is_action_request_query(query: str) -> bool:
         lowered = str(query or "").strip().lower()
         if not lowered:
@@ -309,7 +321,7 @@ class ConversationalLogic(BaseDelegate):
 
         # Model-native fallback: if we have a non-empty primary answer and no critical leak,
         # prefer returning it over forcing quality-guard retry loops.
-        if answer and not leak_blocked:
+        if answer and not leak_blocked and not hard_issues:
             return _ConversationCandidateResult(
                 answer=answer,
                 rewrite_used=rewrite_used,
@@ -326,40 +338,44 @@ class ConversationalLogic(BaseDelegate):
                 ),
             )
 
-        last_resort = self._generate_last_resort_direct_answer(
-            engine=engine,
-            query=query,
-            response_language=response_language,
-            profile=profile,
-            mlx_model_path=mlx_model_path,
-            llama_model_path=llama_model_path,
-            max_tokens=max_tokens,
-        )
-        if last_resort and self._looks_conversational_answer(
-            last_resort,
-            response_language=response_language,
-            query=query,
-        ):
-            final_answer = last_resort
-            question_count = self._question_sentence_count(final_answer)
-            recommendation_shape = (
-                "three_options"
-                if is_recommendation_query and self._looks_three_option_shape(final_answer)
-                else None
+        last_resort_enabled = str(
+            os.getenv("LOCAL_AI_CONVERSATION_LAST_RESORT_ENABLED", "0") or "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if last_resort_enabled:
+            last_resort = self._generate_last_resort_direct_answer(
+                engine=engine,
+                query=query,
+                response_language=response_language,
+                profile=profile,
+                mlx_model_path=mlx_model_path,
+                llama_model_path=llama_model_path,
+                max_tokens=max_tokens,
             )
-            return _ConversationCandidateResult(
-                answer=final_answer,
-                rewrite_used=rewrite_used,
-                quality_repair_reason="|".join(
-                    [item for item in [repair_reason, "last_resort_direct"] if item][:2]
-                ),
-                repair_triggered=True,
-                repair_success=True,
-                leak_blocked=leak_blocked,
-                direct_first_applied=True,
-                question_count_after_postprocess=question_count,
-                recommendation_shape=recommendation_shape,
-            )
+            if last_resort and self._looks_conversational_answer(
+                last_resort,
+                response_language=response_language,
+                query=query,
+            ):
+                final_answer = last_resort
+                question_count = self._question_sentence_count(final_answer)
+                recommendation_shape = (
+                    "three_options"
+                    if is_recommendation_query and self._looks_three_option_shape(final_answer)
+                    else None
+                )
+                return _ConversationCandidateResult(
+                    answer=final_answer,
+                    rewrite_used=rewrite_used,
+                    quality_repair_reason="|".join(
+                        [item for item in [repair_reason, "last_resort_direct"] if item][:2]
+                    ),
+                    repair_triggered=True,
+                    repair_success=True,
+                    leak_blocked=leak_blocked,
+                    direct_first_applied=True,
+                    question_count_after_postprocess=question_count,
+                    recommendation_shape=recommendation_shape,
+                )
 
         clarification_enabled = str(
             os.getenv("LOCAL_AI_CONVERSATION_CLARIFICATION_FALLBACK_ENABLED", "0") or "0"
@@ -413,10 +429,17 @@ class ConversationalLogic(BaseDelegate):
         hard = {
             "meta_leak",
             "context_leak",
+            "clarification_template_leak",
+            "meta_only_ack",
+            "role_confusion",
+            "leading_fragment",
             "pathological_repetition",
             "query_echo_hard",
             "stale_user_echo",
             "language_mismatch",
+            "avoidable_clarification",
+            "continuation_artifact",
+            "comma_loop_artifact",
         }
         return [item for item in issues if item in hard]
 
@@ -597,10 +620,15 @@ class ConversationalLogic(BaseDelegate):
         if not cleaned:
             return ["empty"]
         issues: list[str] = []
+        lowered_clean = cleaned.lower()
         if self._looks_instructional_meta_response(cleaned):
             issues.append("meta_leak")
         if self._contains_context_leak_phrase(cleaned):
             issues.append("context_leak")
+        if "continuation:" in lowered_clean or ":pleaseprovidethetextyouwouldlikemetocontinue." in lowered_clean:
+            issues.append("continuation_artifact")
+        if re.search(r"(?:,\s*){5,}", cleaned):
+            issues.append("comma_loop_artifact")
         if self._has_duplicate_sentences(cleaned):
             issues.append("duplicate_sentence")
         if self._has_pathological_repetition(cleaned):
@@ -614,6 +642,12 @@ class ConversationalLogic(BaseDelegate):
             issues.append("leading_fragment")
         if self._looks_clarification_template_leak(cleaned):
             issues.append("clarification_template_leak")
+        if self._looks_avoidable_clarification_answer(query=query, answer=cleaned):
+            issues.append("avoidable_clarification")
+        if re.match(r"^\s*한\s*번에\s*(?:바로\s*)?(?:본문만\s*)?(?:출력|정리|답변)\s*(?:할게요|해볼게요|드릴게요|해드릴게요)\.?\s*$", cleaned):
+            issues.append("meta_only_ack")
+        if self._looks_user_role_confusion_answer(cleaned):
+            issues.append("role_confusion")
         
         if response_language == "ko":
             ko_chars = len(re.findall(r"[가-힣]", cleaned))
@@ -631,10 +665,41 @@ class ConversationalLogic(BaseDelegate):
         return issues
 
     @staticmethod
+    def _looks_avoidable_clarification_answer(*, query: str, answer: str) -> bool:
+        q = str(query or "").strip().lower()
+        a = str(answer or "").strip().lower()
+        if not q or not a:
+            return False
+        direct_task_request = bool(
+            any(token in q for token in ("정리해줘", "정리", "요약", "뽑아줘", "추천해줘", "알려줘"))
+            and any(token in q for token in ("3개", "세 개", "두 개", "한 줄", "짧게", "간단히"))
+        )
+        if not direct_task_request:
+            return False
+        clarification_markers = (
+            "알려주시면",
+            "말씀해주시면",
+            "구체적으로",
+            "어떤",
+            "무엇을",
+            "어떤 종류",
+            "더 알려",
+            "provide",
+            "tell me",
+            "which one",
+        )
+        if any(marker in a for marker in clarification_markers):
+            has_answer_shape = bool(re.search(r"(?:^|\n)\s*(?:1[.)]|-|\*)\s+", answer))
+            return not has_answer_shape
+        return False
+
+    @staticmethod
     def _looks_leading_fragment(text: str) -> bool:
         value = str(text or "").strip()
         if not value:
             return False
+        if re.match(r"^(?:으로는|로는|에는|에서는|와는|과는)\s+", value):
+            return True
         return bool(
             re.match(
                 r"^(?:께(?:서는|요)?|을|를|이|가|은|는|도)\s*(?:붙여드리겠습니다|도와드리겠습니다|안내해드리겠습니다|질문하신|오늘|집중)",
@@ -658,6 +723,10 @@ class ConversationalLogic(BaseDelegate):
             return True
         if "please provide" in lowered and "1." in lowered and "2." in lowered:
             return True
+        if "한 번에 바로 본문만 출력할게요" in value or "바로 본문만 출력할게요" in value:
+            return True
+        if re.match(r"^\s*한\s*번에\s*.*(?:답변|정리).*(?:드릴게요|해드릴게요)\.?\s*$", value):
+            return True
         return False
 
     def _korean_quality_issues(self, *, query: str, answer: str, response_language: str) -> list[str]:
@@ -672,6 +741,8 @@ class ConversationalLogic(BaseDelegate):
     def _minimal_safe_conversation_answer(self, *, query: str, response_language: str) -> str:
         lowered = (query or "").strip().lower()
         if response_language == "ko":
+            if re.search(r"(내일|오늘).*(할\s*일|할일).*(3개|세\s*개)", query):
+                return "1. 내일 가장 중요한 일 1개를 먼저 끝내기.\n2. 25분 집중 + 5분 휴식으로 두 번 진행하기.\n3. 마감 10분 전에 결과 점검하고 정리하기."
             if any(token in lowered for token in ("뭐 먹", "메뉴", "점심", "저녁", "아침", "먹을")):
                 return "지금은 속이 편한 메뉴 한 가지(국밥, 죽, 비빔밥 중 하나)로 고르는 게 가장 무난해요."
             if any(token in lowered for token in ("몇 시", "몇시", "자야", "수면", "잠")):

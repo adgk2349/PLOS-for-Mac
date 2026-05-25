@@ -46,6 +46,86 @@ from ...answer_contract import (
 
 class GeneralChatConversationMixin:
     @staticmethod
+    def _token_set(text: str) -> set[str]:
+        tokens = re.findall(r"[A-Za-z0-9가-힣]+", str(text or "").lower())
+        return {t for t in tokens if len(t) >= 2}
+
+    @classmethod
+    def _simple_similarity(cls, a: str, b: str) -> float:
+        ta = cls._token_set(a)
+        tb = cls._token_set(b)
+        if not ta or not tb:
+            return 0.0
+        inter = len(ta.intersection(tb))
+        union = len(ta.union(tb))
+        return (inter / union) if union else 0.0
+
+    @classmethod
+    def _detect_topic_shift(cls, *, query: str, recent_user_turns: list[str]) -> bool:
+        q = str(query or "").strip()
+        if not q or not recent_user_turns:
+            return False
+        recent = [str(item or "").strip() for item in recent_user_turns if str(item or "").strip()]
+        if not recent:
+            return False
+        last_user = recent[-1]
+        sim_last = cls._simple_similarity(q, last_user)
+        best_recent = max((cls._simple_similarity(q, item) for item in recent[-4:]), default=0.0)
+        return sim_last <= 0.16 and best_recent <= 0.22
+
+    @classmethod
+    def _select_anchor_user_turn(cls, *, query: str, recent_user_turns: list[str]) -> str:
+        q = str(query or "").strip()
+        if not q:
+            return ""
+        best_text = ""
+        best_score = -1.0
+        for text in recent_user_turns[-6:]:
+            candidate = str(text or "").strip()
+            if not candidate:
+                continue
+            score = cls._simple_similarity(q, candidate)
+            if score > best_score:
+                best_score = score
+                best_text = candidate
+        return best_text if best_score >= 0.18 else ""
+
+    @staticmethod
+    def _is_direct_enumeration_request(query: str) -> bool:
+        lowered = str(query or "").strip().lower()
+        if not lowered:
+            return False
+        has_action = any(token in lowered for token in ("정리해줘", "정리", "요약", "뽑아줘", "추천해줘", "알려줘"))
+        has_count = bool(re.search(r"(?:\b[2-5]\b|2개|3개|4개|5개|두\s*개|세\s*개|네\s*개|다섯\s*개)", lowered))
+        return has_action and has_count
+
+    @staticmethod
+    def _extract_requested_count(query: str) -> int | None:
+        lowered = str(query or "").strip().lower()
+        if not lowered:
+            return None
+        match = re.search(r"\b([2-5])\b", lowered)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+        mapping = {
+            "2개": 2,
+            "3개": 3,
+            "4개": 4,
+            "5개": 5,
+            "두 개": 2,
+            "세 개": 3,
+            "네 개": 4,
+            "다섯 개": 5,
+        }
+        for token, value in mapping.items():
+            if token in lowered:
+                return value
+        return None
+
+    @staticmethod
     def _is_fast_chat_query(query: str) -> bool:
         text = str(query or "").strip()
         if not text:
@@ -193,9 +273,10 @@ class GeneralChatConversationMixin:
         # Inject conversation history from session_digest into MessageState.
         # L2: rolling_summary (compressed older turns) → injected as system message first.
         # L1: recent verbatim turns → injected as user/assistant messages.
-        # Default: keep last 4 turn-pairs (= 8 messages). Tunable via env var.
-        _max_history_turns = int(str(os.getenv("LOCAL_AI_HISTORY_TURNS", "4")).strip() or "4")
+        # Default: keep last 6 turn-pairs (= 12 messages). Tunable via env var.
+        _max_history_turns = int(str(os.getenv("LOCAL_AI_HISTORY_TURNS", "6")).strip() or "6")
         dangling_user_text = ""
+        recent_user_turns: list[str] = []
         try:
             digest_obj = getattr(context, "session_digest_payload", None)
             if not digest_obj:
@@ -259,6 +340,7 @@ class GeneralChatConversationMixin:
                         if not text:
                             continue
                         if role == "user":
+                            recent_user_turns.append(text)
                             state.add_user(text)
                         elif role == "assistant":
                             state.add_assistant(text)
@@ -266,7 +348,41 @@ class GeneralChatConversationMixin:
             pass
 
         if dangling_user_text:
-            query = dangling_user_text + "\n\n" + str(query or "")
+            recent_user_turns.append(dangling_user_text)
+            current_query = str(query or "")
+            sim = self._simple_similarity(dangling_user_text, current_query)
+            followup_like = bool(
+                re.search(r"(그거|이거|저거|방금|아까|이어|계속|that|this|previous|continue)", current_query.lower())
+            )
+            # Merge only when the current turn clearly continues the dangling user turn.
+            # Blind merge can pollute the current query and cause context drift.
+            if sim >= 0.18 or followup_like:
+                query = dangling_user_text + "\n\n" + current_query
+
+        anchor_user_turn = self._select_anchor_user_turn(
+            query=str(query or ""),
+            recent_user_turns=recent_user_turns,
+        )
+        if anchor_user_turn:
+            state.add_system(
+                "Primary context anchor: prioritize this user intent when answering current message.\n"
+                f"- anchor_user: {anchor_user_turn[:180]}"
+            )
+
+        if self._detect_topic_shift(query=str(query or ""), recent_user_turns=recent_user_turns):
+            state.add_system(
+                "Topic shift detected: answer only the current user message. "
+                "Do not reuse prior topic suggestions unless the user explicitly asks to continue them."
+            )
+
+        if self._is_direct_enumeration_request(str(query or "")):
+            requested_count = self._extract_requested_count(str(query or ""))
+            count_clause = f"exactly {requested_count} items" if requested_count else "the requested number of items"
+            state.add_system(
+                "Direct task request detected: provide the list immediately with "
+                f"{count_clause}. Do not ask a clarification question and do not defer."
+            )
+
         state.add_user(str(query or ""))
 
         prompt_preset_enabled = str(os.getenv("LOCAL_AI_MODEL_PROMPT_PRESET_ENABLED", "0") or "0").strip().lower() in {

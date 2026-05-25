@@ -131,6 +131,20 @@ _SUMMARY_ACTION_TOKENS = (
     "summarize",
     "key point",
 )
+_CONVERSATIONAL_SUMMARY_CUES = (
+    "할 일",
+    "할일",
+    "to do",
+    "todo",
+    "일정",
+    "플랜",
+    "계획",
+    "우선순위",
+    "내일",
+    "오늘",
+    "이번 주",
+    "이번주",
+)
 _TARGET_NOISE = {
     *_STOPWORDS,
     "전체",
@@ -210,7 +224,7 @@ class IntentParser:
         if any(token in lowered_query for token in ("그거 말고", "다른 거", "다음 거", "other one", "next one")):
             return ReasoningIntent.NEXT_CANDIDATE
 
-        if any(
+        lightweight_action_hit = any(
             token in lowered_query
             for token in (
                 "요약만",
@@ -227,8 +241,22 @@ class IntentParser:
                 "open it",
                 "follow-up questions",
             )
-        ):
-            return ReasoningIntent.LIGHTWEIGHT_ACTION_REQUEST
+        )
+        if lightweight_action_hit:
+            # Guardrail: generic suggestion requests ("~ 제안해줘") are often
+            # conversational and should not be forced into local_rag actions.
+            if (
+                "제안해줘" in lowered_query
+                and not IntentParser._has_file_target_token(lowered_query)
+                and not IntentParser._has_explicit_find_request(lowered_query)
+                and not IntentParser._has_explicit_summary_request(lowered_query)
+            ):
+                pass
+            else:
+                return ReasoningIntent.LIGHTWEIGHT_ACTION_REQUEST
+
+        if IntentParser._is_general_chat(lowered_query):
+            return ReasoningIntent.GENERAL_CHAT
 
         if (
             re.search(r"([1-9]|1[0-9]|2[0-4])\s*주차", lowered_query) is not None
@@ -270,9 +298,6 @@ class IntentParser:
         file_find_clues = ("find", "locate", "where", "찾아", "어디", "경로")
         if any(clue in lowered_query for clue in file_find_clues) and IntentParser._has_file_target_token(lowered_query):
             return ReasoningIntent.FIND_FILE
-
-        if IntentParser._is_general_chat(lowered_query):
-            return ReasoningIntent.GENERAL_CHAT
 
         return ReasoningIntent.EXPLAIN_CONTENT
 
@@ -411,10 +436,16 @@ class IntentParser:
     @staticmethod
     def _has_explicit_summary_request(lowered_query: str) -> bool:
         has_summary_action = any(token in lowered_query for token in _SUMMARY_ACTION_TOKENS)
-        if has_summary_action and (IntentParser._has_file_target_token(lowered_query) or len(lowered_query.split()) >= 2):
+        has_file_target = IntentParser._has_file_target_token(lowered_query)
+        conversational_summary = any(token in lowered_query for token in _CONVERSATIONAL_SUMMARY_CUES)
+        # "정리/요약" can be conversational ("내일 할 일 정리해줘"), not file-summary.
+        # Require explicit file/document target for summarize-file routing.
+        if has_summary_action and has_file_target:
             return True
+        if has_summary_action and conversational_summary and not has_file_target:
+            return False
         important_clues = ("중요", "important", "시험", "what mattered")
-        if any(token in lowered_query for token in important_clues) and IntentParser._has_file_target_token(lowered_query):
+        if any(token in lowered_query for token in important_clues) and has_file_target:
             return True
         return False
 
