@@ -169,6 +169,15 @@ def test_postprocess_conversational_answer_dedupes_adjacent_repeat():
     )
     assert cleaned.count("자연스럽게 말하려고 해요") == 1
 
+def test_postprocess_conversational_answer_collapses_comma_loop():
+    cleaned = LocalInferenceEngine._postprocess_conversational_answer(
+        "말씀하세요. 귀 기울여 들을게요,,,,,,,",
+        query="고민이 있는데 들어줄 수 있나",
+        response_language="ko",
+    )
+    assert ",,,,," not in cleaned
+    assert cleaned.endswith(".")
+
 def test_postprocess_conversational_answer_limits_questions_to_one():
     cleaned = LocalInferenceEngine._postprocess_conversational_answer(
         "어떤 메뉴 좋아하세요? 어떤 종류를 생각 중이세요? 김치찌개가 무난해요.",

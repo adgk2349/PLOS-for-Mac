@@ -1142,13 +1142,13 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
             return True
         if cls._looks_like_instruction_leak(cleaned):
             return True
-        if cls._has_duplicate_sentence(cleaned):
-            return True
+        # Prefer preserving assistant turns in digest unless corruption is severe.
         if cls._is_high_repetition_text(cleaned):
             return True
-        if cls._looks_like_open_loop(cleaned):
-            return True
-        if cls._token_overlap(cleaned, user_query) >= 0.82 and len(cleaned) <= 220:
+        # Keep conversationally open assistant turns in digest so
+        # short follow-ups (e.g., "방금 답변 한 줄로") can summarize
+        # the actual immediately previous response instead of stale context.
+        if cls._token_overlap(cleaned, user_query) >= 0.92 and len(cleaned) <= 120:
             return True
         if cls._contains_context_leak_phrase(cleaned):
             return True

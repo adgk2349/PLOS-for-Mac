@@ -14,6 +14,52 @@ if TYPE_CHECKING:
 
 # Component: result_sanitizer.py
 class ResultSanitizer(BaseDelegate):
+    @staticmethod
+    def _strip_query_echo_prefix(text: str, query: str) -> str:
+        value = str(text or "").strip()
+        q = str(query or "").strip()
+        if not value or not q:
+            return value
+        q_compact = re.sub(r"\s+", "", q)
+        if len(q_compact) < 6:
+            return value
+        # Remove exact query echo at the beginning, but keep any useful suffix
+        # that follows on the same line.
+        patterns = [
+            rf"^\s*{re.escape(q)}\s*[:：,\-]?\s*",
+            rf"^\s*{re.escape(q_compact)}\s*[:：,\-]?\s*",
+        ]
+        for pattern in patterns:
+            updated = re.sub(pattern, "", value)
+            if updated != value and updated.strip():
+                return updated.strip()
+        # Handle first-line echo without dropping the whole first line.
+        lines = value.split("\n")
+        if lines:
+            first = lines[0].strip()
+            first_compact = re.sub(r"\s+", "", first)
+            if first_compact.startswith(q_compact):
+                suffix = first_compact[len(q_compact):].strip(" :：,-")
+                if suffix:
+                    lines[0] = suffix
+                    return "\n".join([ln for ln in lines if str(ln).strip()]).strip()
+                if len(lines) > 1:
+                    return "\n".join([ln for ln in lines[1:] if str(ln).strip()]).strip()
+        return value
+
+    @staticmethod
+    def _collapse_punctuation_loops(text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        # Collapse runaway comma sequences like ",,,,,,," into a single comma.
+        value = re.sub(r"(?:,\s*){3,}", ", ", value)
+        # Normalize repeated terminal punctuation.
+        value = re.sub(r"([.!?])(?:\s*\1){2,}", r"\1", value)
+        # If content ends with a dangling comma, finish as a sentence for UX.
+        value = re.sub(r",\s*$", ".", value)
+        value = re.sub(r"\s{2,}", " ", value).strip()
+        return value
 
     @staticmethod
     def _normalize_korean_leading_address(text: str) -> str:
@@ -24,6 +70,15 @@ class ResultSanitizer(BaseDelegate):
         # model artifact and degrades conversational tone.
         value = re.sub(r"^\s*께서는\s+", "", value).strip()
         value = re.sub(r"^\s*당신은\s+", "", value).strip()
+        # Repair common broken Korean leading fragments.
+        if re.match(r"^\s*로는\s+", value):
+            value = re.sub(r"^\s*로는\s+", "제 기준으로는 ", value).strip()
+        elif re.match(r"^\s*으로는\s+", value):
+            value = re.sub(r"^\s*으로는\s+", "제 기준으로는 ", value).strip()
+        elif re.match(r"^\s*에는\s+", value):
+            value = re.sub(r"^\s*에는\s+", "이 경우에는 ", value).strip()
+        elif re.match(r"^\s*에서는\s+", value):
+            value = re.sub(r"^\s*에서는\s+", "이 상황에서는 ", value).strip()
         return value
     @staticmethod
     def _heuristic_korean_spacing(text: str) -> str:
@@ -195,6 +250,17 @@ class ResultSanitizer(BaseDelegate):
         return "\n".join(lines).strip()
 
     def _postprocess_conversational_answer(self, answer: str, *, query: str, response_language: str) -> str:
+        def _strip_meta_preamble(value: str) -> str:
+            text = str(value or "").strip()
+            if not text:
+                return ""
+            text = re.sub(
+                r"^\s*한\s*번에\s*(?:바로\s*)?(?:본문만\s*출력|실행\s*가능한\s*답변|딱\s*맞는\s*답변?)\s*을?\s*(?:드릴게요|해드릴게요)\.?\s*",
+                "",
+                text,
+            ).strip()
+            return text
+
         raw_pass_mode = str(os.getenv("LOCAL_AI_CONVERSATION_RAW_PASS_ENABLED", "0") or "0").strip().lower() in {
             "1", "true", "yes", "on"
         }
@@ -228,13 +294,11 @@ class ResultSanitizer(BaseDelegate):
             text = re.sub(r"(?im)^\s*(?:user|assistant|사용자|어시스턴트)\s*[:：]\s*", "", text).strip()
             # Guard: if the answer is a near-verbatim copy of recent history,
             # find and remove the echoed prefix (up to 120 chars).
-            if "\n" in text:
-                first_line = text.split("\n")[0].strip()
-                if len(first_line) >= 8 and self._is_hard_query_echo(first_line, query):
-                    text = "\n".join(text.split("\n")[1:]).strip()
+            text = self._strip_query_echo_prefix(text, query)
             # Keep model-native wording; only reject obvious hard prompt echo.
             if len(re.sub(r"\s+", "", query or "")) >= 10 and self._is_hard_query_echo(text, query):
                 return ""
+            text = _strip_meta_preamble(text)
             return self._normalize_korean_leading_address(text)
 
         light_postprocess = str(os.getenv("LOCAL_AI_CONVERSATION_LIGHT_POSTPROCESS", "0") or "0").strip().lower() in {
@@ -299,6 +363,7 @@ class ResultSanitizer(BaseDelegate):
                     if ko_chars >= 24 and len(re.findall(r"\s+", fallback)) <= 1 and len(fallback) >= 40:
                         fallback = self._heuristic_korean_spacing(fallback)
                 return self._normalize_korean_leading_address(fallback[:320].strip())
+            text = _strip_meta_preamble(text)
             return self._normalize_korean_leading_address(text)
 
         minimal_mode = str(os.getenv("LOCAL_AI_MINIMAL_POSTPROCESS", "0") or "0").strip().lower() in {
@@ -371,6 +436,7 @@ class ResultSanitizer(BaseDelegate):
                 if en_words >= 8 and ko_chars < 6:
                     return ""
             text = re.sub(r"\s{2,}", " ", text).strip()
+            text = _strip_meta_preamble(text)
             return self._normalize_korean_leading_address(text)
 
         text = (answer or "").strip()
@@ -386,6 +452,7 @@ class ResultSanitizer(BaseDelegate):
             return text
         text = re.sub(r"\.\s*입니다\.$", ".", text)
         text = re.sub(r"\s{2,}", " ", text).strip()
+        text = self._collapse_punctuation_loops(text)
         text = re.sub(r"(?im)^\s*(?:최종\s*답변|final\s*answer)\s*[:：]\s*", "", text).strip()
         text = re.sub(r"(?i)\bokay,\s*let\s*me\s*process\s*this\.?\s*", "", text).strip()
         text = re.sub(r"(?i)\bthat'?s\s*straightforward\.?\s*", "", text).strip()
@@ -404,6 +471,8 @@ class ResultSanitizer(BaseDelegate):
         text = re.sub(r"최대한\s*짧고\s*명확하게\s*답하세요\.?\s*", "", text).strip()
         text = self._dedupe_conversation_sentences(text)
         text = self._limit_question_sentences(text, max_questions=1)
+        text = self._collapse_punctuation_loops(text)
+        text = _strip_meta_preamble(text)
         if not text:
             return ""
 
