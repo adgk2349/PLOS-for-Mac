@@ -18,3 +18,42 @@ sidecar/sidecar/
 sidecar/local_ai_core_sidecar.egg-info/
 PLOS.xcodeproj/xcuserdata/
 data/
+
+# local experiment/runtime artifacts
+.tmp-*/
+tmp/
+scratch/
+results/
+*.log
+*_pid*.txt
+generation_*.txt
+
+# sidecar local artifacts
+sidecar/tmp/
+sidecar/scratch/
+sidecar/server_*.log
+sidecar/server_*.pid
+sidecar/stream_turn_report_*.json
+sidecar/real_conversation_report_*.json
+
+# editor/local workspace settings
+.vscode/
+
+# local benchmark/simulation artifacts
+bench_test_ref.json*
+mini_ref.json
+mini_hyp.json
+sampled_questions.json
+sidecar_sample_bench.py
+test_memory_ingestion.py
+test_openai_client.py
+final_system_check.py
+mini_generate_hyp.py
+
+# local R&D notes/templates (not for release by default)
+PLUGIN_*_DESIGN.md
+PLUGIN_RUNTIME_SPEC.md
+PROJECT_VALUATION_REPORT_*.md
+plugin_templates/
+longmemeval_repo/
+tools/
