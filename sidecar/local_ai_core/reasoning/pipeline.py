@@ -85,7 +85,7 @@ class ReasoningPipeline(PipelineCompatDelegates):
         return Path.cwd() / "tmp" / "chat_stream_live.jsonl"
 
     def _append_chat_log(self, payload: dict[str, Any]) -> None:
-        if str(os.getenv("LOCAL_AI_CHAT_LOG_ENABLED", "1") or "1").strip().lower() in {"0", "false", "no", "off"}:
+        if str(os.getenv("LOCAL_AI_CHAT_LOG_ENABLED", "0") or "0").strip().lower() in {"0", "false", "no", "off"}:
             return
         try:
             path = self._chat_log_path()

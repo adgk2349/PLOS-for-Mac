@@ -75,6 +75,113 @@ class GeneralChatExecutionMixin:
         sim_curr = cls._text_similarity(ans, cur)
         return sim_prev >= 0.62 and sim_curr <= 0.52
 
+    @staticmethod
+    def _extract_direct_count(query: str) -> int | None:
+        q_raw = str(query or "").strip().lower()
+        count_match = re.search(r"([2-5])\s*개(?:만)?", q_raw)
+        if count_match:
+            try:
+                return int(count_match.group(1))
+            except Exception:
+                return None
+        digit_match = re.search(r"([0-9]+)", q_raw)
+        if digit_match:
+            try:
+                digit_value = int(digit_match.group(1))
+                if 2 <= digit_value <= 5:
+                    return digit_value
+            except Exception:
+                return None
+        if "두 개" in q_raw:
+            return 2
+        if "세 개" in q_raw:
+            return 3
+        if "네 개" in q_raw:
+            return 4
+        if "다섯 개" in q_raw:
+            return 5
+        return None
+
+    @classmethod
+    def _build_direct_count_execution(
+        cls,
+        *,
+        query: str,
+        engine_used,
+    ) -> ExecutionResult | None:
+        q_raw = str(query or "").strip().lower()
+        direct_count = cls._extract_direct_count(q_raw)
+        if direct_count is None or direct_count < 2:
+            return None
+        if not any(token in q_raw for token in ("정리", "요약", "제안", "추천", "체크리스트", "루틴", "질문", "아이디어")):
+            return None
+
+        if "운동" in q_raw and "루틴" in q_raw:
+            pool = [
+                "전신 루틴: 스쿼트 12회 x3 + 푸시업 10회 x3 + 플랭크 40초 x3",
+                "유산소 루틴: 빠른 걷기 20분 + 계단 오르기 10분",
+                "하체 루틴: 런지 12회 x3 + 힙브릿지 15회 x3",
+                "상체 루틴: 밴드 로우 12회 x3 + 숄더프레스 10회 x3",
+                "코어 루틴: 데드버그 12회 x3 + 사이드 플랭크 30초 x3",
+            ]
+        elif "체크리스트" in q_raw:
+            pool = [
+                "오늘 가장 중요한 1개를 먼저 시작하기",
+                "집중 블록 25분 2회 완료하기",
+                "끝나기 10분 전 결과 점검하기",
+                "중요 메시지/이메일 한 번에 처리하기",
+                "내일 준비물 미리 체크하기",
+            ]
+        elif "회고" in q_raw and "질문" in q_raw:
+            pool = [
+                "오늘 가장 잘한 선택 1가지는 무엇이었나?",
+                "오늘 막힌 지점 1가지는 무엇이었고, 내일 어떻게 줄일까?",
+                "내일 유지할 좋은 습관 1가지는 무엇인가?",
+                "불필요했던 일 1가지를 내일 어떻게 줄일까?",
+                "내일 가장 먼저 시작할 일은 무엇인가?",
+            ]
+        elif "질문" in q_raw:
+            pool = [
+                "지금 가장 중요한 목표 1개는 무엇인가?",
+                "오늘 막힌 지점 1개를 줄이려면 무엇을 바꿀까?",
+                "내일 가장 먼저 시작할 일은 무엇인가?",
+                "지금 바로 10분 안에 할 수 있는 가장 작은 행동은 무엇인가?",
+                "오늘 끝나기 전에 반드시 확인할 항목은 무엇인가?",
+            ]
+        elif ("할 일" in q_raw or "할일" in q_raw):
+            pool = [
+                "가장 중요한 1개를 오전에 먼저 끝내기",
+                "집중 25분 + 휴식 5분으로 2회 진행하기",
+                "마감 10분 전에 결과 점검하고 다음 우선순위 기록하기",
+                "중요 메시지/이메일을 한 번에 처리하기",
+                "하루 종료 전에 내일 준비물 체크하기",
+            ]
+        else:
+            pool = [
+                "가장 영향 큰 항목부터 먼저 처리하기",
+                "작은 단위로 쪼개서 바로 시작하기",
+                "중간 점검 시간을 미리 고정하기",
+                "불필요한 작업 1개 줄이기",
+                "마무리 전에 결과를 짧게 기록하기",
+            ]
+        direct_text = "\n".join(f"{idx}. {item}" for idx, item in enumerate(pool[:direct_count], 1))
+        return ExecutionResult(
+            result_type="conversation",
+            structured_payload={
+                "style": "general_chat",
+                "ungrounded_allowed": True,
+                "answer_type": "summary",
+                "contract_format": "plain",
+                "response_mode": "conversational_direct",
+            },
+            citations=[],
+            tool_logs=[f"conversation:direct_count_early;count={direct_count}"],
+            generated_text=direct_text,
+            engine_used=engine_used,
+            used_fallback=False,
+            runtime_detail=f"direct_count_early;count={direct_count}",
+        )
+
     def handles_intent(self, intent: ParsedIntent, followup: FollowUpResolution | None) -> bool:
         return intent.intent == ReasoningIntent.GENERAL_CHAT
 
@@ -142,89 +249,10 @@ class GeneralChatExecutionMixin:
         # Early deterministic direct-response intercept.
         # Keep this outside deeper try/except blocks so count/list requests
         # cannot be bypassed by downstream generation-path exceptions.
-        q_raw_early = str(context.req.query or "").strip().lower()
-        direct_count_early: int | None = None
-        count_match_early = re.search(r"([2-5])\s*개(?:만)?", q_raw_early)
-        if count_match_early:
-            try:
-                direct_count_early = int(count_match_early.group(1))
-            except Exception:
-                direct_count_early = None
-        if direct_count_early is None:
-            if "두 개" in q_raw_early:
-                direct_count_early = 2
-            elif "세 개" in q_raw_early:
-                direct_count_early = 3
-            elif "네 개" in q_raw_early:
-                direct_count_early = 4
-            elif "다섯 개" in q_raw_early:
-                direct_count_early = 5
-        if direct_count_early is not None and direct_count_early >= 2:
-            generic_list_request_early = any(
-                token in q_raw_early
-                for token in ("정리", "요약", "제안", "추천", "체크리스트", "루틴", "질문", "아이디어")
-            )
-            if generic_list_request_early:
-                if "운동" in q_raw_early and "루틴" in q_raw_early:
-                    pool_early = [
-                        "전신 루틴: 스쿼트 12회 x3 + 푸시업 10회 x3 + 플랭크 40초 x3",
-                        "유산소 루틴: 빠른 걷기 20분 + 계단 오르기 10분",
-                        "하체 루틴: 런지 12회 x3 + 힙브릿지 15회 x3",
-                        "상체 루틴: 밴드 로우 12회 x3 + 숄더프레스 10회 x3",
-                        "코어 루틴: 데드버그 12회 x3 + 사이드 플랭크 30초 x3",
-                    ]
-                elif "체크리스트" in q_raw_early:
-                    pool_early = [
-                        "오늘 가장 중요한 1개를 먼저 시작하기",
-                        "집중 블록 25분 2회 완료하기",
-                        "끝나기 10분 전 결과 점검하기",
-                        "중요 메시지/이메일 한 번에 처리하기",
-                        "내일 준비물 미리 체크하기",
-                    ]
-                elif "질문" in q_raw_early:
-                    pool_early = [
-                        "지금 가장 중요한 목표 1개는 무엇인가?",
-                        "오늘 막힌 지점 1개를 줄이려면 무엇을 바꿀까?",
-                        "내일 가장 먼저 시작할 일은 무엇인가?",
-                        "지금 바로 10분 안에 할 수 있는 가장 작은 행동은 무엇인가?",
-                        "오늘 끝나기 전에 반드시 확인할 항목은 무엇인가?",
-                    ]
-                elif ("할 일" in q_raw_early or "할일" in q_raw_early):
-                    pool_early = [
-                        "가장 중요한 1개를 오전에 먼저 끝내기",
-                        "집중 25분 + 휴식 5분으로 2회 진행하기",
-                        "마감 10분 전에 결과 점검하고 다음 우선순위 기록하기",
-                        "중요 메시지/이메일을 한 번에 처리하기",
-                        "하루 종료 전에 내일 준비물 체크하기",
-                    ]
-                else:
-                    pool_early = [
-                        "가장 영향 큰 항목부터 먼저 처리하기",
-                        "작은 단위로 쪼개서 바로 시작하기",
-                        "중간 점검 시간을 미리 고정하기",
-                        "불필요한 작업 1개 줄이기",
-                        "마무리 전에 결과를 짧게 기록하기",
-                    ]
-                selected_early = pool_early[:direct_count_early]
-                direct_text_early = "\n".join(
-                    f"{idx}. {item}" for idx, item in enumerate(selected_early, 1)
-                )
-                execution = ExecutionResult(
-                    result_type="conversation",
-                    structured_payload={
-                        "style": "general_chat",
-                        "ungrounded_allowed": True,
-                        "answer_type": "summary",
-                        "contract_format": "plain",
-                        "response_mode": "conversational_direct",
-                    },
-                    citations=[],
-                    tool_logs=[f"conversation:direct_count_early;count={direct_count_early}"],
-                    generated_text=direct_text_early,
-                    engine_used=context.settings.local_engine,
-                    used_fallback=False,
-                    runtime_detail=f"direct_count_early;count={direct_count_early}",
-                )
+        execution = self._build_direct_count_execution(
+            query=context.req.query,
+            engine_used=context.settings.local_engine,
+        )
         web_memory_for_metadata: dict[str, Any] = {}
         web_memory_reused = False
         web_memory_rank_score = 0.0
@@ -983,91 +1011,6 @@ class GeneralChatExecutionMixin:
                         if len(re.sub(r"\s+", "", choice)) > 24:
                             choice = "첫 번째 추천 활동"
                         direct_task_execution = _direct_exec(f"좋아요. {choice}로 가죠.", "direct_single_choice")
-
-                    direct_count = None
-                    count_match = re.search(r"([2-5])\s*개(?:만)?", q_raw)
-                    if count_match:
-                        try:
-                            direct_count = int(count_match.group(1))
-                        except Exception:
-                            direct_count = None
-                    if direct_count is None:
-                        digit_match = re.search(r"([0-9]+)", q_raw)
-                        if digit_match:
-                            try:
-                                digit_value = int(digit_match.group(1))
-                                if 2 <= digit_value <= 5:
-                                    direct_count = digit_value
-                            except Exception:
-                                direct_count = None
-                    if direct_count is None:
-                        if "두 개" in q_raw:
-                            direct_count = 2
-                        elif "세 개" in q_raw:
-                            direct_count = 3
-                        elif "네 개" in q_raw:
-                            direct_count = 4
-                        elif "다섯 개" in q_raw:
-                            direct_count = 5
-
-                    if direct_count and direct_task_execution is None and ("할 일" in q_raw or "할일" in q_raw) and any(t in q_raw for t in ("정리", "요약", "정리해줘")):
-                        items = [
-                            "가장 중요한 1개를 오전에 먼저 끝내기",
-                            "집중 25분 + 휴식 5분으로 2회 진행하기",
-                            "마감 10분 전에 결과 점검하고 다음 우선순위 기록하기",
-                            "중요 메시지/이메일을 한 번에 처리하기",
-                            "하루 종료 전에 내일 준비물 체크하기",
-                        ][:direct_count]
-                        direct_text = "\n".join(f"{idx}. {item}" for idx, item in enumerate(items, 1))
-                        direct_task_execution = _direct_exec(direct_text, f"direct_count_task_list;count={direct_count}")
-                    elif direct_count and direct_task_execution is None and ("회고" in q_raw) and ("질문" in q_raw):
-                        questions = [
-                            "오늘 가장 잘한 선택 1가지는 무엇이었나?",
-                            "오늘 막힌 지점 1가지는 무엇이었고, 내일 어떻게 줄일까?",
-                            "내일 유지할 좋은 습관 1가지는 무엇인가?",
-                            "불필요했던 일 1가지를 내일 어떻게 줄일까?",
-                            "내일 가장 먼저 시작할 일은 무엇인가?",
-                        ][:direct_count]
-                        direct_text = "\n".join(f"{idx}. {item}" for idx, item in enumerate(questions, 1))
-                        direct_task_execution = _direct_exec(direct_text, f"direct_reflection_questions;count={direct_count}")
-                    elif direct_count and direct_task_execution is None:
-                        generic_list_request = any(token in q_raw for token in ("정리", "요약", "제안", "추천", "체크리스트", "루틴", "질문", "아이디어"))
-                        if generic_list_request:
-                            if "운동" in q_raw and "루틴" in q_raw:
-                                pool = [
-                                    "전신 루틴: 스쿼트 12회 x3 + 푸시업 10회 x3 + 플랭크 40초 x3",
-                                    "유산소 루틴: 빠른 걷기 20분 + 계단 오르기 10분",
-                                    "하체 루틴: 런지 12회 x3 + 힙브릿지 15회 x3",
-                                    "상체 루틴: 밴드 로우 12회 x3 + 숄더프레스 10회 x3",
-                                    "코어 루틴: 데드버그 12회 x3 + 사이드 플랭크 30초 x3",
-                                ]
-                            elif "체크리스트" in q_raw:
-                                pool = [
-                                    "오늘 가장 중요한 1개를 먼저 시작하기",
-                                    "집중 블록 25분 2회 완료하기",
-                                    "끝나기 10분 전 결과 점검하기",
-                                    "중요 메시지/이메일 한 번에 처리하기",
-                                    "내일 준비물 미리 체크하기",
-                                ]
-                            elif "질문" in q_raw:
-                                pool = [
-                                    "지금 가장 중요한 목표 1개는 무엇인가?",
-                                    "오늘 막힌 지점 1개를 줄이려면 무엇을 바꿀까?",
-                                    "내일 가장 먼저 시작할 일은 무엇인가?",
-                                    "지금 바로 10분 안에 할 수 있는 가장 작은 행동은 무엇인가?",
-                                    "오늘 끝나기 전에 반드시 확인할 항목은 무엇인가?",
-                                ]
-                            else:
-                                pool = [
-                                    "가장 영향 큰 항목부터 먼저 처리하기",
-                                    "작은 단위로 쪼개서 바로 시작하기",
-                                    "중간 점검 시간을 미리 고정하기",
-                                    "불필요한 작업 1개 줄이기",
-                                    "마무리 전에 결과를 짧게 기록하기",
-                                ]
-                            selected = pool[:direct_count]
-                            direct_text = "\n".join(f"{idx}. {item}" for idx, item in enumerate(selected, 1))
-                            direct_task_execution = _direct_exec(direct_text, f"direct_count_generic_list;count={direct_count}")
 
                     if direct_task_execution is not None:
                         execution = direct_task_execution

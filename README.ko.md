@@ -101,7 +101,7 @@ pytest -q
 
 ### 핵심 회귀
 ```bash
-pytest -q tests/test_v2_pipeline.py tests/test_local_inference_sanitize.py tests/test_memory_service_digest.py
+pytest -q tests/v2/chat/test_v2_pipeline.py tests/test_local_inference_sanitize.py tests/test_memory_service_digest.py
 ```
 
 ### 앱 테스트
