@@ -16,6 +16,25 @@ if TYPE_CHECKING:
 # Component: conversational_logic.py
 class ConversationalLogic(BaseDelegate):
     @staticmethod
+    def _looks_meta_only_promise_answer(text: str) -> bool:
+        value = re.sub(r"\s+", " ", str(text or "").strip())
+        if not value:
+            return False
+        trimmed = re.sub(r"^(?:그럼|그러면|좋아요|알겠습니다|네|자|이제)\s*[,.! ]*", "", value)
+        if re.search(r"[:\n]", trimmed):
+            return False
+        if len(re.findall(r"[.!?]", trimmed)) > 1:
+            return False
+        return bool(
+            re.match(
+                r"^(?:한\s*번에\s*)?(?:바로\s*)?(?:한\s*줄로\s*|한\s*문장으로만\s*|간단히\s*|짧게\s*|본문만\s*)?"
+                r"(?:정리|요약|설명|답변|말씀|말해|출력|안내|추천)(?:해\s*|해드리\s*|드리\s*)?"
+                r"(?:볼게요|할게요|드릴게요|해드릴게요)\.?\s*$",
+                trimmed,
+            )
+        )
+
+    @staticmethod
     def _looks_user_role_confusion_answer(text: str) -> bool:
         value = str(text or "").strip()
         if not value:
@@ -42,10 +61,11 @@ class ConversationalLogic(BaseDelegate):
         value = str(text or "").strip()
         if not value:
             return True
-        token_count = len(re.findall(r"\S+", value))
-        if token_count <= 2:
+        if re.search(r"(?m)(?:^|[\n ])(?:\*\*)?(?:\d+\.|[-*•])\s*$", value):
             return True
-        if token_count <= 5 and re.search(r"(까요\?|게요\.?|습니다\.?|요\.?)$", value):
+        if re.search(r"(?:\*\*)?(?:\d+\.)\s*$", value):
+            return True
+        if value.count("**") % 2 == 1:
             return True
         if re.search(r"[:;,(\[{`\-]\s*$", value):
             return True
@@ -89,7 +109,10 @@ class ConversationalLogic(BaseDelegate):
         ).strip()
         if not tail:
             return None
-        merged = f"{str(draft_answer or '').rstrip()} {tail}".strip()
+        base = str(draft_answer or "").rstrip()
+        base = re.sub(r"(?:\s*)(?:\*\*)?(?:\d+\.)\s*$", "", base).rstrip()
+        base = re.sub(r"(?:\s*)[:;,(\[{`\-]\s*$", "", base).rstrip()
+        merged = f"{base} {tail}".strip()
         merged = re.sub(r"\s{2,}", " ", merged).strip()
         return merged
 
@@ -163,6 +186,19 @@ class ConversationalLogic(BaseDelegate):
             query=query,
             response_language=response_language,
         )
+        if answer and not self._looks_meta_only_promise_answer(answer) and self._looks_truncated_conversation_answer(answer):
+            continued = self._continue_conversation_once(
+                engine=engine,
+                query=query,
+                draft_answer=answer,
+                response_language=response_language,
+                profile=profile,
+                mlx_model_path=mlx_model_path,
+                llama_model_path=llama_model_path,
+                max_tokens=max_tokens,
+            )
+            if continued:
+                answer = continued
         raw_preview = re.sub(r"\s+", " ", str(raw or "")).strip()[:140]
         quality_issues = self._conversation_quality_issues(
             query=query,
@@ -215,7 +251,7 @@ class ConversationalLogic(BaseDelegate):
         # Even when static fallbacks are disabled, allow a model-based rewrite
         # if the primary output is invalid (empty/hard issues). This avoids
         # failing fast into repeated runtime-error fallback text.
-        rewrite_enabled = str(os.getenv("LOCAL_AI_CONVERSATION_REWRITE_ENABLED", "0") or "0").strip().lower() in {
+        rewrite_enabled = str(os.getenv("LOCAL_AI_CONVERSATION_REWRITE_ENABLED", "1") or "1").strip().lower() in {
             "1", "true", "yes", "on"
         }
         allow_model_rewrite = bool(
@@ -248,6 +284,19 @@ class ConversationalLogic(BaseDelegate):
                 )
 
         if repaired_answer:
+            if not self._looks_meta_only_promise_answer(repaired_answer) and self._looks_truncated_conversation_answer(repaired_answer):
+                continued = self._continue_conversation_once(
+                    engine=engine,
+                    query=query,
+                    draft_answer=repaired_answer,
+                    response_language=response_language,
+                    profile=profile,
+                    mlx_model_path=mlx_model_path,
+                    llama_model_path=llama_model_path,
+                    max_tokens=max_tokens,
+                )
+                if continued:
+                    repaired_answer = continued
             repaired_issues = self._conversation_quality_issues(
                 query=query,
                 answer=repaired_answer,
@@ -440,6 +489,8 @@ class ConversationalLogic(BaseDelegate):
             "avoidable_clarification",
             "continuation_artifact",
             "comma_loop_artifact",
+            "truncated_answer",
+            "intent_restatement",
         }
         return [item for item in issues if item in hard]
 
@@ -644,10 +695,14 @@ class ConversationalLogic(BaseDelegate):
             issues.append("clarification_template_leak")
         if self._looks_avoidable_clarification_answer(query=query, answer=cleaned):
             issues.append("avoidable_clarification")
-        if re.match(r"^\s*한\s*번에\s*(?:바로\s*)?(?:본문만\s*)?(?:출력|정리|답변)\s*(?:할게요|해볼게요|드릴게요|해드릴게요)\.?\s*$", cleaned):
+        if self._looks_meta_only_promise_answer(cleaned):
             issues.append("meta_only_ack")
+        if self._looks_truncated_conversation_answer(cleaned):
+            issues.append("truncated_answer")
         if self._looks_user_role_confusion_answer(cleaned):
             issues.append("role_confusion")
+        if self._looks_intent_restatement_answer(query=query, answer=cleaned):
+            issues.append("intent_restatement")
         
         if response_language == "ko":
             ko_chars = len(re.findall(r"[가-힣]", cleaned))
@@ -663,6 +718,30 @@ class ConversationalLogic(BaseDelegate):
             if self._is_informal_korean_tone(cleaned):
                 issues.append("informal_tone")
         return issues
+
+    @staticmethod
+    def _looks_intent_restatement_answer(*, query: str, answer: str) -> bool:
+        q = str(query or "").strip()
+        a = str(answer or "").strip()
+        if not q or not a:
+            return False
+        lowered = a.lower()
+        markers = (
+            "원하시는 것 같",
+            "알고 싶으신 것 같",
+            "추천받고 싶으신 것 같",
+            "고민 중이시군요",
+            "찾으시는군요",
+            "것 같습니다",
+        )
+        if not any(marker in lowered for marker in markers):
+            return False
+        if len(re.findall(r"[.!?]", a)) > 2:
+            return False
+        substantive_cues = ("1.", "2.", "-", "*", "예를", "굽", "방법", "먼저", "다음", "뒤집", "온도", "소금", "후추")
+        if any(token in a for token in substantive_cues):
+            return False
+        return True
 
     @staticmethod
     def _looks_avoidable_clarification_answer(*, query: str, answer: str) -> bool:
