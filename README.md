@@ -18,6 +18,11 @@ PLOS combines a native SwiftUI app and a local Python sidecar to run chat, retri
 - Hardware-aware local model catalog
 - Conversational direct-first response policy
 
+## Runtime Status
+- Local inference backends: `MLX` and `llama.cpp` (primary path)
+- External providers (optional): `OpenAI`, `Anthropic`
+- Ollama: not integrated as a first-class runtime in current main branch
+
 ## Architecture
 ```mermaid
 graph TD
@@ -67,6 +72,7 @@ brew install tesseract poppler
 - Open `PLOS.xcodeproj` in Xcode
 - Run `PLOS` target
 - Sidecar lifecycle is managed by the app
+- First-run check: if the chat view loads and answers a simple prompt, startup is healthy
 
 ## Sidecar Standalone (Dev)
 ```bash
@@ -76,6 +82,8 @@ export LOCAL_AI_SESSION_TOKEN=dev-token
 export LOCAL_AI_DATA_DIR="$(pwd)/data"
 uvicorn local_ai_core.main:create_app --factory --host 127.0.0.1 --port 8787
 ```
+
+`dev-token` is an example value for local development only.
 
 ## Model Tiers (Practical)
 - 16GB: 7B/8B class, limited 12B/14B attempts
@@ -93,7 +101,7 @@ pytest -q
 
 ### Focused regressions
 ```bash
-pytest -q tests/test_v2_pipeline.py tests/test_local_inference_sanitize.py tests/test_memory_service_digest.py
+pytest -q tests/v2/chat/test_v2_pipeline.py tests/test_local_inference_sanitize.py tests/test_memory_service_digest.py
 ```
 
 ### App tests
@@ -108,7 +116,6 @@ xcodebuild \
 ## Docs
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [PERFORMANCE.md](PERFORMANCE.md)
-- [PLUGIN_RUNTIME_SPEC.md](PLUGIN_RUNTIME_SPEC.md)
 - [CHANGELOG.en.md](CHANGELOG.en.md)
 - [CHANGELOG.ko.md](CHANGELOG.ko.md)
 - [CHANGELOG.ja.md](CHANGELOG.ja.md)

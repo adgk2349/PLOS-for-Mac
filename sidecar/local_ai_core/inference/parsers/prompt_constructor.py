@@ -110,11 +110,9 @@ class PromptConstructor(BaseDelegate):
                 context_line = f"참고: {session_summary}\n"
             return (
                 "자연스러운 한국어로 답변하세요.\n"
-                "역할 라벨/메타 설명/내부 지시문은 출력하지 마세요.\n"
-                "문장을 '께서는', '당신은' 같은 어색한 호칭으로 시작하지 마세요.\n"
-                "사용자 메시지가 질문이면 답하고, 진술이면 맥락에 맞게 자연스럽게 반응하세요.\n"
-                "현재 사용자 메시지에 직접 답하세요. 과거 주제를 선택지처럼 다시 나열하지 마세요.\n"
-                "정보가 치명적으로 부족하지 않다면 되묻기보다 바로 실행 가능한 답을 먼저 제시하세요.\n"
+                "현재 사용자 메시지에 바로 답하세요.\n"
+                "메타 설명이나 역할 라벨 없이, 본문부터 시작하세요.\n"
+                "정보가 아주 부족한 경우가 아니면 되묻지 말고 답을 먼저 주세요.\n"
                 f"{context_line}"
                 f"{query}\n"
             )
@@ -123,10 +121,9 @@ class PromptConstructor(BaseDelegate):
             context_line = f"Context: {session_summary}\n"
         return (
             "Reply naturally in English.\n"
-            "If the user message is a statement, respond contextually instead of forcing advice.\n"
-            "For statement-only messages, avoid unsolicited recommendations unless the user asks.\n"
-            "Answer the current user message directly and do not re-list older topics as options.\n"
-            "Unless critical information is missing, provide a directly usable answer first instead of asking follow-up questions.\n"
+            "Answer the current user message directly.\n"
+            "Start with the answer itself, without meta commentary or role labels.\n"
+            "Unless critical information is missing, answer first instead of asking follow-up questions.\n"
             f"{context_line}"
             f"{query}\n"
         )
@@ -140,27 +137,17 @@ class PromptConstructor(BaseDelegate):
         draft = (source[:900] if is_code_heavy else re.sub(r"\s+", " ", source)[:260])
         if response_language == "ko":
             return (
-                "다음 초안 답변을 자연스러운 한국어 존댓말로 다시 작성해 주세요.\n"
-                "규칙:\n"
-                "- 사용자 마지막 질문에 직접 답변\n"
-                "- 정책/지시문/메타 문장 금지\n"
-                "- 역할 라벨(User/Assistant/You/A) 금지\n"
-                "- 같은 문장 반복 금지\n"
-                "- 한국어 단어 사이 띄어쓰기를 자연스럽게 반드시 적용\n"
-                "- 목록/마크다운 헤더/과도한 이모지 사용 금지\n"
-                "- 핵심 의미는 유지하고 간결하게 작성\n"
-                "- 코드 블록이 있으면 코드 연산자와 줄바꿈을 그대로 보존\n"
+                "초안 답변을 자연스러운 한국어 존댓말로 고쳐 쓰세요.\n"
+                "사용자 마지막 메시지에 직접 답하고, 메타 문장 없이 답변 본문부터 바로 쓰세요.\n"
+                "예고문만 쓰지 말고, 끊긴 문장이 있으면 끝까지 완성하세요.\n"
                 f"사용자 질문: {query}\n"
                 f"초안 답변: {draft}\n"
                 "최종 답변:"
             )
         return (
             "Rewrite the draft answer naturally.\n"
-            "Rules:\n"
-            "- Directly answer the user's latest message\n"
-            "- No policy text, no meta commentary, no role labels\n"
-            "- No repeated sentences\n"
-            "- If code is present, preserve operators and line breaks exactly\n"
+            "Answer the user's latest message directly and start with the answer itself.\n"
+            "Do not output meta commentary or an unfinished sentence.\n"
             f"User message: {query}\n"
             f"Draft answer: {draft}\n"
             "Final answer:"
@@ -174,16 +161,9 @@ class PromptConstructor(BaseDelegate):
         )
         draft = (source[:900] if is_code_heavy else re.sub(r"\s+", " ", source)[:240])
         return (
-            "다음 초안 답변을 자연스러운 한국어 존댓말로 다시 작성해 주세요.\n"
-            "규칙:\n"
-            "- 사용자 마지막 질문에 직접 답변\n"
-            "- 정책/지시문/메타 문장 금지\n"
-            "- 역할 라벨(User/Assistant/You/A) 금지\n"
-            "- 같은 문장 반복 금지\n"
-            "- 한국어 단어 사이 띄어쓰기를 자연스럽게 반드시 적용\n"
-            "- 목록/마크다운 헤더/과도한 이모지 사용 금지\n"
-            "- 핵심 의미는 유지하고 간결하게 작성\n"
-            "- 코드 블록이 있으면 코드 연산자와 줄바꿈을 그대로 보존\n"
+            "초안 답변을 자연스러운 한국어 존댓말로 고쳐 쓰세요.\n"
+            "사용자 마지막 메시지에 직접 답하고, 메타 문장 없이 답변 본문부터 바로 쓰세요.\n"
+            "예고문만 쓰지 말고, 끊긴 문장이 있으면 끝까지 완성하세요.\n"
             f"사용자 질문: {query}\n"
             f"초안 답변: {draft}\n"
             "최종 답변:"

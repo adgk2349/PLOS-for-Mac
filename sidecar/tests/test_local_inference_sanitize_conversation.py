@@ -160,6 +160,48 @@ def test_generate_conversational_repairs_hard_issue_even_when_static_fallback_di
     assert result.used_fallback is False
     assert "제 성능은 현재 로컬 설정과 모델 크기에 따라 달라집니다." in result.answer
 
+def test_generate_conversational_repairs_meta_only_promise_answer():
+    engine = _SequentialStubInferenceEngine(
+        outputs_by_engine={
+            LocalEngine.MLX: [
+                "한 문장으로만 요약해 드릴게요.",
+                "핵심은 오늘 가장 중요한 일 하나를 먼저 끝내는 것입니다.",
+            ],
+            LocalEngine.LLAMA_CPP: [None],
+        }
+    )
+    result = engine.generate_conversational(
+        query="방금 내용 한 줄로 다시 말해줘",
+        mode=WorkMode.GENERAL,
+        profile="recommended",
+        engine=LocalEngine.MLX,
+        language_preference="ko",
+        allow_static_fallback=False,
+    )
+    assert result.used_fallback is False
+    assert result.answer == "핵심은 오늘 가장 중요한 일 하나를 먼저 끝내는 것입니다."
+
+def test_generate_conversational_continues_truncated_answer_once():
+    engine = _SequentialStubInferenceEngine(
+        outputs_by_engine={
+            LocalEngine.MLX: [
+                "프라이팬으로 굽는 핵심은 **1.",
+                "고기는 굽기 20분 전에 꺼내고 팬을 충분히 달군 뒤 짧고 강하게 굽는 것입니다.",
+            ],
+            LocalEngine.LLAMA_CPP: [None],
+        }
+    )
+    result = engine.generate_conversational(
+        query="소고기 굽는 법 핵심만 알려줘",
+        mode=WorkMode.GENERAL,
+        profile="recommended",
+        engine=LocalEngine.MLX,
+        language_preference="ko",
+        allow_static_fallback=False,
+    )
+    assert result.used_fallback is False
+    assert "충분히 달군 뒤" in result.answer
+
 def test_generate_conversational_allows_brief_ack_answer():
     engine = _SequentialStubInferenceEngine(
         outputs_by_engine={
@@ -348,3 +390,30 @@ def test_pick_best_conversation_answer_rejects_invalid_primary_meta_response():
     )
     assert selected is None
     assert issues == []
+
+def test_conversation_quality_issues_flags_meta_only_promise_answer():
+    engine = LocalInferenceEngine()
+    issues = engine._conversation_quality_issues(
+        query="왜 그렇게 골랐는지 한 문장으로만 말해줘",
+        answer="설명해 드릴게요.",
+        response_language="ko",
+    )
+    assert "meta_only_ack" in issues
+
+def test_conversation_quality_issues_flags_truncated_answer():
+    engine = LocalInferenceEngine()
+    issues = engine._conversation_quality_issues(
+        query="소고기 굽는 법 핵심만 알려줘",
+        answer="프라이팬으로 굽는 핵심은 **1.",
+        response_language="ko",
+    )
+    assert "truncated_answer" in issues
+
+def test_conversation_quality_issues_flags_intent_restatement_answer():
+    engine = LocalInferenceEngine()
+    issues = engine._conversation_quality_issues(
+        query="곁들일 거 하나만 추천해줘",
+        answer="소고기에 곁들일 메뉴를 추천받고 싶으신 것 같습니다.",
+        response_language="ko",
+    )
+    assert "intent_restatement" in issues

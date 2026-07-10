@@ -17,7 +17,7 @@ This guide provides repeatable checks for local model latency, response quality,
 ```bash
 cd sidecar
 source .venv/bin/activate
-pytest -q tests/test_v2_pipeline.py tests/test_local_inference_sanitize.py tests/test_memory_service_digest.py
+pytest -q tests/v2/chat/test_v2_pipeline.py tests/test_local_inference_sanitize.py tests/test_memory_service_digest.py
 ```
 
 ## 2) End-to-End API Regression
@@ -47,7 +47,7 @@ Run week exact/filter tests:
 ```bash
 cd sidecar
 source .venv/bin/activate
-pytest -q tests/test_v2_pipeline.py -k "week_exact_filter or requested_weeks"
+pytest -q tests/v2/chat/test_v2_pipeline.py -k "week_exact_filter or requested_weeks"
 ```
 
 ## 5) Manual Comparison Matrix (Recommended)
