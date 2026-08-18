@@ -25,16 +25,15 @@ def test_session_digest_caps_and_merge(tmp_path: Path):
     assert digest is not None
     assert digest["turn_count"] == 12
     # New architecture: DIGEST_RECENT_TURNS_CAP=20 (was 8).
-    # Assistant messages ending in questions are dropped by quality filter,
-    # so only 12 user messages are stored. 12 < WINDOW_VERBATIM*2=20, no compression yet.
+    # Question-shaped assistant turns are retained when they contain useful
+    # conversational context. 12 pairs are capped to the verbatim window.
     assert len(digest["recent_turns"]) <= memory._DIGEST_RECENT_TURNS_CAP
     assert len(digest["active_topics"]) <= 8
     assert len(digest["stable_facts"]) <= 10
     assert len(digest["open_loops"]) <= 6
     # rolling_summary starts empty at 12 turns (compression triggers at > WINDOW_VERBATIM*2).
     assert isinstance(digest.get("rolling_summary"), str)
-    # Assistant question-like turns are dropped from digest to prevent open-loop pollution.
-    assert digest["recent_turns"][-1]["role"] == "user"
+    assert digest["recent_turns"][-1]["role"] == "assistant"
 
 
 def test_session_digest_rolling_summary_compresses_old_turns(tmp_path: Path):
@@ -88,6 +87,27 @@ def test_session_digest_refresh_happens_every_six_turns(tmp_path: Path):
     assert calls == [6]
     assert result["digest_refresh"] == "model"
     assert "model_refreshed_topic" in result["active_topics"]
+    # Refreshing labels must not let a small model discard exact recent turns.
+    assert len(result["recent_turns"]) == 12
+    assert result["recent_turns"][-1]["role"] == "assistant"
+
+
+def test_session_digest_rolling_summary_preserves_user_intent_and_outcome(tmp_path: Path):
+    memory = _new_service(tmp_path)
+    session_id = "session-outcome-summary"
+    for idx in range(12):
+        memory.update_session_digest(
+            session_id,
+            f"프로젝트 {idx}의 예산을 10만원으로 잡을까?",
+            f"프로젝트 {idx}는 예산을 10만원으로 두고 핵심 기능부터 만들기로 했어요.",
+            mode="rule",
+        )
+
+    digest = memory.get_session_digest(session_id)
+    assert digest is not None
+    assert "사용자 의도" in digest["rolling_summary"]
+    assert "당시 결론" in digest["rolling_summary"]
+    assert "핵심 기능부터" in digest["rolling_summary"]
 
 
 def test_session_digest_refresh_fallback_keeps_rule_digest(tmp_path: Path):
@@ -162,6 +182,16 @@ def test_session_digest_drops_low_quality_assistant_summary(tmp_path: Path):
     digest = memory.get_session_digest(session_id)
     assert digest is not None
     assert digest["recent_turns"][-1]["role"] == "user"
+
+
+def test_session_digest_drops_punctuation_only_assistant_summary(tmp_path: Path):
+    memory = _new_service(tmp_path)
+    session_id = "session-punctuation-quality-guard"
+    memory.update_session_digest(session_id, "큰 해커톤 위주로 참여할까?", ".", mode="rule")
+
+    digest = memory.get_session_digest(session_id)
+    assert digest is not None
+    assert digest["recent_turns"] == [{"role": "user", "text": "큰 해커톤 위주로 참여할까?"}]
 
 
 def test_clear_session_context_memory_removes_only_context_keys(tmp_path: Path):

@@ -7,7 +7,7 @@ final class BookmarkStore {
     private let defaultsKey = "local_ai_bookmarks"
     private let defaults = UserDefaults.standard
 
-    struct BookmarkEntry: Codable {
+    struct BookmarkEntry: Codable, Equatable {
         let path: String
         let bookmarkData: Data
     }
@@ -21,6 +21,7 @@ final class BookmarkStore {
         }
 
         var urls: [URL] = []
+        var refreshedEntries: [BookmarkEntry] = []
         for entry in entries {
             var stale = false
             guard let resolved = try? URL(
@@ -33,6 +34,22 @@ final class BookmarkStore {
             }
             _ = resolved.startAccessingSecurityScopedResource()
             urls.append(resolved)
+            if stale,
+               let refreshedData = try? resolved.bookmarkData(
+                   options: [.withSecurityScope],
+                   includingResourceValuesForKeys: nil,
+                   relativeTo: nil
+               )
+            {
+                refreshedEntries.append(BookmarkEntry(path: resolved.path, bookmarkData: refreshedData))
+            } else {
+                refreshedEntries.append(entry)
+            }
+        }
+        if refreshedEntries.count != entries.count || refreshedEntries != entries,
+           let encoded = try? JSONEncoder().encode(refreshedEntries)
+        {
+            defaults.set(encoded, forKey: defaultsKey)
         }
         return urls
     }
@@ -347,6 +364,7 @@ final class AppViewModel: ObservableObject {
     var lastPostChatStateRefreshAt = Date.distantPast
     let postChatStateRefreshInterval: TimeInterval = 8
     var activeLocalChatTask: Task<Void, Never>?
+    var activeChatGenerationID: UUID?
     var isStreamingRoomStateDirty = false
     var streamingDirtyRoomID: String?
     var roomIndexPollingTasks: [String: Task<Void, Never>] = [:]

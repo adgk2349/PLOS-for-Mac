@@ -196,12 +196,35 @@ def test_pipeline_loads_previous_context_before_followup_and_injects_digest_summ
     assert followup.kwargs["last_selected_file"] == "/tmp/a.md"
     assert followup.kwargs["last_actions"] == ["OPEN_FILE", "ASK_FOLLOWUP"]
 
-    assert executor.session_summaries
-    injected = executor.session_summaries[0]
-    assert "topics: topic-a" in injected
-    assert "last_query: 이전 질문" in injected
+    # The digest is available to MessageState, so it must not also be appended
+    # to the legacy prompt as session_summary.
+    assert executor.session_summaries == [""]
+    digest_text = ReasoningPipeline._session_digest_to_summary_text(
+        digest=memory.get_session_digest("sess-ctx"),
+        last_context=memory.get_last_conversational_context("sess-ctx"),
+    )
+    assert "topics: topic-a" in digest_text
+    assert "last_query: 이전 질문" in digest_text
+    assert "recent_user: 이전 질문" in digest_text
 
     assert composed.metadata["context_digest_used"] is True
     assert composed.metadata["context_injected"] is True
     assert composed.metadata["digest_turn_count"] == 4
     assert memory.digest_updated is True
+
+
+def test_digest_summary_keeps_recent_assistant_conclusion_for_followups():
+    summary = ReasoningPipeline._session_digest_to_summary_text(
+        digest={
+            "rolling_summary": "Earlier plans established a small, shippable scope.",
+            "recent_turns": [
+                {"role": "user", "text": "해커톤에서 완성도를 높이려면 뭘 먼저 해야 해?"},
+                {"role": "assistant", "text": "핵심 기능 하나를 먼저 끝내고 데모 흐름을 고정하는 게 우선이에요."},
+            ],
+        },
+        last_context={"last_user_query": "해커톤에서 완성도를 높이려면 뭘 먼저 해야 해?"},
+    )
+
+    assert "earlier_context:" in summary
+    assert "recent_exchange:" in summary
+    assert "핵심 기능 하나를 먼저 끝내고" in summary

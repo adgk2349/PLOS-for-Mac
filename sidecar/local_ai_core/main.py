@@ -14,6 +14,8 @@ from .chat import PrivacyError
 from .plugins import ExtensionKernel, FinetuneJobService, PluginRegistryService
 from .models import (
     ChatFilters,
+    ChatTitleRequest,
+    ChatTitleResponse,
     ComposedChatResponseV2,
     DeepAnalysisRequest,
     DeepAnalysisResponse,
@@ -55,6 +57,7 @@ from .models import (
     StartupProfile,
     UserPreferencesResponse,
     WorkspaceMemoryResponse,
+    WorkMode,
     EpisodicMemoryResponse,
     FinetuneJobStatusResponse,
     FinetuneJobSubmitRequest,
@@ -553,6 +556,37 @@ def create_app(*, state: AppState | None = None) -> FastAPI:
     async def local_chat(payload: LocalChatRequest) -> LocalChatResponse:
         await app_state.wait_until_ready()
         return app_state.chat_facade.local_chat(payload)
+
+    @app.post("/v1/chat/title", response_model=ChatTitleResponse, dependencies=[Depends(_auth_dependency)])
+    async def generate_chat_title(payload: ChatTitleRequest) -> ChatTitleResponse:
+        await app_state.wait_until_ready()
+        settings_model = await app_state.workspace_service.get_settings()
+        language = str(payload.language or settings_model.language or "auto").strip() or "auto"
+        prompt = (
+            "Write one concise conversation title from the exchange below. "
+            "Return only the title, with no label, quote, markdown, or final punctuation. "
+            "Use 3 to 7 words in the conversation language.\n\n"
+            f"User: {payload.user_text.strip()}\n"
+            f"Assistant: {payload.assistant_text.strip()}"
+        )
+        inference = await asyncio.to_thread(
+            app_state.local_inference.generate,
+            query=prompt,
+            mode=WorkMode.SUMMARY,
+            citations=[],
+            profile=settings_model.startup_profile.value,
+            engine=settings_model.local_engine or LocalEngine.MLX,
+            mlx_model_path=settings_model.mlx_model_path,
+            llama_model_path=settings_model.llama_model_path,
+            language_preference=language,
+            max_tokens=24,
+        )
+        raw_title = str(getattr(inference, "answer", "") or "")
+        title = " ".join(raw_title.replace("\r", " ").replace("\n", " ").split()).strip()
+        title = title.strip(" \t\"'`“”‘’#*-:：")
+        if len(title) > 48:
+            title = title[:48].rstrip()
+        return ChatTitleResponse(title=title)
 
     @app.post("/v2/chat/local", response_model=ComposedChatResponseV2, dependencies=[Depends(_auth_dependency)])
     async def local_chat_v2(payload: LocalChatRequestV2) -> ComposedChatResponseV2:

@@ -491,6 +491,16 @@ struct LocalChatRequestV2: Codable {
     var roleplay_persona: String? = nil
 }
 
+struct ChatTitleRequest: Codable {
+    var user_text: String
+    var assistant_text: String
+    var language: String?
+}
+
+struct ChatTitleResponse: Codable {
+    var title: String
+}
+
 struct SuggestedAction: Codable, Identifiable, Hashable {
     var action_id: String
     var kind: SuggestedActionKind

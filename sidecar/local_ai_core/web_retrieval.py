@@ -7,5 +7,6 @@ from .retrieval.web_retrieval import *  # noqa: F401,F403
 from .retrieval.web_retrieval import (  # noqa: F401
     _DiscoveredURL,
     _FetchedPage,
+    _BraveSearchResultParser,
     _SearxngHTMLResultParser,
 )

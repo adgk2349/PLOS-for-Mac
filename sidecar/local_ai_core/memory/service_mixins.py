@@ -548,7 +548,10 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
         if not isinstance(refreshed, dict):
             return "fallback_rule", digest
         merged = dict(digest)
-        for key in ("active_topics", "stable_facts", "open_loops", "recent_turns"):
+        # A small model can improve labels, but must not rewrite the verbatim
+        # turn buffer. Its digest JSON is capped more aggressively and used to
+        # discard older turns every refresh, which breaks long follow-ups.
+        for key in ("active_topics", "stable_facts", "open_loops"):
             if key in refreshed:
                 merged[key] = refreshed.get(key)
         merged["version"] = self._DIGEST_VERSION
@@ -980,6 +983,11 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
             )
             if not text:
                 continue
+            # Existing digests may contain a failed one-character completion.
+            # Remove only non-content fragments here; other assistant-memory
+            # policy is enforced when the turn is first written.
+            if role == "assistant" and not re.search(r"[A-Za-z0-9가-힣ぁ-ゖァ-ヺ一-龥]", text):
+                continue
             output.append({"role": role, "text": text})
         return output[-self._DIGEST_RECENT_TURNS_CAP :]
 
@@ -1013,6 +1021,26 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
                 user_fragments.append(text)
             elif role == "assistant":
                 assistant_fragments.append(text)
+
+        # Preserve what the user was trying to do and the conclusion reached.
+        # Entity-only summaries are compact but not actionable on a later
+        # follow-up such as "그걸 더 구체적으로 해줘".
+        paired_outcomes: list[str] = []
+        pending_user = ""
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role") or "").strip().lower()
+            text = re.sub(r"\s+", " ", str(turn.get("text") or "")).strip()
+            if not text:
+                continue
+            if role == "user":
+                pending_user = text
+            elif role == "assistant" and pending_user:
+                paired_outcomes.append(
+                    f"사용자 의도: {pending_user[:90]} / 당시 결론: {text[:140]}"
+                )
+                pending_user = ""
 
         # Extract named entities and numbers (Korean + Latin)
         def _extract_entities(texts: list[str]) -> list[str]:
@@ -1068,6 +1096,8 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
         parts: list[str] = []
         if existing_summary:
             parts.append(existing_summary.rstrip(".").strip())
+        if paired_outcomes:
+            parts.append("이전 대화 핵심: " + " | ".join(paired_outcomes[-3:]))
         if entities:
             parts.append("대화 중 언급된 주요 키워드는 " + ", ".join(entities[:10]) + "입니다")
         if questions:
@@ -1139,6 +1169,10 @@ class MemoryServiceMethodsMixin(MemoryServiceWorkspaceMethodsMixin):
     def _should_drop_assistant_digest_text(cls, *, assistant_text: str, user_query: str) -> bool:
         cleaned = (assistant_text or "").strip()
         if not cleaned:
+            return True
+        # Never feed punctuation-only or symbol-only failed generations back
+        # into the next chat template as an assistant turn.
+        if not re.search(r"[A-Za-z0-9가-힣ぁ-ゖァ-ヺ一-龥]", cleaned):
             return True
         if cls._looks_like_instruction_leak(cleaned):
             return True

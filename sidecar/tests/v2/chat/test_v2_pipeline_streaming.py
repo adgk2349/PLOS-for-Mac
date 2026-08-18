@@ -250,6 +250,25 @@ def test_v2_chat_stream_splits_chunks_by_sentence(monkeypatch):
     assert chunk_texts[2] == "셋째 문장입니다."
 
 
+def test_stream_sanitizer_holds_split_amente_prefix():
+    first, cleaned, pending = ReasoningPipeline._sanitize_stream_piece(
+        "A",
+        prefix_cleaned=False,
+    )
+    assert first == ""
+    assert cleaned is False
+    assert pending == "A"
+
+    second, cleaned, pending = ReasoningPipeline._sanitize_stream_piece(
+        "MENTE: 실제 답변",
+        prefix_cleaned=cleaned,
+        prefix_pending=pending,
+    )
+    assert second == "실제 답변"
+    assert cleaned is True
+    assert pending == ""
+
+
 def test_chat_service_stream_hides_room_scope_missing_status():
     service = ChatService.__new__(ChatService)
     service._room_registry = None

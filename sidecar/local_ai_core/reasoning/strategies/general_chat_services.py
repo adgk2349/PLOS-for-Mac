@@ -5,6 +5,7 @@ import os
 from typing import Any, Protocol
 
 from ..helpers.web.general_chat_web_gate_helpers import GeneralChatWebGateHelpers
+from ..conversation_context_policy import resolve_conversation_context_policy
 
 
 class WebSearchGate(Protocol):
@@ -102,8 +103,20 @@ class DefaultConversationInputBuilder:
                 followup_resolution=followup_resolution,
                 last_context=context.last_context,
             )
+        context_policy = resolve_conversation_context_policy(
+            startup_profile=getattr(getattr(context, "workspace", None), "startup_profile", "RECOMMENDED"),
+            model_path=(
+                getattr(getattr(context, "settings", None), "mlx_model_path", None)
+                or getattr(getattr(context, "settings", None), "llama_model_path", None)
+            ),
+            digest=getattr(context, "session_digest_payload", None),
+        )
+        # MessageState already carries digest history for chat-template engines.
+        # Only use the compact summary as a legacy-prompt fallback when history
+        # is unavailable; runtime context and explicit hints still pass through.
+        digest_fallback = context.session_digest if context_policy.inject_digest_into_legacy_prompt else ""
         session_summary_override = self.strategy._merge_session_summary_with_hint(
-            session_summary=context.session_digest,
+            session_summary=digest_fallback,
             followup_hint=followup_hint,
         )
         session_summary_override = self.strategy._merge_session_summary_with_runtime_context(

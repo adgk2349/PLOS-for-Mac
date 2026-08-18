@@ -128,6 +128,9 @@ class GeneralChatWebExecutionHelpers:
         base = " ".join(str(original_query or "").split()).strip()
         if round_index <= 1 or not base:
             return base
+        normalized_product_query = GeneralChatWebExecutionHelpers._normalized_product_query(base)
+        if normalized_product_query:
+            return f"{normalized_product_query} release date"
         if round_index == 2:
             entities = strategy._tokenize_keywords(base, max_tokens=2)
             suffix = "latest update"
@@ -137,6 +140,34 @@ class GeneralChatWebExecutionHelpers:
         title_blob = " ".join(str(item.get("title") or "") for item in round1_sources[:3] if isinstance(item, dict))
         title_terms = strategy._tokenize_keywords(title_blob, max_tokens=2)
         return " ".join([base, *title_terms, "official source"]).strip()
+
+    @staticmethod
+    def _normalized_product_query(query: str) -> str:
+        """Normalize high-confidence Korean product aliases for global search providers."""
+        source = " ".join(str(query or "").split()).strip()
+        if not source:
+            return ""
+        aliases = {
+            "에어팟": "AirPods",
+            "맥스": "Max",
+            "최신 정보": "latest news",
+            "최신": "latest",
+            "정보": "news",
+            "출시일": "release date",
+            "가격": "price",
+            "사양": "specifications",
+        }
+        normalized = source
+        applied = False
+        for korean, english in aliases.items():
+            if korean not in normalized:
+                continue
+            normalized = normalized.replace(korean, english)
+            applied = True
+        if not applied or "AirPods" not in normalized:
+            return ""
+        normalized = normalized.replace("latest news", " ")
+        return " ".join(normalized.split())
 
     @staticmethod
     def source_rows_from_report(report: WebRetrievalReport) -> list[dict[str, str]]:
@@ -274,4 +305,3 @@ class GeneralChatWebExecutionHelpers:
             "round_timeout_seconds": float(max(1.0, round_timeout_seconds)),
         }
         return deduped, collected_logs, metadata
-

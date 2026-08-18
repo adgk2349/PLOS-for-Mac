@@ -20,6 +20,7 @@ struct ChatMessage: Identifiable, Codable {
     var verification: VerificationResult?
     var reasoningBrief: String?
     var artifacts: [GeneratedArtifact]?
+    var citations: [Citation]?
     var actions: [SuggestedAction]
     let timestamp: Date
     var isStreaming: Bool = false
@@ -42,6 +43,7 @@ struct ChatMessage: Identifiable, Codable {
         verification = nil
         reasoningBrief = nil
         artifacts = nil
+        citations = nil
         actions = []
         self.timestamp = timestamp
     }
@@ -60,6 +62,7 @@ struct ChatMessage: Identifiable, Codable {
         verification = nil
         reasoningBrief = Self.nfc(response.reasoning_brief)
         artifacts = nil
+        citations = nil
         actions = response.actions
         self.timestamp = timestamp
     }
@@ -88,6 +91,7 @@ struct ChatMessage: Identifiable, Codable {
         verification = response.verification
         reasoningBrief = nil
         artifacts = response.artifacts
+        citations = response.citations
         actions = response.actions
         if isDegraded {
             let trimmedText = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -113,6 +117,7 @@ struct ChatRoom: Codable, Identifiable {
     var lastResolvedRoomScopeHash: String?
     var lastResolvedRoomStorageID: String?
     var latestQueryForDeepAnalysis: String?
+    var titleGenerationState: String? = nil
     var updatedAt: Date
     var archivedAt: Date?
 

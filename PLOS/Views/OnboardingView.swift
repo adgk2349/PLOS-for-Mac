@@ -268,8 +268,9 @@ struct OnboardingView: View {
             if isSelected {
                 viewModel.removeFolder(path)
             } else {
-                viewModel.includedFolderURLs.append(URL(fileURLWithPath: path))
-                viewModel.persistBookmarks()
+                // A raw path does not grant sandbox access. Open the picker at
+                // the preset directory so macOS can issue a durable bookmark.
+                viewModel.addFolder(initialDirectoryURL: URL(fileURLWithPath: path))
             }
         } label: {
             HStack(spacing: 6) {

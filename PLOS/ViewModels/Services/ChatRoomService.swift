@@ -177,6 +177,20 @@ final class ChatRoomService {
         return isGenericGreeting(trimmed)
     }
 
+    func normalizeGeneratedChatTitle(_ raw: String) -> String? {
+        var title = raw
+            .precomposedStringWithCanonicalMapping
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        title = title.trimmingCharacters(in: CharacterSet(charactersIn: " \t\\\"'`“”‘’#*-:："))
+        title = title.replacingOccurrences(of: #"(?i)^(?:title|제목)\s*[:：]\s*"#, with: "", options: .regularExpression)
+        title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard title.count >= 2 else { return nil }
+        return String(title.prefix(48)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func isGenericGreeting(_ text: String) -> Bool {
         let lowered = text
             .precomposedStringWithCanonicalMapping

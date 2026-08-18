@@ -203,6 +203,10 @@ final class SidecarAPIClient {
         try await request(path: "/v1/chat/local", method: "POST", body: payload)
     }
 
+    func generateChatTitle(_ payload: ChatTitleRequest) async throws -> ChatTitleResponse {
+        try await request(path: "/v1/chat/title", method: "POST", body: payload)
+    }
+
     func localChatV2(_ payload: LocalChatRequestV2) async throws -> ComposedChatResponseV2 {
         try await request(path: "/v2/chat/local", method: "POST", body: payload)
     }

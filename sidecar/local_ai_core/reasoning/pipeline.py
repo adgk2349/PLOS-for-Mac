@@ -148,9 +148,9 @@ class ReasoningPipeline(PipelineCompatDelegates):
         payload = dict(digest or {})
         lines: list[str] = []
 
-        topics = [str(item).strip() for item in (payload.get("active_topics") or []) if str(item).strip()]
-        if topics:
-            lines.append("topics: " + ", ".join(topics[:6]))
+        rolling_summary = " ".join(str(payload.get("rolling_summary") or "").split()).strip()
+        if rolling_summary:
+            lines.append("earlier_context: " + rolling_summary[:320])
 
         facts = [str(item).strip() for item in (payload.get("stable_facts") or []) if str(item).strip()]
         if facts:
@@ -160,7 +160,8 @@ class ReasoningPipeline(PipelineCompatDelegates):
         if loops:
             lines.append("open_loops: " + " | ".join(loops[:3]))
 
-        recent_user_turns: list[str] = []
+        recent_exchanges: list[tuple[str, str]] = []
+        pending_user = ""
         for row in payload.get("recent_turns") or []:
             if not isinstance(row, dict):
                 continue
@@ -169,16 +170,27 @@ class ReasoningPipeline(PipelineCompatDelegates):
             if not text:
                 continue
             if role == "user":
-                recent_user_turns.append(text[:140])
-        if recent_user_turns:
-            lines.append("recent_user: " + " / ".join(recent_user_turns[-3:]))
+                pending_user = text
+            elif role == "assistant" and pending_user:
+                recent_exchanges.append((pending_user, text))
+                pending_user = ""
+        if recent_exchanges:
+            for user_text, assistant_text in recent_exchanges[-3:]:
+                lines.append(f"recent_exchange: U={user_text[:110]} | A={assistant_text[:160]}")
+        elif pending_user:
+            lines.append("recent_user: " + pending_user[:140])
+
+        topics = [str(item).strip() for item in (payload.get("active_topics") or []) if str(item).strip()]
+        if topics:
+            lines.append("topics: " + ", ".join(topics[:6]))
 
         if isinstance(last_context, dict):
             last_query = " ".join(str(last_context.get("last_user_query") or "").split()).strip()
             if last_query:
                 lines.append("last_query: " + last_query[:160])
-            # Avoid feeding previous assistant phrasing back into next-turn prompt.
-            # This reduces style drift, echo loops, and multilingual contamination.
+            last_summary = " ".join(str(last_context.get("result_summary") or "").split()).strip()
+            if last_summary and not recent_exchanges:
+                lines.append("last_answer: " + last_summary[:180])
 
         summary = "\n".join(line for line in lines if line).strip()
         if not summary:
@@ -267,6 +279,7 @@ class ReasoningPipeline(PipelineCompatDelegates):
         queue_wait_timeout = max(0.01, float(os.getenv("LOCAL_AI_STREAM_QUEUE_TIMEOUT_SEC", "0.05")))
         batch_char_limit = max(120, int(os.getenv("LOCAL_AI_STREAM_BATCH_CHARS", "420")))
         stream_prefix_cleaned = False
+        stream_prefix_pending = ""
 
         def _on_token(piece: str) -> None:
             value = str(piece or "")
@@ -297,9 +310,10 @@ class ReasoningPipeline(PipelineCompatDelegates):
                     try:
                         while True:
                             piece = self._drain_token_queue(token_queue, initial_piece=token_queue.get_nowait(), char_limit=batch_char_limit)
-                            piece, stream_prefix_cleaned = self._sanitize_stream_piece(
+                            piece, stream_prefix_cleaned, stream_prefix_pending = self._sanitize_stream_piece(
                                 piece,
                                 prefix_cleaned=stream_prefix_cleaned,
+                                prefix_pending=stream_prefix_pending,
                             )
                             if not piece:
                                 continue
@@ -353,9 +367,10 @@ class ReasoningPipeline(PipelineCompatDelegates):
                         )
                     continue
                 piece = self._drain_token_queue(token_queue, initial_piece=initial_piece, char_limit=batch_char_limit)
-                piece, stream_prefix_cleaned = self._sanitize_stream_piece(
+                piece, stream_prefix_cleaned, stream_prefix_pending = self._sanitize_stream_piece(
                     piece,
                     prefix_cleaned=stream_prefix_cleaned,
+                    prefix_pending=stream_prefix_pending,
                 )
                 if not piece:
                     continue
@@ -505,10 +520,15 @@ class ReasoningPipeline(PipelineCompatDelegates):
         return chunks
 
     @staticmethod
-    def _sanitize_stream_piece(piece: str, *, prefix_cleaned: bool) -> tuple[str, bool]:
-        text = str(piece or "")
+    def _sanitize_stream_piece(
+        piece: str,
+        *,
+        prefix_cleaned: bool,
+        prefix_pending: str = "",
+    ) -> tuple[str, bool, str]:
+        text = str(prefix_pending or "") + str(piece or "")
         if not text:
-            return "", prefix_cleaned
+            return "", prefix_cleaned, ""
         text = re.sub(r"(?im)^\s*continuation\s*:\s*", "", text)
         text = re.sub(r"(?im)^:?\s*please\s*provide\s*the\s*text\s*you\s*would\s*like\s*me\s*to\s*continue\.?\s*$", "", text)
         text = re.sub(r"(?i)pleaseprovidethetextyouwouldlikemetocontinue\.?", "", text)
@@ -520,7 +540,21 @@ class ReasoningPipeline(PipelineCompatDelegates):
         cleaned_flag = prefix_cleaned
         if not cleaned_flag:
             text = re.sub(r"(?im)^\s*(?:answer|response|final answer|답변|최종 답변)\s*[:：]\s*", "", text)
-            text = re.sub(r"(?im)^\s*(?:assistant|user|you|a|q)\s*[:：]?\s*", "", text)
+            # Do not treat a bare `a`/`q` as a role marker: valid answers can
+            # begin with those letters (and Gemma's leaked `AMENTE` does).
+            text = re.sub(r"(?im)^\s*(?:assistant|user|you)\s*[:：]?\s*", "", text)
+            # Gemma-family checkpoints occasionally leak this tokenizer prefix.
+            # Keep a split prefix pending so it cannot flash in the live UI as
+            # `A` -> `AMENTE` before the next chunk arrives.
+            leading = text.lstrip()
+            lowered_leading = leading.lower()
+            noise_prefix = "amente"
+            if lowered_leading and noise_prefix.startswith(lowered_leading):
+                return "", cleaned_flag, leading
+            if lowered_leading.startswith(noise_prefix):
+                suffix = leading[len(noise_prefix):]
+                if not suffix or suffix[0] in " \t\r\n.,!?~:;-":
+                    text = suffix.lstrip(" \t\r\n.,!?~:;-")
             cleaned_flag = True
         stripped = text.strip().lower()
         if stripped in {
@@ -538,8 +572,8 @@ class ReasoningPipeline(PipelineCompatDelegates):
             "user",
             ":",
         }:
-            return "", cleaned_flag
+            return "", cleaned_flag, ""
         if not text.strip():
-            return "", cleaned_flag
-        return text, cleaned_flag
+            return "", cleaned_flag, ""
+        return text, cleaned_flag, ""
  

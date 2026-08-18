@@ -4,6 +4,22 @@ struct PLOSGlassTheme {
     static let strokeStrong = Color.primary.opacity(0.24)
     static let strokeSoft = Color.primary.opacity(0.12)
 
+    // Keep the main workspace quiet and opaque like a code editor. Glass is
+    // reserved for controls and transient surfaces, not the reading canvas.
+    static func workspaceBackground(for scheme: ColorScheme) -> Color {
+        if scheme == .dark {
+            return Color(red: 0.075, green: 0.075, blue: 0.073)
+        }
+        return Color(red: 0.94, green: 0.94, blue: 0.93)
+    }
+
+    static func workspaceSidebar(for scheme: ColorScheme) -> Color {
+        if scheme == .dark {
+            return Color(red: 0.105, green: 0.105, blue: 0.102)
+        }
+        return Color(red: 0.89, green: 0.89, blue: 0.88)
+    }
+
     static func chromeTint(for scheme: ColorScheme) -> Color {
         if scheme == .dark {
             return Color.black.opacity(0.24)
@@ -41,14 +57,9 @@ struct PLOSGlassBackground: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        let tint = colorScheme == .dark
-            ? Color.black.opacity(0.22)
-            : Color.white.opacity(0.24)
-
         Rectangle()
-            .fill(.clear)
-            .glassEffect(.regular.tint(tint), in: Rectangle())
-        .ignoresSafeArea()
+            .fill(PLOSGlassTheme.workspaceBackground(for: colorScheme))
+            .ignoresSafeArea()
     }
 }
 

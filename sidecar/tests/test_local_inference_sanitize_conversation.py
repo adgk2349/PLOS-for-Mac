@@ -181,6 +181,27 @@ def test_generate_conversational_repairs_meta_only_promise_answer():
     assert result.used_fallback is False
     assert result.answer == "핵심은 오늘 가장 중요한 일 하나를 먼저 끝내는 것입니다."
 
+def test_generate_conversational_repairs_punctuation_only_answer():
+    engine = _SequentialStubInferenceEngine(
+        outputs_by_engine={
+            LocalEngine.MLX: [
+                ".",
+                "큰 해커톤은 팀 구성과 일정이 맞을 때 선별해서 참여하는 편이 좋습니다.",
+            ],
+            LocalEngine.LLAMA_CPP: [None],
+        }
+    )
+    result = engine.generate_conversational(
+        query="큰 유형의 해커톤을 말하는 거야",
+        mode=WorkMode.GENERAL,
+        profile="recommended",
+        engine=LocalEngine.MLX,
+        language_preference="ko",
+        allow_static_fallback=False,
+    )
+    assert result.used_fallback is False
+    assert result.answer == "큰 해커톤은 팀 구성과 일정이 맞을 때 선별해서 참여하는 편이 좋습니다."
+
 def test_generate_conversational_continues_truncated_answer_once():
     engine = _SequentialStubInferenceEngine(
         outputs_by_engine={

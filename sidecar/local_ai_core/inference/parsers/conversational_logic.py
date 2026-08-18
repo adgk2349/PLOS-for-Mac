@@ -491,6 +491,7 @@ class ConversationalLogic(BaseDelegate):
             "comma_loop_artifact",
             "truncated_answer",
             "intent_restatement",
+            "non_substantive_answer",
         }
         return [item for item in issues if item in hard]
 
@@ -672,6 +673,8 @@ class ConversationalLogic(BaseDelegate):
             return ["empty"]
         issues: list[str] = []
         lowered_clean = cleaned.lower()
+        if re.search(r"[A-Za-z0-9가-힣ぁ-ゖァ-ヺ一-龥]", cleaned) is None:
+            issues.append("non_substantive_answer")
         if self._looks_instructional_meta_response(cleaned):
             issues.append("meta_leak")
         if self._contains_context_leak_phrase(cleaned):

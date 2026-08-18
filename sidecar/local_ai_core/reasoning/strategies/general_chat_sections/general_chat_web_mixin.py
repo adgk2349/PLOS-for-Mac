@@ -152,13 +152,22 @@ class GeneralChatWebMixin:
 
     @staticmethod
     def _deterministic_web_summary(*, query: str, sources: list[dict[str, str]], language: str) -> str:
+        def excerpt(value: str) -> str:
+            compact = " ".join(str(value or "").split()).strip()
+            if len(compact) <= 260:
+                return compact
+            sentence_end = max(compact.rfind(mark, 0, 260) for mark in (". ", "! ", "? ", "다. ", "요. "))
+            if sentence_end >= 100:
+                return compact[: sentence_end + 1].rstrip()
+            return compact[:257].rstrip() + "..."
+
         if language == "ko":
             header = "웹 검색 근거를 정리하면 아래와 같습니다."
             lead = f"질문: {query.strip()}" if query.strip() else ""
             bullets: list[str] = []
             for idx, item in enumerate(sources[:3], start=1):
                 title = str(item.get("title") or "").strip() or "제목 없음"
-                snippet = str(item.get("snippet") or "").strip()
+                snippet = excerpt(str(item.get("snippet") or ""))
                 if snippet:
                     bullets.append(f"- [{idx}] {title}: {snippet}")
                 else:
@@ -170,7 +179,7 @@ class GeneralChatWebMixin:
         bullets = []
         for idx, item in enumerate(sources[:3], start=1):
             title = str(item.get("title") or "").strip() or "untitled"
-            snippet = str(item.get("snippet") or "").strip()
+            snippet = excerpt(str(item.get("snippet") or ""))
             bullets.append(f"- [{idx}] {title}" + (f": {snippet}" if snippet else ""))
         refs = [f"[{i}] {s.get('url','')}" for i, s in enumerate(sources[:3], start=1) if str(s.get("url") or "").strip()]
         return "\n".join([header, *bullets, "Sources:", *refs]).strip()

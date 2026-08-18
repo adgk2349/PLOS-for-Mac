@@ -1,5 +1,47 @@
 import re
 
+
+def normalize_chat_message_state(message_state: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Return a chat-template-safe message sequence.
+
+    Chat templates expect system instructions before an alternating
+    user/assistant transcript.  The conversation pipeline adds late policy
+    hints while assembling a turn, so preserve those hints but move them into
+    the leading system block instead of emitting an invalid mid-turn system
+    message.
+    """
+    system_parts: list[str] = []
+    turns: list[dict[str, str]] = []
+    for item in message_state or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "system":
+            system_parts.append(content)
+            continue
+        if role not in {"user", "assistant"}:
+            continue
+        if role == "assistant" and not re.search(r"[A-Za-z0-9가-힣ぁ-ゖァ-ヺ一-龥]", content):
+            continue
+        # A transcript cannot begin with an assistant response.  This can
+        # happen when memory contains a stale assistant-only fragment.
+        if role == "assistant" and not turns:
+            continue
+        if turns and turns[-1]["role"] == role:
+            turns[-1]["content"] = f"{turns[-1]['content']}\n\n{content}"
+        else:
+            turns.append({"role": role, "content": content})
+
+    normalized: list[dict[str, str]] = []
+    if system_parts:
+        normalized.append({"role": "system", "content": "\n\n".join(system_parts)})
+    normalized.extend(turns)
+    return normalized
+
+
 def inject_system_instruction_if_needed(
     message_state: list[dict[str, str]],
     response_language: str | None = None
@@ -9,6 +51,7 @@ def inject_system_instruction_if_needed(
     consecutive system message blocks which cause fragment-token hallucinations ('께서도', etc.)
     and standardizes response behavior.
     """
+    message_state = normalize_chat_message_state(message_state)
     if not message_state:
         return message_state
     

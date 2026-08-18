@@ -192,6 +192,11 @@ enum ChatPanelMarkdownFormatter {
 
         let replacements: [(String, String)] = [
             (#"([^\n])\s+(#{1,6}\s)"#, "$1\n\n$2"),
+            // Small local models often serialize a whole outline on one line
+            // (`1. ... * item * item 2. ...`). Restore actual Markdown block
+            // boundaries before MarkdownUI sees the partial streamed document.
+            (#"([^\n])\s+(\d{1,2}[.)])\s+(?=\p{L}|['\"*_])"#, "$1\n\n$2 "),
+            (#"([^\n*])\s+\*\s+(?!\*)"#, "$1\n\n* "),
             (#"([.!?。！？])\s+((?:\d{1,2}[.)]|[-*•])\s+)"#, "$1\n$2"),
             (#"\s+((?:\d{1,2}[.)])(?=[^\d\s]))"#, "\n$1"),
             (#"(?m)^(\d{1,2}[.)])(?=\S)"#, "$1 "),

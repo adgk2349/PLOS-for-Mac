@@ -131,6 +131,7 @@ extension AppViewModel {
 
 
     func createChatRoom() {
+        stopActiveLocalChatGeneration()
         let room = chatRoomService.makeDefaultRoom()
         chatRooms.insert(room, at: 0)
         selectedChatRoomID = room.id
@@ -152,6 +153,7 @@ extension AppViewModel {
 
 
     func selectChatRoom(_ roomID: String) {
+        stopActiveLocalChatGeneration()
         flushStreamingRoomState(updateTimestamp: true, reorder: true, persist: true)
         guard let room = chatRooms.first(where: { $0.id == roomID }) else {
             return
@@ -374,8 +376,7 @@ extension AppViewModel {
         let updated = mutateChatMessage(id: messageID, shouldSyncActiveRoom: false) { message in
             if let response {
                 var merged = ChatMessage(id: message.id, localV2: response, timestamp: message.timestamp)
-                let isDegraded = response.used_fallback ?? false
-                if let finalText, !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !isDegraded {
+                if let finalText, !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     merged.text = finalText.precomposedStringWithCanonicalMapping
                     merged.lead = nil
                     merged.resultSummary = nil
@@ -438,6 +439,67 @@ extension AppViewModel {
         if shouldPersist {
             persistChatRooms()
         }
+        scheduleAutomaticChatTitleIfNeeded(roomID: activeID)
+    }
+
+    private func scheduleAutomaticChatTitleIfNeeded(roomID: String) {
+        guard let index = chatRooms.firstIndex(where: { $0.id == roomID }) else { return }
+        let room = chatRooms[index]
+        guard room.titleGenerationState == nil else { return }
+
+        let userMessages = room.messages.filter { $0.source == .user }
+        guard userMessages.count == 1,
+              let userText = userMessages.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !userText.isEmpty,
+              let assistantMessage = room.messages.first(where: {
+                  ($0.source == .local || $0.source == .external) && !$0.isStreaming
+              }),
+              let assistantText = assistantMessage.text?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !assistantText.isEmpty
+        else {
+            return
+        }
+
+        let provisionalTitle = room.title
+        chatRooms[index].titleGenerationState = "pending"
+        persistChatRooms()
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let response = try await self.performWithSidecarRetry { client in
+                    try await client.generateChatTitle(
+                        ChatTitleRequest(
+                            user_text: userText,
+                            assistant_text: String(assistantText.prefix(1800)),
+                            language: L10n.sidecarLanguageCode(for: self.appLanguage)
+                        )
+                    )
+                }
+                guard let title = self.chatRoomService.normalizeGeneratedChatTitle(response.title) else {
+                    self.finishAutomaticChatTitleGeneration(roomID: roomID, title: nil, provisionalTitle: provisionalTitle)
+                    return
+                }
+                self.finishAutomaticChatTitleGeneration(roomID: roomID, title: title, provisionalTitle: provisionalTitle)
+            } catch {
+                self.finishAutomaticChatTitleGeneration(roomID: roomID, title: nil, provisionalTitle: provisionalTitle)
+            }
+        }
+    }
+
+    private func finishAutomaticChatTitleGeneration(roomID: String, title: String?, provisionalTitle: String) {
+        guard let index = chatRooms.firstIndex(where: { $0.id == roomID }),
+              chatRooms[index].titleGenerationState == "pending"
+        else {
+            return
+        }
+
+        // Do not overwrite a title changed while the local model was generating.
+        if let title, chatRooms[index].title == provisionalTitle {
+            chatRooms[index].title = title
+        }
+        chatRooms[index].titleGenerationState = title == nil ? "failed" : "generated"
+        persistChatRooms()
     }
 
     private func appendStreamingDelta(_ delta: String, to message: inout ChatMessage) {
@@ -754,6 +816,7 @@ extension AppViewModel {
 
     private func resetTransientGenerationUIState() {
         activeGeneratingMessageID = nil
+        activeChatGenerationID = nil
         liveThinkingTraceEvents = []
         isGeneratingChatResponse = false
         isStreamingRoomStateDirty = false
