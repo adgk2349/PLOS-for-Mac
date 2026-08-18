@@ -3,10 +3,12 @@ from local_ai_core.web_retrieval import (
     WebSearchSource,
     _DiscoveredURL,
     _FetchedPage,
+    _BraveSearchResultParser,
     _SearxngHTMLResultParser,
 )
 import httpx
 import local_ai_core.web_retrieval as web_retrieval_module
+from local_ai_core.reasoning.helpers.web.general_chat_web_execution_helpers import GeneralChatWebExecutionHelpers
 
 
 def test_extract_direct_url_skips_search(monkeypatch):
@@ -56,6 +58,156 @@ def test_discover_urls_falls_back_to_instant(monkeypatch):
     discovered = retriever.discover_urls(query="Swift 공식 문서", limit=8, logs=logs)
     assert len(discovered) == 1
     assert discovered[0].url == "https://docs.swift.org/swift-book"
+
+
+def test_discover_urls_falls_back_to_bing_rss_when_duckduckgo_has_no_results(monkeypatch):
+    retriever = WebRetriever()
+    logs: list[str] = []
+
+    monkeypatch.setattr(retriever, "_discover_from_ddg_html", lambda **kwargs: [])
+    monkeypatch.setattr(retriever, "_discover_from_ddg_instant", lambda **kwargs: [])
+    monkeypatch.setattr(
+        retriever,
+        "_discover_from_bing_rss",
+        lambda **kwargs: [
+            _DiscoveredURL(
+                title="Apple AirPods Max",
+                url="https://www.apple.com/airpods-max/",
+                snippet="Official product page",
+                source="bing_rss",
+            )
+        ],
+    )
+
+    discovered = retriever.discover_urls(query="에어팟 맥스 최신 정보", limit=8, logs=logs)
+
+    assert len(discovered) == 1
+    assert discovered[0].source == "bing_rss"
+
+
+def test_bing_rss_discovery_parses_search_items(monkeypatch):
+    retriever = WebRetriever()
+    logs: list[str] = []
+    xml = b'''<?xml version="1.0"?><rss><channel><item>
+        <title>Apple AirPods Max</title>
+        <link>https://www.apple.com/airpods-max/</link>
+        <description>Official &amp;amp; current product information.</description>
+    </item></channel></rss>'''
+
+    class _Response:
+        content = xml
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, *args, **kwargs):
+            return _Response()
+
+    monkeypatch.setattr(web_retrieval_module.httpx, "Client", _Client)
+    discovered = retriever._discover_from_bing_rss(query="AirPods Max", limit=3, logs=logs)
+
+    assert len(discovered) == 1
+    assert discovered[0].url == "https://www.apple.com/airpods-max/"
+    assert discovered[0].snippet == "Official & current product information."
+
+
+def test_brave_result_parser_extracts_title_url_and_snippet():
+    parser = _BraveSearchResultParser()
+    parser.feed('''
+        <div class="snippet card"><div class="result-content">
+          <a href="https://docs.python.org/3/whatsnew/3.14.html"><div class="title search-snippet-title">What's new in Python 3.14</div></a>
+          <div class="generic-snippet"><div class="content">Official release notes and upgrade guidance.</div></div>
+        </div></div>
+    ''')
+    parser.close()
+
+    assert parser.results == [{
+        "title": "What's new in Python 3.14",
+        "url": "https://docs.python.org/3/whatsnew/3.14.html",
+        "snippet": "Official release notes and upgrade guidance.",
+    }]
+
+
+def test_discover_urls_uses_brave_before_lower_quality_fallbacks(monkeypatch):
+    retriever = WebRetriever()
+    logs: list[str] = []
+    monkeypatch.setattr(retriever, "_discover_from_ddg_html", lambda **kwargs: [])
+    monkeypatch.setattr(
+        retriever,
+        "_discover_from_brave_search",
+        lambda **kwargs: [
+            _DiscoveredURL(
+                title="Python 3.14 release notes",
+                url="https://docs.python.org/3/whatsnew/3.14.html",
+                snippet="Official documentation",
+                source="brave_html",
+            )
+        ],
+    )
+    monkeypatch.setattr(retriever, "_discover_from_ddg_instant", lambda **kwargs: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(retriever, "_discover_from_bing_rss", lambda **kwargs: (_ for _ in ()).throw(AssertionError()))
+
+    discovered = retriever.discover_urls(query="Python 3.14 release notes", limit=3, logs=logs)
+
+    assert len(discovered) == 1
+    assert discovered[0].source == "brave_html"
+
+
+def test_relevance_ranking_rejects_generic_product_page_for_specific_query():
+    logs: list[str] = []
+    ranked = WebRetriever._rank_relevant_discovered(
+        query="Apple AirPods Max 2 latest news",
+        discovered=[
+            _DiscoveredURL(
+                title="AirPods - Apple",
+                url="https://www.apple.com/airpods/",
+                snippet="Wireless headphones from Apple.",
+                source="bing_rss",
+            )
+        ],
+        logs=logs,
+    )
+
+    assert ranked == []
+    assert "web_discovery:low_relevance" in logs
+
+
+def test_relevance_ranking_keeps_matching_official_documentation():
+    ranked = WebRetriever._rank_relevant_discovered(
+        query="Python 3.14 release notes official",
+        discovered=[
+            _DiscoveredURL(
+                title="What's new in Python 3.14",
+                url="https://docs.python.org/3/whatsnew/3.14.html",
+                snippet="Official Python 3.14 release notes.",
+                source="brave_html",
+            )
+        ],
+        logs=[],
+    )
+
+    assert len(ranked) == 1
+
+
+def test_korean_airpods_query_is_refined_for_global_product_search():
+    refined = GeneralChatWebExecutionHelpers.query_variant_for_round(
+        object(),
+        original_query="에어팟 맥스 2 최신 정보",
+        round_index=2,
+        round1_sources=[],
+    )
+
+    assert refined == "AirPods Max 2 release date"
 
 
 def test_discover_urls_prefers_searxng_when_url_is_configured(monkeypatch):

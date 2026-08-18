@@ -154,8 +154,11 @@ enum StreamTagParser {
             answerLines.append(line)
         }
 
-        let answer = answerLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        if answer.isEmpty {
+        // Stream chunks can begin or end at a tokenizer whitespace boundary. Do
+        // not trim the live answer here: doing so joins adjacent Korean words or
+        // removes Markdown line breaks before the next chunk is appended.
+        let answer = answerLines.joined(separator: "\n")
+        if answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return (dedupeReasoningNotes(reasoning), cleaned.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         return (dedupeReasoningNotes(reasoning), answer)

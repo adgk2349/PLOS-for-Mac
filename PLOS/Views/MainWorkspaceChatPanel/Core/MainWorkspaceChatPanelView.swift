@@ -606,7 +606,8 @@ struct ChatPanelView: View {
             markdownRichContent(
                 content,
                 font: .body,
-                keyPrefix: "\(message.id.uuidString)-local-text"
+                keyPrefix: "\(message.id.uuidString)-local-text",
+                isStreaming: message.isStreaming
             )
         }
         if let lead = message.lead, !lead.isEmpty {
@@ -1310,7 +1311,12 @@ struct ChatPanelView: View {
     }
 
     @ViewBuilder
-    private func markdownRichContent(_ raw: String, font: Font, keyPrefix: String) -> some View {
+    private func markdownRichContent(
+        _ raw: String,
+        font: Font,
+        keyPrefix: String,
+        isStreaming: Bool = false
+    ) -> some View {
         let segments = ChatPanelMarkdownFormatter.markdownSegments(from: raw, keyPrefix: keyPrefix)
         VStack(alignment: .leading, spacing: 8) {
             ForEach(segments) { segment in
@@ -1329,6 +1335,9 @@ struct ChatPanelView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // MarkdownUI parses a value when the view is created. Recreate the partial
+        // document for each streamed chunk so headings, lists, and fences update live.
+        .id(isStreaming ? "\(keyPrefix)|\(raw.hashValue)" : keyPrefix)
     }
 
     @ViewBuilder
@@ -1599,9 +1608,13 @@ struct ChatPanelView: View {
     }
 
     private func citationsForMessage(_ message: ChatMessage) -> [Citation] {
-        guard message.source == .local, message.id == latestLocalMessageID else {
+        guard message.source == .local else {
             return []
         }
+        if let messageCitations = message.citations, !messageCitations.isEmpty {
+            return Array(messageCitations.prefix(3))
+        }
+        guard message.id == latestLocalMessageID else { return [] }
         return Array(viewModel.citations.prefix(3))
     }
 
@@ -1610,11 +1623,11 @@ struct ChatPanelView: View {
             HStack(spacing: 6) {
                 ForEach(Array(citations.enumerated()), id: \.offset) { index, citation in
                     Button {
-                        viewModel.highlightedCitationPath = citation.file_path
+                        openCitation(citation)
                     } label: {
                         HStack(spacing: 4) {
                             Text("[\(index + 1)]")
-                            Text(nfc(URL(fileURLWithPath: citation.file_path).lastPathComponent))
+                            Text(citationLabel(citation))
                                 .lineLimit(1)
                         }
                         .font(.caption2)
@@ -1629,6 +1642,23 @@ struct ChatPanelView: View {
             }
         }
         .padding(.top, 2)
+    }
+
+    private func openCitation(_ citation: Citation) {
+        let path = citation.file_path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let url = URL(string: path), let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        viewModel.highlightedCitationPath = path
+    }
+
+    private func citationLabel(_ citation: Citation) -> String {
+        let path = citation.file_path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let url = URL(string: path), let host = url.host, !host.isEmpty {
+            return nfc(host)
+        }
+        return nfc(URL(fileURLWithPath: path).lastPathComponent)
     }
 
     private func nfc(_ value: String) -> String {

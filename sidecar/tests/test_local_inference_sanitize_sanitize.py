@@ -151,6 +151,52 @@ def test_postprocess_conversational_answer_strips_meta_prefix_phrase():
     )
     assert cleaned == "안녕하세요!"
 
+
+def test_postprocess_conversational_answer_preserves_long_greeting_body():
+    answer = (
+        "안녕하세요. 오늘은 해커톤 준비를 시작하기 좋은 시기예요. "
+        "관심 분야를 하나 정하고, 모집 일정과 팀 구성부터 확인해 보세요."
+    )
+    cleaned = LocalInferenceEngine._postprocess_conversational_answer(
+        answer,
+        query="안녕, 해커톤 준비를 시작할까?",
+        response_language="ko",
+    )
+
+    assert cleaned == answer
+
+
+def test_postprocess_conversational_answer_preserves_trailing_question_sentence():
+    answer = (
+        "큰 해커톤은 팀 구성과 일정이 맞을 때 선별해서 참여하는 편이 좋아요. "
+        "포트폴리오와 네트워킹에는 도움이 되지만 경쟁도 더 치열합니다. "
+        "이번에 노리는 분야나 대회가 있나요? "
+        "관심 있는 일정이 있다면 같이 우선순위를 정해볼까요?"
+    )
+    cleaned = LocalInferenceEngine._postprocess_conversational_answer(
+        answer,
+        query="큰 해커톤 위주로 참여하면 좋겠지?",
+        response_language="ko",
+    )
+
+    assert cleaned == answer
+
+
+def test_postprocess_conversational_answer_preserves_tail_after_inline_marker_words():
+    answer = (
+        "대회 규모보다 주제와 팀 구성이 더 중요해요. "
+        "Wait, 일정이 겹치면 준비 시간이 부족해질 수 있습니다. "
+        "마지막으로 제출물 범위부터 합의하세요."
+    )
+    cleaned = LocalInferenceEngine._postprocess_conversational_answer(
+        answer,
+        query="해커톤을 고를 때 뭘 봐야 해?",
+        response_language="ko",
+    )
+
+    assert cleaned == answer
+
+
 def test_postprocess_conversational_answer_strips_you_a_prefixes():
     cleaned = LocalInferenceEngine._postprocess_conversational_answer(
         "You: 네, 로컬 모델은 어디서든 쓸 수 있어요.\nA: 물 조금 마셔요.",
@@ -178,13 +224,13 @@ def test_postprocess_conversational_answer_collapses_comma_loop():
     assert ",,,,," not in cleaned
     assert cleaned.endswith(".")
 
-def test_postprocess_conversational_answer_limits_questions_to_one():
+def test_postprocess_conversational_answer_preserves_multiple_questions():
     cleaned = LocalInferenceEngine._postprocess_conversational_answer(
         "어떤 메뉴 좋아하세요? 어떤 종류를 생각 중이세요? 김치찌개가 무난해요.",
         query="오늘 저녁 뭐 먹을까",
         response_language="ko",
     )
-    assert cleaned.count("?") <= 1
+    assert cleaned == "어떤 메뉴 좋아하세요? 어떤 종류를 생각 중이세요? 김치찌개가 무난해요."
     assert "김치찌개" in cleaned
 
 def test_normalize_three_option_recommendation_formats_numbered_options():

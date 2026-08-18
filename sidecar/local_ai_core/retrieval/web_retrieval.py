@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
@@ -7,6 +8,7 @@ import os
 import re
 import time
 from urllib.parse import parse_qs, unquote, urlparse, urlsplit, urlunsplit
+from xml.etree import ElementTree
 
 try:
     import httpx
@@ -133,6 +135,72 @@ class _DuckDuckGoHTMLResultParser(HTMLParser):
             self._current_snippet_chunks.append(text)
 
 
+class _BraveSearchResultParser(HTMLParser):
+    """Extract the server-rendered organic result cards from Brave Search HTML."""
+
+    def __init__(self):
+        super().__init__()
+        self.results: list[dict[str, str]] = []
+        self._inside_result = False
+        self._result_div_depth = 0
+        self._href = ""
+        self._title_chunks: list[str] = []
+        self._snippet_chunks: list[str] = []
+        self._inside_title = False
+        self._inside_snippet = False
+
+    def handle_starttag(self, tag, attrs):
+        attr_map = {k: v for k, v in attrs}
+        css_class = str(attr_map.get("class") or "")
+        if not self._inside_result:
+            if tag == "div" and "snippet" in css_class.split():
+                self._inside_result = True
+                self._result_div_depth = 1
+                self._href = ""
+                self._title_chunks = []
+                self._snippet_chunks = []
+            return
+
+        if tag == "div":
+            self._result_div_depth += 1
+            if "search-snippet-title" in css_class:
+                self._inside_title = True
+            if "content" in css_class.split():
+                self._inside_snippet = True
+        elif tag == "a" and not self._href:
+            href = str(attr_map.get("href") or "").strip()
+            if href.startswith("http"):
+                self._href = href
+
+    def handle_endtag(self, tag):
+        if not self._inside_result:
+            return
+        if tag == "div":
+            if self._inside_title:
+                self._inside_title = False
+            if self._inside_snippet:
+                self._inside_snippet = False
+            self._result_div_depth -= 1
+            if self._result_div_depth <= 0:
+                title = " ".join(" ".join(self._title_chunks).split()).strip()
+                snippet = " ".join(" ".join(self._snippet_chunks).split()).strip()
+                if self._href:
+                    self.results.append({"title": title, "url": self._href, "snippet": snippet})
+                self._inside_result = False
+                self._result_div_depth = 0
+                self._href = ""
+                self._title_chunks = []
+                self._snippet_chunks = []
+                self._inside_title = False
+                self._inside_snippet = False
+
+    def handle_data(self, data):
+        if self._inside_title:
+            self._title_chunks.append(str(data or ""))
+        if self._inside_snippet:
+            self._snippet_chunks.append(str(data or ""))
+
+
 class _SearxngHTMLResultParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -222,6 +290,8 @@ class _SearxngHTMLResultParser(HTMLParser):
 class WebRetriever:
     _DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
     _DDG_INSTANT_ENDPOINT = "https://api.duckduckgo.com/"
+    _BRAVE_SEARCH_ENDPOINT = "https://search.brave.com/search"
+    _BING_RSS_ENDPOINT = "https://www.bing.com/search"
     _UA = (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -281,6 +351,21 @@ class WebRetriever:
                 prefer_searxng=prefer_searxng,
             )
             logs.append(f"web_discovery:count={len(discovered)}")
+
+        had_unranked_discovery = bool(discovered)
+        discovered = self._rank_relevant_discovered(query=query, discovered=discovered, logs=logs)
+        if not discovered and had_unranked_discovery and prefer_searxng and not direct_urls:
+            # A provider can return a non-empty but irrelevant result set. Treat it
+            # as a retrieval miss and continue with the public fallback providers.
+            logs.append("web_discovery:searxng_low_relevance:using_public_fallback")
+            discovered = self.discover_urls(
+                query=query,
+                limit=max_candidates,
+                logs=logs,
+                searxng_url=searxng_url,
+                prefer_searxng=False,
+            )
+            discovered = self._rank_relevant_discovered(query=query, discovered=discovered, logs=logs)
 
         if not discovered:
             report = WebRetrievalReport(
@@ -370,9 +455,13 @@ class WebRetriever:
             )
         
         if not discovered:
+            discovered = self._discover_from_brave_search(query=query, limit=limit, logs=logs)
+        if not discovered:
             discovered = self._discover_from_ddg_html(query=query, limit=limit, logs=logs)
         if not discovered:
             discovered = self._discover_from_ddg_instant(query=query, limit=limit, logs=logs)
+        if not discovered:
+            discovered = self._discover_from_bing_rss(query=query, limit=limit, logs=logs)
         if not discovered and (not prefer_searxng) and effective_searxng_url:
             discovered = self._discover_from_searxng(
                 query=query,
@@ -381,6 +470,42 @@ class WebRetriever:
                 base_url=effective_searxng_url,
             )
         return self._dedupe_discovered(discovered, limit=limit)
+
+    @staticmethod
+    def _rank_relevant_discovered(
+        *,
+        query: str,
+        discovered: list[_DiscoveredURL],
+        logs: list[str],
+    ) -> list[_DiscoveredURL]:
+        if not discovered or WebRetriever._extract_direct_urls(query):
+            return discovered
+        ignored = {
+            "latest", "news", "official", "information", "search", "find", "the", "and",
+            "최신", "정보", "검색", "찾아줘", "알려줘", "해줘", "문서", "관련", "대해",
+        }
+        terms = [
+            term for term in re.findall(r"[a-z0-9][a-z0-9._-]*|[가-힣]{2,}", query.casefold())
+            if len(term) >= 2 and term not in ignored
+        ]
+        terms = list(dict.fromkeys(terms))[:8]
+        if len(terms) < 2:
+            return discovered
+
+        ranked: list[tuple[float, _DiscoveredURL]] = []
+        for item in discovered:
+            haystack = " ".join([item.title, item.url, item.snippet]).casefold()
+            hits = sum(1 for term in terms if term in haystack)
+            score = hits / len(terms)
+            phrases = [" ".join(terms[index : index + 2]) for index in range(len(terms) - 1)]
+            has_key_phrase = any(phrase in haystack for phrase in phrases)
+            if score >= 0.5 and has_key_phrase:
+                ranked.append((score, item))
+        if not ranked:
+            logs.append("web_discovery:low_relevance")
+            return []
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        return [item for _, item in ranked]
 
     def _discover_from_searxng(self, *, query: str, limit: int, logs: list[str], base_url: str) -> list[_DiscoveredURL]:
         if httpx is None:
@@ -490,24 +615,28 @@ class WebRetriever:
         max_sources: int,
         logs: list[str],
     ) -> tuple[list[_FetchedPage], int]:
-        pages: list[_FetchedPage] = []
-        failures = 0
-        for item in discovered:
-            if len(pages) >= max_sources:
-                break
+        candidates = list(discovered[: max(1, int(max_sources))])
+        if not candidates:
+            return [], 0
+
+        # Independent pages should not make a slow or blocked source delay all
+        # other evidence. Preserve discovery order after concurrent retrieval.
+        def fetch(item: _DiscoveredURL) -> _FetchedPage | None:
             fetched = self._fetch_page(url=item.url, logs=logs)
             if fetched is None:
-                failures += 1
-                continue
+                return None
             title = item.title or self._domain_title(item.url)
-            pages.append(
-                _FetchedPage(
-                    title=title[:120],
-                    url=item.url,
-                    snippet=(item.snippet or "")[:320],
-                    content=fetched[:3000],
-                )
+            return _FetchedPage(
+                title=title[:120],
+                url=item.url,
+                snippet=(item.snippet or "")[:320],
+                content=fetched[:3000],
             )
+
+        with ThreadPoolExecutor(max_workers=min(3, len(candidates))) as pool:
+            fetched_pages = list(pool.map(fetch, candidates))
+        pages = [page for page in fetched_pages if page is not None]
+        failures = len(candidates) - len(pages)
         return pages, failures
 
     def build_evidence(self, *, pages: list[_FetchedPage], max_sources: int, logs: list[str]) -> list[WebSearchSource]:
@@ -637,6 +766,86 @@ class WebRetriever:
 
         walk_topics(payload.get("RelatedTopics"))
         return output[:limit]
+
+    def _discover_from_brave_search(self, *, query: str, limit: int, logs: list[str]) -> list[_DiscoveredURL]:
+        if httpx is None:
+            logs.append("error:httpx_not_installed")
+            return []
+        logs.append(f"retrieving:{self._BRAVE_SEARCH_ENDPOINT}")
+        headers = {
+            "User-Agent": self._UA,
+            "Accept-Language": self._ACCEPT_LANGUAGE,
+        }
+        try:
+            with httpx.Client(timeout=self._timeout, headers=headers, follow_redirects=True) as client:
+                response = client.get(self._BRAVE_SEARCH_ENDPOINT, params={"q": query, "source": "web"})
+                response.raise_for_status()
+                html = response.text
+        except Exception as exc:
+            logs.append(f"warning:search_failed:{self._BRAVE_SEARCH_ENDPOINT}:{exc.__class__.__name__}")
+            return []
+
+        parser = _BraveSearchResultParser()
+        parser.feed(html)
+        parser.close()
+        output: list[_DiscoveredURL] = []
+        for row in parser.results:
+            target_url = str(row.get("url") or "").strip()
+            if not self._is_http_url(target_url):
+                continue
+            output.append(
+                _DiscoveredURL(
+                    title=str(row.get("title") or self._domain_title(target_url))[:120],
+                    url=target_url,
+                    snippet=str(row.get("snippet") or "")[:320],
+                    source="brave_html",
+                )
+            )
+            if len(output) >= limit:
+                break
+        logs.append(f"retrieved:{self._BRAVE_SEARCH_ENDPOINT}:{len(output)}")
+        return output
+
+    def _discover_from_bing_rss(self, *, query: str, limit: int, logs: list[str]) -> list[_DiscoveredURL]:
+        """Use Bing's RSS response only when the preferred search providers have no results."""
+        if httpx is None:
+            logs.append("error:httpx_not_installed")
+            return []
+        logs.append(f"retrieving:{self._BING_RSS_ENDPOINT}:rss")
+        headers = {
+            "User-Agent": self._UA,
+            "Accept-Language": self._ACCEPT_LANGUAGE,
+            "Accept": "application/rss+xml,application/xml,text/xml,*/*",
+        }
+        params = {"q": query, "format": "rss", "setlang": "en-US", "cc": "US"}
+        try:
+            with httpx.Client(timeout=self._timeout, headers=headers, follow_redirects=True) as client:
+                response = client.get(self._BING_RSS_ENDPOINT, params=params)
+                response.raise_for_status()
+                root = ElementTree.fromstring(response.content)
+        except Exception as exc:
+            logs.append(f"warning:search_failed:{self._BING_RSS_ENDPOINT}:{exc.__class__.__name__}")
+            return []
+
+        output: list[_DiscoveredURL] = []
+        for item in root.findall("./channel/item"):
+            target_url = str(item.findtext("link") or "").strip()
+            if not self._is_http_url(target_url):
+                continue
+            title = " ".join(unescape(str(item.findtext("title") or "")).split()).strip()
+            snippet = " ".join(unescape(str(item.findtext("description") or "")).split()).strip()
+            output.append(
+                _DiscoveredURL(
+                    title=(title or self._domain_title(target_url))[:120],
+                    url=target_url,
+                    snippet=snippet[:320],
+                    source="bing_rss",
+                )
+            )
+            if len(output) >= limit:
+                break
+        logs.append(f"retrieved:{self._BING_RSS_ENDPOINT}:rss:{len(output)}")
+        return output
 
     def _fetch_page(self, *, url: str, logs: list[str]) -> str | None:
         if httpx is None:

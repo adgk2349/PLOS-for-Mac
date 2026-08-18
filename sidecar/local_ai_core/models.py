@@ -218,6 +218,16 @@ class LocalChatRequestV2(LocalChatRequest):
     fix_mode: Literal["plan_only", "apply_patch"] | None = None
 
 
+class ChatTitleRequest(BaseModel):
+    user_text: str = Field(min_length=1, max_length=2400)
+    assistant_text: str = Field(min_length=1, max_length=3600)
+    language: str | None = None
+
+
+class ChatTitleResponse(BaseModel):
+    title: str
+
+
 class SuggestedAction(BaseModel):
     action_id: str
     kind: SuggestedActionKind

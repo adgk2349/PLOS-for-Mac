@@ -224,8 +224,6 @@ class MlxHandler(BaseDelegate):
     ) -> str:
         if style != "conversation":
             return prompt
-        if not self._is_qwen35_model_reference(model_path):
-            return prompt
 
         tokenizer = self._mlx_tokenizer
         if tokenizer is None:

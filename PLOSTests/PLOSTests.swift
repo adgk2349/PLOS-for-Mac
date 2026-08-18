@@ -81,4 +81,32 @@ struct PLOSTests {
         #expect(resultKO == "한국어")
         #expect(resultJA == "日本語")
     }
+
+    @Test
+    func streamingParserPreservesTokenizerBoundaries() {
+        let first = StreamTagParser.splitReasoningAndAnswer(from: "첫 번째 문장 ")
+        let second = StreamTagParser.splitReasoningAndAnswer(from: "다음 문장입니다.")
+
+        #expect(first.answerText + second.answerText == "첫 번째 문장 다음 문장입니다.")
+    }
+
+    @Test
+    func markdownFormatterRestoresInlineOutlineBlocks() {
+        let raw = "1. 목표 설정 * 핵심 문제에 집중 * MVP 완성도 2. 실행 품질 향상 * 피드백 반영"
+        let normalized = ChatPanelMarkdownFormatter.normalizeMarkdownForRender(raw)
+
+        #expect(normalized.hasPrefix("1. 목표 설정"))
+        #expect(normalized.contains("\n\n* 핵심 문제에 집중"))
+        #expect(normalized.contains("\n\n2. 실행 품질 향상"))
+        #expect(normalized.contains("\n\n* 피드백 반영"))
+    }
+
+    @Test
+    func generatedChatTitleIsReducedToOneSafeLine() {
+        let service = ChatRoomService()
+        let title = service.normalizeGeneratedChatTitle("제목:  해커톤 우승 전략\n")
+
+        #expect(title == "해커톤 우승 전략")
+        #expect(service.normalizeGeneratedChatTitle("-") == nil)
+    }
 }

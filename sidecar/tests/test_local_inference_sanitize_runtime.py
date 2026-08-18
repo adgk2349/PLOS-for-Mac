@@ -178,12 +178,12 @@ def test_mlx_prepare_prompt_uses_chat_template_without_thinking_for_qwen_convers
     assert len(dummy.calls) == 1
     assert dummy.calls[0]["kwargs"].get("enable_thinking") is False
 
-def test_mlx_prepare_prompt_skips_template_for_non_qwen_model():
+def test_mlx_prepare_prompt_uses_template_for_any_chat_model():
     class _DummyTokenizer:
         has_chat_template = True
 
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
-            return "UNEXPECTED_TEMPLATE"
+            return "GEMMA_TEMPLATE"
 
     engine = LocalInferenceEngine()
     engine._mlx_tokenizer = _DummyTokenizer()
@@ -193,7 +193,7 @@ def test_mlx_prepare_prompt_skips_template_for_non_qwen_model():
         style="conversation",
         model_path="/tmp/some-base-model",
     )
-    assert rendered == prompt
+    assert rendered == "GEMMA_TEMPLATE"
 
 def test_mlx_context_window_hint_reads_max_position_embeddings(tmp_path: Path):
     model_dir = tmp_path / "qwen35_9b_gguf"

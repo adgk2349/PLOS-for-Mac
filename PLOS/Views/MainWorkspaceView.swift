@@ -279,9 +279,17 @@ struct MainWorkspaceView: View {
     }
 
     private var sidebarBackground: some View {
-        return Rectangle()
-            .fill(.ultraThinMaterial)
-            .overlay(PLOSGlassTheme.chromeTint(for: colorScheme))
+        Rectangle()
+            .fill(.clear)
+            .glassEffect(
+                .regular.tint(PLOSGlassTheme.workspaceSidebar(for: colorScheme).opacity(0.72)),
+                in: Rectangle()
+            )
+            .overlay(alignment: .trailing) {
+                Rectangle()
+                    .fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.16))
+                    .frame(width: 1)
+            }
     }
 
     private func iconButton(symbol: String, helpText: String, action: @escaping () -> Void) -> some View {

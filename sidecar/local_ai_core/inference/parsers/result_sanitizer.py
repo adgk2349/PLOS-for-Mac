@@ -178,30 +178,6 @@ class ResultSanitizer(BaseDelegate):
                     count += 1
         return count
 
-    def _limit_question_sentences(self, text: str, *, max_questions: int) -> str:
-        value = str(text or "").strip()
-        if not value:
-            return ""
-        kept_lines: list[str] = []
-        used_questions = 0
-        for line in value.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            kept_sentences: list[str] = []
-            for sentence in re.split(r"(?<=[.!?。！？])\s+", line):
-                sentence = sentence.strip()
-                if not sentence:
-                    continue
-                if self._looks_question_sentence(sentence):
-                    if used_questions >= max_questions:
-                        continue
-                    used_questions += 1
-                kept_sentences.append(sentence)
-            if kept_sentences:
-                kept_lines.append(" ".join(kept_sentences).strip())
-        return "\n".join(kept_lines).strip()
-
     def _looks_three_option_shape(self, text: str) -> bool:
         value = str(text or "").strip()
         if not value:
@@ -465,12 +441,12 @@ class ResultSanitizer(BaseDelegate):
         text = re.sub(r"(?im)^\s*(?:사용자의?\s*(?:말|질문|요청|메시지)|사용자\s*메시지)에\s*(?:바로\s*반응하|명확한\s*답(?:변)?을?\s*하)(?:세요|하십시오)\.?\s*", "", text).strip()
         text = re.sub(r"(?i)\bokay,\s*[.!,]*\s*$", "", text).strip()
         text = re.sub(r"(?i)^okay,\s*i'?ll\s*go\s*with\s*that\s*response\.?\s*", "", text).strip()
-        text = re.sub(r"(?i)\b(?:okay,\s*let'?s\s*see|alright,\s*let\s*me|alright,\s*something\s*like|hmm,|wait,)\b.*", "", text).strip()
-        text = re.sub(r"(?i)\b(?:user|assistant|you)\s*:\s*.*", "", text).strip()
+        # Do not delete from an inline marker through the end of the answer.
+        # Those words can occur in otherwise valid content, and the previous
+        # broad regex was able to turn a complete streamed answer into its lead.
         text = re.sub(r"(?im)^(?:최종 답변 규칙|final response rule):.*$", "", text).strip()
         text = re.sub(r"최대한\s*짧고\s*명확하게\s*답하세요\.?\s*", "", text).strip()
         text = self._dedupe_conversation_sentences(text)
-        text = self._limit_question_sentences(text, max_questions=1)
         text = self._collapse_punctuation_loops(text)
         text = _strip_meta_preamble(text)
         if not text:
@@ -483,20 +459,10 @@ class ResultSanitizer(BaseDelegate):
                 return ""
         if self._looks_instructional_meta_response(text):
             return ""
-
-        lowered_query = (query or "").lower()
-        is_greeting = any(token in lowered_query for token in ("안녕", "hello", "hi", "hey"))
-        if not is_greeting:
-            return self._normalize_korean_leading_address(text)
-
-        segments = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-        if not segments:
-            return self._normalize_korean_leading_address(text)
-        limited = segments[:2]
-        joined = " ".join(limited).strip()
-        if response_language == "ko" and len(joined) > 130:
-            joined = limited[0]
-        return self._normalize_korean_leading_address(joined.strip())
+        # Sanitization must not impose a response-length policy.  The stream
+        # already showed the generated body; trimming it here made completed
+        # messages collapse to their opening sentence.
+        return self._normalize_korean_leading_address(text)
 
     def _looks_conversational_answer(self, text: str, *, response_language: str, query: str) -> bool:
         content = (text or "").strip()
@@ -688,15 +654,6 @@ class ResultSanitizer(BaseDelegate):
             else:
                 content = tail.strip()
         content = re.sub(r"(?is)</?think>", "", content).strip()
-
-        cut_match = re.search(r"(?i)(okay,\s*let'?s\s*see|alright,\s*let\s*me|alright,\s*something\s*like|hmm,|wait,|the user asked|i should|i need to)", content)
-        if cut_match and cut_match.start() > 0:
-            prefix = content[:cut_match.start()].strip()
-            prefix = re.sub(r"(?im)\b(?:user|assistant)\s*[:：]\s*", "", prefix).strip()
-            prefix = re.sub(r"(?im)\bfollow-up question:\s*.*", "", prefix).strip()
-            prefix = re.sub(r"(?im)\bmode:\s*[A-Z_]+\s*", "", prefix).strip()
-            prefix = re.sub(r"\s{2,}", " ", prefix).strip(" -:\n")
-            if prefix and len(prefix) >= 8: return prefix
 
         lines = [line.strip() for line in content.splitlines() if line.strip()]
         cleaned_lines = []

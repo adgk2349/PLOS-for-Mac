@@ -308,12 +308,13 @@ extension AppViewModel {
             persistedAuxiliaryTimeoutSeconds != min(120, max(4, sidecarAuxiliaryTimeoutSeconds))
     }
 
-    func addFolder() {
+    func addFolder(initialDirectoryURL: URL? = nil) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
         panel.prompt = "선택"
+        panel.directoryURL = initialDirectoryURL
 
         if panel.runModal() == .OK {
             let existing = Set(includedFolderURLs.map(\.path))

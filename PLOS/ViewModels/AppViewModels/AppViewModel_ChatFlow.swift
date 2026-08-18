@@ -16,12 +16,16 @@ extension AppViewModel {
             return
         }
         guard !isBusy else { return }
+        let generationID = UUID()
+        activeChatGenerationID = generationID
         activeLocalChatTask?.cancel()
         activeLocalChatTask = Task { [weak self] in
             guard let self else { return }
             await self.askLocal()
             await MainActor.run {
-                self.activeLocalChatTask = nil
+                if self.activeChatGenerationID == generationID {
+                    self.activeLocalChatTask = nil
+                }
             }
         }
     }
@@ -32,6 +36,7 @@ extension AppViewModel {
         }
         activeLocalChatTask?.cancel()
         activeLocalChatTask = nil
+        activeChatGenerationID = nil
         if let activeID = activeGeneratingMessageID {
             _ = finalizeStreamingLocalMessage(messageID: activeID, response: nil, finalText: nil)
         }
@@ -372,13 +377,19 @@ extension AppViewModel {
 
         isBusy = true
         isGeneratingChatResponse = true
+        let generationID = UUID()
+        activeChatGenerationID = generationID
+        let streamConversationID = activeConversationID
         activeGeneratingMessageID = nil
         liveThinkingTraceEvents = []
         defer {
-            activeGeneratingMessageID = nil
-            liveThinkingTraceEvents = []
-            isGeneratingChatResponse = false
-            isBusy = false
+            if activeChatGenerationID == generationID {
+                activeGeneratingMessageID = nil
+                liveThinkingTraceEvents = []
+                isGeneratingChatResponse = false
+                isBusy = false
+                activeChatGenerationID = nil
+            }
         }
 
         if appendUserMessage {
@@ -438,6 +449,10 @@ extension AppViewModel {
                     activeGeneratingMessageID = reasoningAnchorID
 
                     for try await event in stream {
+                        guard activeChatGenerationID == generationID,
+                              activeConversationID == streamConversationID else {
+                            throw CancellationError()
+                        }
                         if event.type == "status" {
                             appendLiveThinkingTraceStatus(event.message)
                             continue
@@ -546,6 +561,11 @@ extension AppViewModel {
                         }
                     }
 
+                    guard activeChatGenerationID == generationID,
+                          activeConversationID == streamConversationID else {
+                        throw CancellationError()
+                    }
+
                     if !didReceiveDone {
                         let bufferedSplit = splitReasoningAndAnswer(from: streamedTextBuffer)
                         let bufferedRaw = sanitizeFinalGeneratedText(bufferedSplit.answerText)
@@ -592,9 +612,11 @@ extension AppViewModel {
             }
             await refreshPostChatStateIfNeeded()
         } catch is CancellationError {
+            guard activeChatGenerationID == generationID else { return }
             flushStreamingRoomState(updateTimestamp: true, reorder: true, persist: true)
             lastError = nil
         } catch {
+            guard activeChatGenerationID == generationID else { return }
             handleViewModelError(error)
         }
     }
@@ -602,68 +624,17 @@ extension AppViewModel {
     private func selectFinalStreamText(bufferedRaw: String, generatedText: String) -> (text: String, source: String) {
         let bufferedTrimmed = bufferedRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         let generatedTrimmed = generatedText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if generatedTrimmed.isEmpty {
-            return (bufferedRaw, "buffered_generated_empty")
+        // The user has already seen `bufferedRaw` arrive as the answer. The
+        // completed payload is produced by a later pipeline stage and can be a
+        // shortened rewrite; replacing the visible stream caused first-sentence
+        // regressions. Use it only when no answer was streamed at all.
+        if !bufferedTrimmed.isEmpty {
+            return (bufferedRaw, "buffered_authoritative")
         }
-        if bufferedTrimmed.isEmpty {
-            return (generatedText, "generated_empty_buffer")
+        if !generatedTrimmed.isEmpty {
+            return (generatedText, "generated_no_stream")
         }
-        let bufferedIncomplete = looksIncompleteAssistantText(bufferedTrimmed)
-        let generatedIncomplete = looksIncompleteAssistantText(generatedTrimmed)
-        if bufferedIncomplete && !generatedIncomplete {
-            return (generatedText, "generated_preferred_buffer_incomplete")
-        }
-        if generatedIncomplete && !bufferedIncomplete {
-            return (bufferedRaw, "buffered_preferred_generated_incomplete")
-        }
-        // When finalized payload is unexpectedly short, keep streamed buffer to avoid end-of-stream overwrite regressions.
-        if shouldPreferBufferedStreamText(bufferedTrimmed: bufferedTrimmed, generatedTrimmed: generatedTrimmed) {
-            return (bufferedRaw, "buffered_preferred_short_final")
-        }
-        return (generatedText, "generated_preferred")
-    }
-
-    private func shouldPreferBufferedStreamText(bufferedTrimmed: String, generatedTrimmed: String) -> Bool {
-        let bufferedHasLeakMarkers = containsInternalLeakMarkers(bufferedTrimmed)
-        let generatedHasLeakMarkers = containsInternalLeakMarkers(generatedTrimmed)
-        if bufferedHasLeakMarkers && !generatedHasLeakMarkers {
-            return false
-        }
-        if generatedHasLeakMarkers && !bufferedHasLeakMarkers {
-            return true
-        }
-        if generatedTrimmed.count < 64 && bufferedTrimmed.count >= max(180, generatedTrimmed.count * 3) {
-            return true
-        }
-        if bufferedTrimmed.contains("```"), !generatedTrimmed.contains("```"), bufferedTrimmed.count > generatedTrimmed.count + 80 {
-            return true
-        }
-        let bufferedSentenceCount = bufferedTrimmed.split(whereSeparator: { ".!?。！？\n".contains($0) }).count
-        let generatedSentenceCount = generatedTrimmed.split(whereSeparator: { ".!?。！？\n".contains($0) }).count
-        if generatedSentenceCount <= 1 && bufferedSentenceCount >= 3 && bufferedTrimmed.count > generatedTrimmed.count + 120 {
-            return true
-        }
-        return false
-    }
-
-    private func looksIncompleteAssistantText(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-        if trimmed.range(of: #"(?im)(?:^|\n)\s*\d{1,2}[.)]\s*$"#, options: .regularExpression) != nil {
-            return true
-        }
-        if trimmed.contains("```"), trimmed.components(separatedBy: "```").count % 2 == 0 {
-            return true
-        }
-        if trimmed.range(of: #"[:;,(\[{`-]\s*$"#, options: .regularExpression) != nil {
-            return true
-        }
-        if trimmed.count >= 120,
-           trimmed.range(of: #"[.!?。！？]\s*$"#, options: .regularExpression) == nil
-        {
-            return true
-        }
-        return false
+        return ("", "empty")
     }
 
     private func containsInternalLeakMarkers(_ text: String) -> Bool {

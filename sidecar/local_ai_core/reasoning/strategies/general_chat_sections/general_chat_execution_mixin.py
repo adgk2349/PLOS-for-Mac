@@ -327,30 +327,26 @@ class GeneralChatExecutionMixin:
                     last_context=last_context,
                     is_followup_web_search=followup_web_search,
                 )
+                # SearXNG is an optional preferred provider, not a prerequisite for web
+                # search. WebRetriever falls back to DuckDuckGo when it is unavailable.
+                # Previously a failed local readiness probe discarded that fallback path.
+                source_rows, web_loop_logs, web_loop_meta = await asyncio.to_thread(
+                    self._run_web_reasoning_loop,
+                    retriever=retriever,
+                    base_query=effective_web_query or context.req.query,
+                    freshness_sensitive_query=bool(freshness_sensitive_query),
+                    searxng_url=configured_searxng_url or None,
+                    prefer_searxng=searxng_ready,
+                    max_rounds=3,
+                    max_total_seconds=18.0,
+                    round_timeout_seconds=6.0,
+                )
                 if not searxng_ready:
-                    source_rows = []
-                    web_loop_logs = list(readiness_logs)
-                    web_loop_logs.append("web_search:unavailable:searxng_not_ready")
-                    web_loop_meta = {
-                        "web_loop_rounds": 0,
-                        "web_loop_converged": False,
-                        "web_loop_quality_score": 0.0,
-                        "web_loop_queries": [effective_web_query or context.req.query],
-                        "web_loop_timed_out": False,
-                        "round_timeout_seconds": 6.0,
-                    }
-                else:
-                    source_rows, web_loop_logs, web_loop_meta = await asyncio.to_thread(
-                        self._run_web_reasoning_loop,
-                        retriever=retriever,
-                        base_query=effective_web_query or context.req.query,
-                        freshness_sensitive_query=bool(freshness_sensitive_query),
-                        searxng_url=configured_searxng_url or None,
-                        prefer_searxng=True,
-                        max_rounds=3,
-                        max_total_seconds=18.0,
-                        round_timeout_seconds=6.0,
-                    )
+                    web_loop_logs = [
+                        *readiness_logs,
+                        "web_search:searxng_unavailable:using_public_fallback",
+                        *web_loop_logs,
+                    ]
                 if (
                     not source_rows
                     and is_local_searx

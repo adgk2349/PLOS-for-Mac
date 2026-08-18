@@ -27,6 +27,7 @@ from ....models import (
 )
 from ....nlu.followup_resolver import FollowUpResolution
 from ...context import ReasoningContext
+from ...conversation_context_policy import resolve_conversation_context_policy
 from ...message_state import MessageState
 from ...executor_contract import bind_async_executor_contract, require_executor_methods
 from ....web_retrieval import WebRetrievalReport, WebRetriever
@@ -273,12 +274,19 @@ class GeneralChatConversationMixin:
         # Inject conversation history from session_digest into MessageState.
         # L2: rolling_summary (compressed older turns) → injected as system message first.
         # L1: recent verbatim turns → injected as user/assistant messages.
-        # Default: keep last 6 turn-pairs (= 12 messages). Tunable via env var.
-        _max_history_turns = int(str(os.getenv("LOCAL_AI_HISTORY_TURNS", "6")).strip() or "6")
+        digest_obj = getattr(context, "session_digest_payload", None)
+        context_policy = resolve_conversation_context_policy(
+            startup_profile=getattr(getattr(context, "workspace", None), "startup_profile", "RECOMMENDED"),
+            model_path=(
+                getattr(getattr(context, "settings", None), "mlx_model_path", None)
+                or getattr(getattr(context, "settings", None), "llama_model_path", None)
+            ),
+            digest=digest_obj,
+        )
+        _max_history_turns = context_policy.history_turn_pairs
         dangling_user_text = ""
         recent_user_turns: list[str] = []
         try:
-            digest_obj = getattr(context, "session_digest_payload", None)
             if not digest_obj:
                 raw_digest = getattr(context, "session_digest", None) or {}
                 if isinstance(raw_digest, str):
@@ -294,7 +302,9 @@ class GeneralChatConversationMixin:
                 if rolling_summary:
                     compact_summary = re.sub(r"\s+", " ", rolling_summary).strip()
                     if compact_summary:
-                        state.add_system(f"Previous conversation summary: {compact_summary[:420]}")
+                        state.add_system(
+                            f"Previous conversation summary: {compact_summary[:context_policy.rolling_summary_chars]}"
+                        )
 
                 # L1: verbatim recent turns
                 raw_turns = digest_obj.get("recent_turns") or []
